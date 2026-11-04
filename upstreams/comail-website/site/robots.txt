@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://comail.hungcuong.dev/sitemap.xml
