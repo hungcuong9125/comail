@@ -934,6 +934,7 @@ export interface ThreadWokeEvent {
 }
 
 export interface NetworkStateEvent {
+  accountId: number;
   online: boolean;
 }
 

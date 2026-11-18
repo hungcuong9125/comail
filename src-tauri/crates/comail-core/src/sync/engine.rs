@@ -1107,7 +1107,10 @@ async fn run_actor(
                     );
                     session = Some(s);
                     backoff_secs = 1;
-                    ctx.bus.emit(CoreEvent::NetworkState { online: true });
+                    ctx.bus.emit(CoreEvent::NetworkState {
+                        account_id,
+                        online: true,
+                    });
                     set_state(&ctx, account_id, "syncing").await;
                 }
                 Err(e @ (CoreError::NeedsReauth | CoreError::Auth(_))) => {
@@ -1132,7 +1135,10 @@ async fn run_actor(
                 }
                 Err(e) => {
                     tracing::warn!(account_id, "imap connect failed: {e}");
-                    ctx.bus.emit(CoreEvent::NetworkState { online: false });
+                    ctx.bus.emit(CoreEvent::NetworkState {
+                        account_id,
+                        online: false,
+                    });
                     set_state(&ctx, account_id, "offline").await;
                     // Backoff, but wake early on commands.
                     let wait = std::time::Duration::from_secs(backoff_secs);
@@ -1241,7 +1247,10 @@ async fn run_actor(
             Err(e) => {
                 tracing::warn!(account_id, "sync cycle error: {e}");
                 imap::logout(s).await;
-                ctx.bus.emit(CoreEvent::NetworkState { online: false });
+                ctx.bus.emit(CoreEvent::NetworkState {
+                    account_id,
+                    online: false,
+                });
                 set_state(&ctx, account_id, "offline").await;
                 let message = e.to_string();
                 for waiter in sync_waiters.drain(..) {
@@ -1337,7 +1346,10 @@ async fn run_actor(
                                     // IDLE state and reconnect next iteration.
                                     tracing::warn!(account_id, "idle failed: {e}");
                                     supports_idle = None;
-                                    ctx.bus.emit(CoreEvent::NetworkState { online: false });
+                                    ctx.bus.emit(CoreEvent::NetworkState {
+                                        account_id,
+                                        online: false,
+                                    });
                                 }
                             }
                         }

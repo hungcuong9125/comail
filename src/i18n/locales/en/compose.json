@@ -67,6 +67,7 @@
   "bcc": "Bcc",
   "recipientPlaceholder": "name@example.com",
   "addRecipient": "Add at least one recipient",
+  "sending": "Sending…",
   "sent": "Sent",
   "scheduled": "Scheduled. Will send {{date}}",
   "sendingIn": "Sending in {s}s · Z to undo",

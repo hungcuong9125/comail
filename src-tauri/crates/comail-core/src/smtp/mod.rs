@@ -87,15 +87,41 @@ pub async fn send_raw(
         recipients = recipients.len(),
         "smtp send_raw: connecting to relay",
     );
-    transport.send_raw(&envelope, raw).await.map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("535") || msg.to_lowercase().contains("auth") {
-            CoreError::Auth(format!("smtp auth: {msg}"))
-        } else {
-            CoreError::Smtp(msg)
-        }
-    })?;
+    transport
+        .send_raw(&envelope, raw)
+        .await
+        .map_err(|e| classify_send_error(e.status().map(|code| u16::from(code)), e.to_string()))?;
     Ok(())
+}
+
+// A temporary 454 (including 4.7.0) must remain retryable: reauthentication
+// cannot repair a server-side temporary authentication failure.
+fn classify_send_error(code: Option<u16>, message: String) -> CoreError {
+    match code {
+        Some(530 | 534 | 535) => CoreError::Auth(format!("smtp auth: {message}")),
+        _ => CoreError::Smtp(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_explicit_auth_reply_codes_require_reauthentication() {
+        for code in [530, 534, 535] {
+            assert!(matches!(
+                classify_send_error(Some(code), "rejected".into()),
+                CoreError::Auth(_)
+            ));
+        }
+        for code in [None, Some(454), Some(450), Some(550), Some(554)] {
+            assert!(matches!(
+                classify_send_error(code, "auth host 535 unavailable".into()),
+                CoreError::Smtp(_)
+            ));
+        }
+    }
 }
 
 /// Cheap connectivity/auth probe used by test_connection.

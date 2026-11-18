@@ -65,6 +65,7 @@
   "bcc": "Bcc",
   "recipientPlaceholder": "name@example.com",
   "addRecipient": "Thêm ít nhất một người nhận",
+  "sending": "Đang gửi…",
   "sent": "Đã gửi",
   "scheduled": "Đã lên lịch. Sẽ gửi {{date}}",
   "sendingIn": "Sẽ gửi sau {s}s · Z để hoàn tác",
