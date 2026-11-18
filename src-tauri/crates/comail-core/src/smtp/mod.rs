@@ -90,7 +90,7 @@ pub async fn send_raw(
     transport.send_raw(&envelope, raw).await.map_err(|e| {
         let code = e.status().map(u16::from);
         let message = e.to_string();
-        if definitely_not_accepted(code, e.is_tls(), &message) {
+        if definitely_not_accepted(code, e.is_tls(), e.is_client(), &message) {
             classify_send_error(code, message)
         } else {
             CoreError::SmtpUncertain(message)
@@ -100,8 +100,20 @@ pub async fn send_raw(
 }
 
 /// Only evidence from before DATA or an explicit rejection permits safe retry.
-fn definitely_not_accepted(code: Option<u16>, is_tls: bool, display: &str) -> bool {
-    code.is_some() || is_tls || display.starts_with("Connection error")
+///
+/// In lettre 0.11: a reply code means the server answered a command with a
+/// 4xx/5xx; TLS and `Kind::Connection` ("Connection error") errors arise while
+/// connecting or upgrading; `Kind::Client` errors (no compatible AUTH
+/// mechanism, STARTTLS/SMTPUTF8/8BITMIME unsupported) are raised by the client
+/// before MAIL FROM. `Kind::Network`/`Response` can occur after DATA, so they
+/// stay uncertain.
+fn definitely_not_accepted(
+    code: Option<u16>,
+    is_tls: bool,
+    is_client: bool,
+    display: &str,
+) -> bool {
+    code.is_some() || is_tls || is_client || display.starts_with("Connection error")
 }
 
 // A temporary 454 (including 4.7.0) must remain retryable: reauthentication
@@ -170,22 +182,85 @@ mod acceptance_tests {
     use super::*;
     #[test]
     fn transport_failures_require_positive_pre_acceptance_evidence() {
-        for code in [None, Some(454), Some(530), Some(535), Some(550)] {
-            for tls in [false, true] {
-                for message in [
-                    "Connection error: refused",
-                    "network error",
-                    "response error",
-                    "client error",
-                    "timeout",
-                    "other Connection error",
-                ] {
-                    assert_eq!(
-                        definitely_not_accepted(code, tls, message),
-                        code.is_some() || tls || message.starts_with("Connection error")
-                    );
-                }
-            }
+        // (reply code, is_tls, is_client, lettre Display, expected "definitely not accepted")
+        let cases: &[(Option<u16>, bool, bool, &str, bool)] = &[
+            // Explicit server replies, including a rejection of the final ".".
+            (
+                Some(550),
+                false,
+                false,
+                "permanent error (550): no such user",
+                true,
+            ),
+            (
+                Some(421),
+                false,
+                false,
+                "transient error (421): try again later",
+                true,
+            ),
+            (
+                Some(535),
+                false,
+                false,
+                "permanent error (535): bad credentials",
+                true,
+            ),
+            // Connect / TLS-upgrade stage.
+            (
+                None,
+                false,
+                false,
+                "Connection error: connection refused",
+                true,
+            ),
+            (
+                None,
+                true,
+                false,
+                "tls error: invalid peer certificate",
+                true,
+            ),
+            // Client-side refusals before MAIL FROM.
+            (
+                None,
+                false,
+                true,
+                "internal client error: No compatible authentication mechanism was found",
+                true,
+            ),
+            // Anything that can happen after DATA stays uncertain.
+            (
+                None,
+                false,
+                false,
+                "network error: connection reset by peer",
+                false,
+            ),
+            (None, false, false, "network error: timed out", false),
+            (
+                None,
+                false,
+                false,
+                "response error: incomplete response",
+                false,
+            ),
+            (None, false, false, "transport has been shut down", false),
+            // "Connection error" must be the lettre kind prefix, not any substring.
+            (
+                None,
+                false,
+                false,
+                "network error: Connection error mid-stream",
+                false,
+            ),
+        ];
+        for &(code, tls, client, display, expected) in cases {
+            assert_eq!(
+                definitely_not_accepted(code, tls, client, display),
+                expected,
+                "{display}"
+            );
         }
     }
 }
