@@ -261,7 +261,17 @@ async fn record_outcomes(
                     account_id, action_id, kind = %action.kind, attempts, error = %msg,
                     "action attempt failed",
                 );
-                if terminal_failure(&action.kind, attempts, e) {
+                let accepted = if action.kind == "send" {
+                    ctx.db
+                        .read(move |conn| {
+                            Ok(repo::actions::get(conn, action_id)?
+                                .is_some_and(|a| !a.payload["smtpAcceptedAt"].is_null()))
+                        })
+                        .await?
+                } else {
+                    false
+                };
+                if !accepted && terminal_failure(&action.kind, attempts, e) {
                     let m = msg.clone();
                     let failed_thread = (action.kind == crate::trash::KIND)
                         .then(|| deletion_thread_id(action))
@@ -566,34 +576,6 @@ fn needs_fresh_session(error: &CoreError) -> bool {
 fn is_permanent(msg: &str) -> bool {
     // Preserve IMAP status handling without treating incidental digits as SMTP.
     msg.contains("NO ") || msg.contains("BAD ") || msg.contains("bad ") || is_smtp_permanent(msg)
-}
-
-#[test]
-fn smtp_reply_classification_uses_code_boundaries() {
-    for reply in [
-        "550 mailbox missing",
-        "553-invalid",
-        "535 auth",
-        " 554 rejected",
-    ] {
-        assert!(is_smtp_permanent(reply));
-    }
-    for reply in [
-        "450 retry",
-        "connection to port 550 failed",
-        "5500 bytes",
-        "bad connection",
-        "NO recipient",
-    ] {
-        assert!(!is_smtp_permanent(reply));
-    }
-    // Shape produced by smtp::classify_send_error for lettre errors.
-    assert!(is_smtp_permanent("550 permanent error (550): no such user"));
-    assert!(!is_smtp_permanent("421 transient error (421): try later"));
-    assert!(!is_smtp_permanent("permanent error (550): unprefixed"));
-    assert!(is_permanent("A1 NO denied"));
-    assert!(is_permanent("A2 BAD command"));
-    assert!(!is_permanent("received 553 bytes"));
 }
 
 fn is_smtp_permanent(msg: &str) -> bool {
@@ -1131,6 +1113,10 @@ async fn send_action(
     };
     tracing::info!(account_id = config.id, draft_id, "smtp send: starting");
 
+    if !action.payload["smtpDispatchingAt"].is_null() && action.payload["smtpAcceptedAt"].is_null()
+    {
+        return Err(CoreError::ActionRejected("send outcome unknown: the message may have been sent, check the Sent folder before resending".into()));
+    }
     let accepted_id = action.payload["smtpAcceptedAt"]
         .as_i64()
         .and_then(|_| action.payload["messageId"].as_str());
@@ -1227,18 +1213,18 @@ async fn send_action(
         for (path, filename) in att_rows {
             let canon = tokio::fs::canonicalize(&path)
                 .await
-                .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
+                .map_err(|e| CoreError::ActionRejected(format!("attachment {filename}: {e}")))?;
             let within = staging_root
                 .as_ref()
                 .is_some_and(|root| canon.starts_with(root));
             if !within {
-                return Err(CoreError::Other(format!(
+                return Err(CoreError::ActionRejected(format!(
                     "attachment {filename}: refusing to read file outside the staging area"
                 )));
             }
             let bytes = tokio::fs::read(&canon)
                 .await
-                .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
+                .map_err(|e| CoreError::ActionRejected(format!("attachment {filename}: {e}")))?;
             let mime_type = mime_guess_from_name(&filename);
             attachments.push(crate::mime::OutgoingAttachment {
                 filename,
@@ -1291,7 +1277,7 @@ async fn send_action(
             .map(|a| a.email.clone())
             .collect();
         if recipients.is_empty() {
-            return Err(CoreError::Smtp("no recipients".into()));
+            return Err(CoreError::ActionRejected("no recipients".into()));
         }
 
         tracing::info!(
@@ -1301,26 +1287,71 @@ async fn send_action(
             recipients = recipients.len(),
             "smtp send: dispatching",
         );
-        smtp::send_raw(config, &auth, &config.email, &recipients, &raw).await?;
+        let action_id = action.id;
+        let mut dispatch = action.payload.clone();
+        dispatch["smtpDispatchingAt"] = serde_json::json!(now_ms());
+        dispatch["messageId"] = serde_json::json!(msg_id);
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE pending_actions SET payload = ?2 WHERE id = ?1",
+                    rusqlite::params![action_id, serde_json::to_string(&dispatch)?],
+                )?;
+                Ok(())
+            })
+            .await?;
+        if let Err(error) = smtp::send_raw(config, &auth, &config.email, &recipients, &raw).await {
+            let description = error.to_string();
+            // Only a durably recorded SMTP error permits another attempt. If
+            // storage is unwritable, recovery conservatively keeps ambiguity.
+            ctx.db.write(move |conn| {
+                conn.execute("UPDATE pending_actions SET payload = json_remove(payload, '$.smtpDispatchingAt'), last_error = ?2 WHERE id = ?1",
+                    rusqlite::params![action_id, description])?;
+                Ok(())
+            }).await?;
+            return Err(error);
+        }
         // A crash between SMTP acceptance and this standalone durable write still
         // leaves an unavoidable ambiguity; SMTP and SQLite cannot commit atomically.
         let action_id = action.id;
         let mut payload = action.payload.clone();
         payload["smtpAcceptedAt"] = serde_json::json!(now_ms());
         payload["messageId"] = serde_json::json!(msg_id);
-        ctx.db
-            .write(move |conn| {
-                conn.execute(
-                    "UPDATE pending_actions SET payload = ?2 WHERE id = ?1",
-                    rusqlite::params![action_id, serde_json::to_string(&payload)?],
-                )?;
-                Ok(())
-            })
-            .await?;
+        let mut recorded = false;
+        for attempt in 0..3 {
+            let payload = payload.clone();
+            match ctx
+                .db
+                .write(move |conn| {
+                    conn.execute(
+                        "UPDATE pending_actions SET payload = ?2 WHERE id = ?1",
+                        rusqlite::params![action_id, serde_json::to_string(&payload)?],
+                    )?;
+                    Ok(())
+                })
+                .await
+            {
+                Ok(()) => {
+                    recorded = true;
+                    break;
+                }
+                Err(error) => {
+                    tracing::error!(action_id, %error, "SMTP accepted; cannot persist acceptance");
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                }
+            }
+        }
+        if !recorded {
+            return Err(CoreError::ActionRejected(
+                "sent, but local bookkeeping could not be recorded".into(),
+            ));
+        }
         tracing::info!(account_id = config.id, "smtp send: accepted by server");
         (msg_id, Some(raw))
     };
 
+    // Accepted retries skip APPEND because raw MIME is unavailable: a crash
+    // after the marker write but before APPEND can lose the server Sent copy.
     // Append to Sent (Gmail does this automatically).
     if config.provider != Provider::Gmail
         && let Some(raw) = raw
@@ -1440,6 +1471,34 @@ fn mime_guess_from_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn smtp_reply_classification_uses_code_boundaries() {
+        for reply in [
+            "550 mailbox missing",
+            "553-invalid",
+            "535 auth",
+            " 554 rejected",
+        ] {
+            assert!(is_smtp_permanent(reply));
+        }
+        for reply in [
+            "450 retry",
+            "connection to port 550 failed",
+            "5500 bytes",
+            "bad connection",
+            "NO recipient",
+        ] {
+            assert!(!is_smtp_permanent(reply));
+        }
+        // Shape produced by smtp::classify_send_error for lettre errors.
+        assert!(is_smtp_permanent("550 permanent error (550): no such user"));
+        assert!(!is_smtp_permanent("421 transient error (421): try later"));
+        assert!(!is_smtp_permanent("permanent error (550): unprefixed"));
+        assert!(is_permanent("A1 NO denied"));
+        assert!(is_permanent("A2 BAD command"));
+        assert!(!is_permanent("received 553 bytes"));
+    }
+
     use super::*;
 
     #[tokio::test]

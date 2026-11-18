@@ -90,7 +90,7 @@ pub async fn send_raw(
     transport
         .send_raw(&envelope, raw)
         .await
-        .map_err(|e| classify_send_error(e.status().map(|code| u16::from(code)), e.to_string()))?;
+        .map_err(|e| classify_send_error(e.status().map(u16::from), e.to_string()))?;
     Ok(())
 }
 

@@ -1735,7 +1735,7 @@ impl Core {
                     return Err(CoreError::NotFound("draft (message is not a draft)".into()));
                 }
                 let active: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM pending_actions WHERE kind = 'send' AND message_id = ?1 AND state IN ('pending','inflight')",
+                    "SELECT COUNT(*) FROM pending_actions WHERE kind = 'send' AND message_id = ?1 AND (state IN ('pending','inflight') OR json_extract(payload, '$.smtpAcceptedAt') IS NOT NULL)",
                     rusqlite::params![draft_id], |r| r.get(0),
                 )?;
                 if active > 0 {
@@ -6071,6 +6071,11 @@ fn revert_action(
         trash::ensure_not_deleting(conn, tid)?;
     }
     let was_pending = repo::actions::try_cancel(conn, action.id)?;
+    if action.kind == "send" && !was_pending {
+        return Err(CoreError::Other(
+            "message already sent or sending; cannot undo".into(),
+        ));
+    }
     let tx = conn.transaction()?;
     let thread_id = action.thread_id;
 

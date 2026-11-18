@@ -204,7 +204,8 @@ pub fn expedite(conn: &Connection, id: i64) -> Result<Option<i64>> {
 pub fn try_cancel(conn: &Connection, id: i64) -> Result<bool> {
     let n = conn.execute(
         "UPDATE pending_actions SET state = 'cancelled', finished_at = ?2
-         WHERE id = ?1 AND state = 'pending'",
+         WHERE id = ?1 AND state = 'pending'
+           AND NOT (kind = 'send' AND json_extract(payload, '$.smtpAcceptedAt') IS NOT NULL)",
         params![id, now_ms()],
     )?;
     Ok(n > 0)
