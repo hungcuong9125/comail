@@ -96,10 +96,15 @@ pub async fn send_raw(
 
 // A temporary 454 (including 4.7.0) must remain retryable: reauthentication
 // cannot repair a server-side temporary authentication failure.
+//
+// Non-auth replies are prefixed with their reply code: lettre's Display reads
+// "permanent error (550): …", and the queue's `is_smtp_permanent` decides
+// whether to stop retrying by looking for a leading 5xx code.
 fn classify_send_error(code: Option<u16>, message: String) -> CoreError {
     match code {
         Some(530 | 534 | 535) => CoreError::Auth(format!("smtp auth: {message}")),
-        _ => CoreError::Smtp(message),
+        Some(code) => CoreError::Smtp(format!("{code} {message}")),
+        None => CoreError::Smtp(message),
     }
 }
 
@@ -120,6 +125,18 @@ mod tests {
                 classify_send_error(code, "auth host 535 unavailable".into()),
                 CoreError::Smtp(_)
             ));
+        }
+    }
+
+    #[test]
+    fn non_auth_replies_lead_with_their_code() {
+        match classify_send_error(Some(550), "permanent error (550): no such user".into()) {
+            CoreError::Smtp(msg) => assert!(msg.starts_with("550 "), "{msg}"),
+            other => panic!("expected Smtp, got {other:?}"),
+        }
+        match classify_send_error(None, "network error: timed out".into()) {
+            CoreError::Smtp(msg) => assert_eq!(msg, "network error: timed out"),
+            other => panic!("expected Smtp, got {other:?}"),
         }
     }
 }

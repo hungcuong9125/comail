@@ -587,6 +587,10 @@ fn smtp_reply_classification_uses_code_boundaries() {
     ] {
         assert!(!is_smtp_permanent(reply));
     }
+    // Shape produced by smtp::classify_send_error for lettre errors.
+    assert!(is_smtp_permanent("550 permanent error (550): no such user"));
+    assert!(!is_smtp_permanent("421 transient error (421): try later"));
+    assert!(!is_smtp_permanent("permanent error (550): unprefixed"));
     assert!(is_permanent("A1 NO denied"));
     assert!(is_permanent("A2 BAD command"));
     assert!(!is_permanent("received 553 bytes"));
