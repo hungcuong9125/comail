@@ -271,7 +271,7 @@ async fn record_outcomes(
                 } else {
                     false
                 };
-                if !accepted && terminal_failure(&action.kind, attempts, e) {
+                if let Some(msg) = failure_decision(&action.kind, accepted, attempts, e) {
                     let m = msg.clone();
                     let failed_thread = (action.kind == crate::trash::KIND)
                         .then(|| deletion_thread_id(action))
@@ -540,6 +540,43 @@ fn deletion_thread_id(action: &repo::actions::PendingAction) -> Option<i64> {
     action
         .thread_id
         .or_else(|| action.payload["threadId"].as_i64())
+}
+
+const SEND_UNKNOWN: &str =
+    "send outcome unknown: the message may have been sent, check the Sent folder before resending";
+const SENT_BOOKKEEPING_FAILED: &str = "sent, but local bookkeeping could not be recorded";
+
+#[derive(Debug, PartialEq)]
+enum SendPlan<'a> {
+    Fresh,
+    BookkeepingOnly(&'a str),
+    Ambiguous,
+}
+
+fn send_resume_plan(payload: &serde_json::Value) -> SendPlan<'_> {
+    if !payload["smtpAcceptedAt"].is_null() {
+        return match payload["messageId"].as_str().filter(|id| !id.is_empty()) {
+            Some(id) => SendPlan::BookkeepingOnly(id),
+            None => SendPlan::Ambiguous,
+        };
+    }
+    if !payload["smtpDispatchingAt"].is_null() {
+        SendPlan::Ambiguous
+    } else {
+        SendPlan::Fresh
+    }
+}
+
+fn failure_decision(
+    kind: &str,
+    accepted: bool,
+    attempts: i64,
+    error: &CoreError,
+) -> Option<String> {
+    if accepted {
+        return (attempts >= MAX_ATTEMPTS).then(|| SENT_BOOKKEEPING_FAILED.into());
+    }
+    terminal_failure(kind, attempts, error).then(|| error.to_string())
 }
 
 fn terminal_failure(kind: &str, attempts: i64, error: &CoreError) -> bool {
@@ -1113,13 +1150,11 @@ async fn send_action(
     };
     tracing::info!(account_id = config.id, draft_id, "smtp send: starting");
 
-    if !action.payload["smtpDispatchingAt"].is_null() && action.payload["smtpAcceptedAt"].is_null()
-    {
-        return Err(CoreError::ActionRejected("send outcome unknown: the message may have been sent, check the Sent folder before resending".into()));
-    }
-    let accepted_id = action.payload["smtpAcceptedAt"]
-        .as_i64()
-        .and_then(|_| action.payload["messageId"].as_str());
+    let accepted_id = match send_resume_plan(&action.payload) {
+        SendPlan::Fresh => None,
+        SendPlan::BookkeepingOnly(message_id) => Some(message_id),
+        SendPlan::Ambiguous => return Err(CoreError::ActionRejected(SEND_UNKNOWN.into())),
+    };
     // Load everything needed to build the message.
     let (detail, references) = ctx
         .db
@@ -1301,6 +1336,9 @@ async fn send_action(
             })
             .await?;
         if let Err(error) = smtp::send_raw(config, &auth, &config.email, &recipients, &raw).await {
+            if matches!(error, CoreError::SmtpUncertain(_)) {
+                return Err(CoreError::ActionRejected(SEND_UNKNOWN.into()));
+            }
             let description = error.to_string();
             // Only a durably recorded SMTP error permits another attempt. If
             // storage is unwritable, recovery conservatively keeps ambiguity.
@@ -1678,5 +1716,82 @@ mod tests {
         assert!(is_connection_failure("UID MOVE timed out after 30s"));
         assert!(is_connection_failure("connection closed"));
         assert!(!is_connection_failure("temporary mailbox quota"));
+    }
+}
+
+#[cfg(test)]
+mod send_decision_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn resume_plan_never_redispatches_marked_sends() {
+        assert_eq!(send_resume_plan(&json!({})), SendPlan::Fresh);
+        assert_eq!(
+            send_resume_plan(&json!({"smtpDispatchingAt":null})),
+            SendPlan::Fresh
+        );
+        assert_eq!(
+            send_resume_plan(&json!({"smtpDispatchingAt":1})),
+            SendPlan::Ambiguous
+        );
+        for marker in [json!(1), json!("malformed")] {
+            assert_eq!(
+                send_resume_plan(&json!({"smtpAcceptedAt":marker, "messageId":"stable"})),
+                SendPlan::BookkeepingOnly("stable")
+            );
+            for id in [json!(null), json!(""), json!(42)] {
+                assert_eq!(
+                    send_resume_plan(&json!({"smtpAcceptedAt":marker,"messageId":id})),
+                    SendPlan::Ambiguous
+                );
+            }
+        }
+        assert_eq!(
+            send_resume_plan(
+                &json!({"smtpDispatchingAt":1,"smtpAcceptedAt":2,"messageId":"stable"})
+            ),
+            SendPlan::BookkeepingOnly("stable")
+        );
+    }
+
+    #[test]
+    fn accepted_bookkeeping_retries_are_bounded() {
+        for error in [
+            CoreError::Other("disk".into()),
+            CoreError::ActionRejected("rejected".into()),
+            CoreError::Smtp("550 rejected".into()),
+        ] {
+            for attempts in 1..MAX_ATTEMPTS {
+                assert_eq!(failure_decision("send", true, attempts, &error), None);
+            }
+            for attempts in [MAX_ATTEMPTS, MAX_ATTEMPTS + 1] {
+                assert_eq!(
+                    failure_decision("send", true, attempts, &error),
+                    Some(SENT_BOOKKEEPING_FAILED.into())
+                );
+            }
+        }
+        assert!(
+            failure_decision("send", false, 1, &CoreError::Other("temporary".into())).is_none()
+        );
+        assert!(
+            failure_decision(
+                "send",
+                false,
+                MAX_ATTEMPTS,
+                &CoreError::Other("temporary".into())
+            )
+            .is_some()
+        );
+        assert!(
+            failure_decision(
+                "send",
+                false,
+                1,
+                &CoreError::ActionRejected(SEND_UNKNOWN.into())
+            )
+            .is_some()
+        );
     }
 }

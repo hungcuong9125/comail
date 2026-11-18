@@ -12,6 +12,8 @@ pub enum CoreError {
     Imap(String),
     #[error("smtp error: {0}")]
     Smtp(String),
+    #[error("smtp outcome uncertain: {0}")]
+    SmtpUncertain(String),
     #[error("tls error: {0}")]
     Tls(String),
     #[error("auth failed: {0}")]
@@ -50,7 +52,7 @@ impl CoreError {
             CoreError::Io(_) => "io",
             CoreError::Network(_) => "network",
             CoreError::Imap(_) => "imap",
-            CoreError::Smtp(_) => "smtp",
+            CoreError::Smtp(_) | CoreError::SmtpUncertain(_) => "smtp",
             CoreError::Tls(_) => "tls",
             CoreError::Auth(_) => "auth",
             CoreError::NeedsReauth => "needs_reauth",

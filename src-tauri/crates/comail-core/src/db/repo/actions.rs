@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::models::now_ms;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
@@ -201,6 +201,26 @@ pub fn expedite(conn: &Connection, id: i64) -> Result<Option<i64>> {
 }
 
 /// Transition pending -> cancelled; returns false if it was no longer pending.
+/// Guard used inside queue_send's serialized database write.
+pub fn ensure_sendable(conn: &Connection, draft_id: i64) -> Result<()> {
+    let is_draft: bool = conn.query_row(
+        "SELECT is_draft FROM messages WHERE id = ?1",
+        rusqlite::params![draft_id],
+        |r| r.get(0),
+    )?;
+    if !is_draft {
+        return Err(CoreError::NotFound("draft (message is not a draft)".into()));
+    }
+    let active: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pending_actions WHERE kind = 'send' AND message_id = ?1 AND (state IN ('pending','inflight') OR json_extract(payload, '$.smtpAcceptedAt') IS NOT NULL)",
+                    rusqlite::params![draft_id], |r| r.get(0),
+                )?;
+    if active > 0 {
+        return Err(CoreError::Other("draft already queued for sending".into()));
+    }
+    Ok(())
+}
+
 pub fn try_cancel(conn: &Connection, id: i64) -> Result<bool> {
     let n = conn.execute(
         "UPDATE pending_actions SET state = 'cancelled', finished_at = ?2
@@ -276,6 +296,35 @@ pub fn gc(conn: &Connection, older_than_ms: i64) -> Result<()> {
 mod tests {
     use super::*;
     use crate::db::testutil;
+
+    #[test]
+    fn send_guard_and_cancellation_respect_durable_acceptance() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let (_, message) = testutil::seed_message(&conn, "sender@test.dev", "send", false);
+        assert!(ensure_sendable(&conn, message).is_err());
+        conn.execute("UPDATE messages SET is_draft = 1 WHERE id = ?1", [message])
+            .unwrap();
+        assert!(ensure_sendable(&conn, message).is_ok());
+        let id = enqueue(
+            &conn,
+            1,
+            "send",
+            Some(message),
+            None,
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap();
+        assert!(ensure_sendable(&conn, message).is_err());
+        assert!(try_cancel(&conn, id).unwrap());
+        set_state(&conn, id, "failed", None).unwrap();
+        assert!(ensure_sendable(&conn, message).is_ok());
+        conn.execute("UPDATE pending_actions SET payload = '{\"smtpAcceptedAt\":1}', state = 'pending' WHERE id = ?1", [id]).unwrap();
+        assert!(!try_cancel(&conn, id).unwrap());
+        set_state(&conn, id, "failed", None).unwrap();
+        assert!(ensure_sendable(&conn, message).is_err());
+    }
 
     #[test]
     fn live_recovery_is_scoped_and_preserves_retry_and_remote_identity() {

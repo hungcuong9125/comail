@@ -87,11 +87,21 @@ pub async fn send_raw(
         recipients = recipients.len(),
         "smtp send_raw: connecting to relay",
     );
-    transport
-        .send_raw(&envelope, raw)
-        .await
-        .map_err(|e| classify_send_error(e.status().map(u16::from), e.to_string()))?;
+    transport.send_raw(&envelope, raw).await.map_err(|e| {
+        let code = e.status().map(u16::from);
+        let message = e.to_string();
+        if definitely_not_accepted(code, e.is_tls(), &message) {
+            classify_send_error(code, message)
+        } else {
+            CoreError::SmtpUncertain(message)
+        }
+    })?;
     Ok(())
+}
+
+/// Only evidence from before DATA or an explicit rejection permits safe retry.
+fn definitely_not_accepted(code: Option<u16>, is_tls: bool, display: &str) -> bool {
+    code.is_some() || is_tls || display.starts_with("Connection error")
 }
 
 // A temporary 454 (including 4.7.0) must remain retryable: reauthentication
@@ -152,5 +162,30 @@ pub async fn test_connection(cfg: &AccountConfig, auth: &SmtpAuth) -> Result<()>
         Ok(())
     } else {
         Err(CoreError::Smtp("connection test failed".into()))
+    }
+}
+
+#[cfg(test)]
+mod acceptance_tests {
+    use super::*;
+    #[test]
+    fn transport_failures_require_positive_pre_acceptance_evidence() {
+        for code in [None, Some(454), Some(530), Some(535), Some(550)] {
+            for tls in [false, true] {
+                for message in [
+                    "Connection error: refused",
+                    "network error",
+                    "response error",
+                    "client error",
+                    "timeout",
+                    "other Connection error",
+                ] {
+                    assert_eq!(
+                        definitely_not_accepted(code, tls, message),
+                        code.is_some() || tls || message.starts_with("Connection error")
+                    );
+                }
+            }
+        }
     }
 }
