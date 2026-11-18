@@ -7,6 +7,10 @@ const settled = new Map<number, string>();
 
 const feedbackTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
+export function isSendOutcomeUnknown(error?: string | null) {
+  return error?.toLowerCase().includes("may have been sent") ?? false;
+}
+
 export function isSentBookkeepingError(error?: string | null) {
   return error?.toLowerCase().includes("sent, but local bookkeeping could not be recorded") ?? false;
 }

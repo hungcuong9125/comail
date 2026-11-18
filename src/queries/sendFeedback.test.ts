@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import i18n from "../i18n";
 import { useUi } from "../stores/ui";
-import { handleSendState, isSentBookkeepingError, trackSendToast } from "./sendFeedback";
+import { handleSendState, isSentBookkeepingError, isSendOutcomeUnknown, trackSendToast } from "./sendFeedback";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -83,4 +83,14 @@ it("recognizes accepted SMTP with bookkeeping failure defensively", () => {
   expect(isSentBookkeepingError("SMTP: SENT, BUT LOCAL BOOKKEEPING COULD NOT BE RECORDED: disk full")).toBe(true);
   expect(isSentBookkeepingError("SMTP rejected")).toBe(false);
   expect(isSentBookkeepingError(null)).toBe(false);
+});
+
+it("recognizes ambiguous send outcomes without confusing confirmed acceptance", () => {
+  expect(isSendOutcomeUnknown("send outcome unknown: the message may have been sent, check the Sent folder before resending")).toBe(true);
+  expect(isSendOutcomeUnknown("SMTP: MAY HAVE BEEN SENT")).toBe(true);
+  expect(isSendOutcomeUnknown(undefined)).toBe(false);
+  expect(isSendOutcomeUnknown(null)).toBe(false);
+  expect(isSendOutcomeUnknown("SMTP rejected")).toBe(false);
+  expect(isSendOutcomeUnknown("sent, but local bookkeeping could not be recorded")).toBe(false);
+  expect(isSentBookkeepingError("may have been sent")).toBe(false);
 });
