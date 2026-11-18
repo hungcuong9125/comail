@@ -242,6 +242,7 @@ interface UiState {
   keySequence: string;
   toasts: ToastItem[];
   offline: boolean;
+  networkAccountIds: number[] | null;
   accountOnline: Record<number, boolean>;
   setAccountOnline: (accountId: number, online: boolean) => void;
   retainNetworkAccounts: (accountIds: number[]) => void;
@@ -338,17 +339,19 @@ export const useUi = create<UiState>((set, get) => ({
   keySequence: "",
   toasts: [],
   offline: false,
+  networkAccountIds: null,
   accountOnline: {},
   setAccountOnline: (accountId, online) => set((state) => {
+    if (state.networkAccountIds && !state.networkAccountIds.includes(accountId)) return state;
     const accountOnline = { ...state.accountOnline, [accountId]: online };
-    return { accountOnline, offline: Object.values(accountOnline).every((value) => !value) };
+    return { accountOnline, offline: state.networkAccountIds !== null && state.networkAccountIds.length > 0 && state.networkAccountIds.every((id) => accountOnline[id] === false) };
   }),
   retainNetworkAccounts: (accountIds) => set((state) => {
     const accountOnline = Object.fromEntries(
       accountIds.map((id) => [id, state.accountOnline[id] ?? true]),
     );
     const values = Object.values(accountOnline);
-    return { accountOnline, offline: values.length > 0 && values.every((value) => !value) };
+    return { networkAccountIds: accountIds, accountOnline, offline: values.length > 0 && values.every((value) => !value) };
   }),
   syncStatuses: {},
   lastUndo: null,
