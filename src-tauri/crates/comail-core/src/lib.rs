@@ -1727,6 +1727,20 @@ impl Core {
             .write(move |conn| {
                 let row = repo::messages::get_row(conn, draft_id)?
                     .ok_or_else(|| CoreError::NotFound("draft".into()))?;
+                let is_draft: bool = conn.query_row(
+                    "SELECT is_draft FROM messages WHERE id = ?1",
+                    rusqlite::params![draft_id], |r| r.get(0),
+                )?;
+                if !is_draft {
+                    return Err(CoreError::NotFound("draft (message is not a draft)".into()));
+                }
+                let active: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pending_actions WHERE kind = 'send' AND message_id = ?1 AND state IN ('pending','inflight')",
+                    rusqlite::params![draft_id], |r| r.get(0),
+                )?;
+                if active > 0 {
+                    return Err(CoreError::Other("draft already queued for sending".into()));
+                }
                 let payload = serde_json::json!({ "draftId": draft_id });
                 let aid = repo::actions::enqueue(
                     conn,

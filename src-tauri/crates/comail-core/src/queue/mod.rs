@@ -542,7 +542,12 @@ fn terminal_failure(kind: &str, attempts: i64, error: &CoreError) -> bool {
     if kind == crate::trash::KIND {
         return attempts >= MAX_ATTEMPTS || matches!(error, CoreError::DeleteRejected(_));
     }
-    attempts >= MAX_ATTEMPTS || is_permanent(&error.to_string())
+    attempts >= MAX_ATTEMPTS
+        || match error {
+            CoreError::Smtp(msg) => is_smtp_permanent(msg),
+            _ if kind != "send" => is_permanent(&error.to_string()),
+            _ => false,
+        }
 }
 
 fn needs_fresh_session(error: &CoreError) -> bool {
@@ -559,8 +564,42 @@ fn needs_fresh_session(error: &CoreError) -> bool {
 }
 
 fn is_permanent(msg: &str) -> bool {
-    // IMAP tagged NO responses and SMTP 5xx are not going to succeed on retry.
-    msg.contains("NO ") || msg.contains("550") || msg.contains("553") || msg.contains("bad ")
+    // Preserve IMAP status handling without treating incidental digits as SMTP.
+    msg.contains("NO ") || msg.contains("BAD ") || msg.contains("bad ") || is_smtp_permanent(msg)
+}
+
+#[test]
+fn smtp_reply_classification_uses_code_boundaries() {
+    for reply in [
+        "550 mailbox missing",
+        "553-invalid",
+        "535 auth",
+        " 554 rejected",
+    ] {
+        assert!(is_smtp_permanent(reply));
+    }
+    for reply in [
+        "450 retry",
+        "connection to port 550 failed",
+        "5500 bytes",
+        "bad connection",
+        "NO recipient",
+    ] {
+        assert!(!is_smtp_permanent(reply));
+    }
+    assert!(is_permanent("A1 NO denied"));
+    assert!(is_permanent("A2 BAD command"));
+    assert!(!is_permanent("received 553 bytes"));
+}
+
+fn is_smtp_permanent(msg: &str) -> bool {
+    let reply = msg.trim_start();
+    let bytes = reply.as_bytes();
+    bytes.len() >= 3
+        && bytes[0] == b'5'
+        && bytes[1].is_ascii_digit()
+        && bytes[2].is_ascii_digit()
+        && (bytes.len() == 3 || matches!(bytes[3], b' ' | b'-' | b'\r' | b'\n'))
 }
 
 fn is_connection_failure(msg: &str) -> bool {
@@ -1088,6 +1127,9 @@ async fn send_action(
     };
     tracing::info!(account_id = config.id, draft_id, "smtp send: starting");
 
+    let accepted_id = action.payload["smtpAcceptedAt"]
+        .as_i64()
+        .and_then(|_| action.payload["messageId"].as_str());
     // Load everything needed to build the message.
     let (detail, references) = ctx
         .db
@@ -1152,109 +1194,133 @@ async fn send_action(
         })
         .await?;
 
-    // Staged attachments (read from disk at dispatch time).
-    let att_rows: Vec<(String, String)> = ctx
-        .db
-        .read(move |conn| {
-            let mut stmt = conn
-                .prepare("SELECT file_path, filename FROM draft_attachments WHERE draft_id = ?1")?;
-            let rows = stmt
-                .query_map(rusqlite::params![draft_id], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await?;
-    // Defense in depth: only ever read files inside our own staging root, so a
-    // stale/crafted `draft_attachments` row can't turn dispatch into an
-    // arbitrary local-file read. `save_draft` copies picked files in here.
-    let staging_root = tokio::fs::canonicalize(ctx.paths.draft_attachments_dir())
-        .await
-        .ok();
-    let mut attachments = Vec::new();
-    for (path, filename) in att_rows {
-        let canon = tokio::fs::canonicalize(&path)
+    let (msg_id, raw) = if let Some(message_id) = accepted_id {
+        // Recovery retries local bookkeeping only, never SMTP or attachment reads.
+        (message_id.to_owned(), None)
+    } else {
+        // Staged attachments (read from disk at dispatch time).
+        let att_rows: Vec<(String, String)> = ctx
+            .db
+            .read(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT file_path, filename FROM draft_attachments WHERE draft_id = ?1",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![draft_id], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        // Defense in depth: only ever read files inside our own staging root, so a
+        // stale/crafted `draft_attachments` row can't turn dispatch into an
+        // arbitrary local-file read. `save_draft` copies picked files in here.
+        let staging_root = tokio::fs::canonicalize(ctx.paths.draft_attachments_dir())
             .await
-            .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
-        let within = staging_root
-            .as_ref()
-            .is_some_and(|root| canon.starts_with(root));
-        if !within {
-            return Err(CoreError::Other(format!(
-                "attachment {filename}: refusing to read file outside the staging area"
-            )));
+            .ok();
+        let mut attachments = Vec::new();
+        for (path, filename) in att_rows {
+            let canon = tokio::fs::canonicalize(&path)
+                .await
+                .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
+            let within = staging_root
+                .as_ref()
+                .is_some_and(|root| canon.starts_with(root));
+            if !within {
+                return Err(CoreError::Other(format!(
+                    "attachment {filename}: refusing to read file outside the staging area"
+                )));
+            }
+            let bytes = tokio::fs::read(&canon)
+                .await
+                .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
+            let mime_type = mime_guess_from_name(&filename);
+            attachments.push(crate::mime::OutgoingAttachment {
+                filename,
+                mime_type,
+                bytes,
+            });
         }
-        let bytes = tokio::fs::read(&canon)
-            .await
-            .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
-        let mime_type = mime_guess_from_name(&filename);
-        attachments.push(crate::mime::OutgoingAttachment {
-            filename,
-            mime_type,
-            bytes,
-        });
-    }
 
-    let out = crate::mime::OutgoingMessage {
-        from: from.clone(),
-        to: &detail.to,
-        cc: &detail.cc,
-        bcc: &bcc,
-        subject: &detail.subject,
-        body_text: detail.text_body.as_deref().unwrap_or(""),
-        body_html: detail.html_body.as_deref(),
-        in_reply_to: in_reply_to.as_deref(),
-        references: &refs,
-        message_id_domain: &domain,
-        attachments,
+        let out = crate::mime::OutgoingMessage {
+            from: from.clone(),
+            to: &detail.to,
+            cc: &detail.cc,
+            bcc: &bcc,
+            subject: &detail.subject,
+            body_text: detail.text_body.as_deref().unwrap_or(""),
+            body_html: detail.html_body.as_deref(),
+            in_reply_to: in_reply_to.as_deref(),
+            references: &refs,
+            message_id_domain: &domain,
+            attachments,
+        };
+        let (msg_id, raw) = crate::mime::build_message(&out)?;
+        tracing::debug!(
+            account_id = config.id,
+            draft_id,
+            message_id = %msg_id,
+            bytes = raw.len(),
+            attachments = out.attachments.len(),
+            to = detail.to.len(),
+            cc = detail.cc.len(),
+            bcc = bcc.len(),
+            "smtp send: message built",
+        );
+
+        // SMTP auth.
+        let auth = match config.auth_kind {
+            AuthKind::Password => {
+                smtp::SmtpAuth::Password(credentials::load_async(config.id, Slot::Password).await?)
+            }
+            AuthKind::Oauth2 => {
+                smtp::SmtpAuth::XOAuth2(ctx.tokens.access_token(config.id, config.provider).await?)
+            }
+        };
+
+        let recipients: Vec<String> = detail
+            .to
+            .iter()
+            .chain(detail.cc.iter())
+            .chain(bcc.iter())
+            .map(|a| a.email.clone())
+            .collect();
+        if recipients.is_empty() {
+            return Err(CoreError::Smtp("no recipients".into()));
+        }
+
+        tracing::info!(
+            account_id = config.id,
+            host = %config.smtp_host,
+            port = config.smtp_port,
+            recipients = recipients.len(),
+            "smtp send: dispatching",
+        );
+        smtp::send_raw(config, &auth, &config.email, &recipients, &raw).await?;
+        // A crash between SMTP acceptance and this standalone durable write still
+        // leaves an unavoidable ambiguity; SMTP and SQLite cannot commit atomically.
+        let action_id = action.id;
+        let mut payload = action.payload.clone();
+        payload["smtpAcceptedAt"] = serde_json::json!(now_ms());
+        payload["messageId"] = serde_json::json!(msg_id);
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE pending_actions SET payload = ?2 WHERE id = ?1",
+                    rusqlite::params![action_id, serde_json::to_string(&payload)?],
+                )?;
+                Ok(())
+            })
+            .await?;
+        tracing::info!(account_id = config.id, "smtp send: accepted by server");
+        (msg_id, Some(raw))
     };
-    let (msg_id, raw) = crate::mime::build_message(&out)?;
-    tracing::debug!(
-        account_id = config.id,
-        draft_id,
-        message_id = %msg_id,
-        bytes = raw.len(),
-        attachments = out.attachments.len(),
-        to = detail.to.len(),
-        cc = detail.cc.len(),
-        bcc = bcc.len(),
-        "smtp send: message built",
-    );
-
-    // SMTP auth.
-    let auth = match config.auth_kind {
-        AuthKind::Password => {
-            smtp::SmtpAuth::Password(credentials::load_async(config.id, Slot::Password).await?)
-        }
-        AuthKind::Oauth2 => {
-            smtp::SmtpAuth::XOAuth2(ctx.tokens.access_token(config.id, config.provider).await?)
-        }
-    };
-
-    let recipients: Vec<String> = detail
-        .to
-        .iter()
-        .chain(detail.cc.iter())
-        .chain(bcc.iter())
-        .map(|a| a.email.clone())
-        .collect();
-    if recipients.is_empty() {
-        return Err(CoreError::Smtp("no recipients".into()));
-    }
-
-    tracing::info!(
-        account_id = config.id,
-        host = %config.smtp_host,
-        port = config.smtp_port,
-        recipients = recipients.len(),
-        "smtp send: dispatching",
-    );
-    smtp::send_raw(config, &auth, &config.email, &recipients, &raw).await?;
-    tracing::info!(account_id = config.id, "smtp send: accepted by server");
 
     // Append to Sent (Gmail does this automatically).
-    if config.provider != Provider::Gmail {
+    if config.provider != Provider::Gmail
+        && let Some(raw) = raw
+    {
         let sent = ctx
             .db
             .read({

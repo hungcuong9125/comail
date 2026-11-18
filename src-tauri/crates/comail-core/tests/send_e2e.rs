@@ -208,5 +208,80 @@ async fn reply_send_reaches_smtp_and_sent_folder() {
     })
     .await;
 
-    eprintln!("send e2e OK: SMTP delivery, References headers, Sent APPEND, local thread state");
+    let conn = rusqlite::Connection::open(tmp.path().join("comail.db")).unwrap();
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pending_actions", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        core.queue_send(QueueSendArgs {
+            draft_id,
+            send_at: Some(now_ms())
+        })
+        .await
+        .is_err()
+    );
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pending_actions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after, "non-draft must not enqueue");
+
+    // Simulate recovery after SMTP acceptance, including a missing staged file:
+    // replay must not rebuild MIME or require attachments to still exist.
+    wait_for("first action done", Duration::from_secs(30), || async {
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM pending_actions WHERE id=?1",
+                [result.action_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (state == "done").then_some(())
+    })
+    .await;
+    let payload: String = conn
+        .query_row(
+            "SELECT payload FROM pending_actions WHERE id=?1",
+            [result.action_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&payload).unwrap()["smtpAcceptedAt"].is_number()
+    );
+    conn.execute(
+        "UPDATE pending_actions SET state='inflight' WHERE id=?1",
+        [result.action_id],
+    )
+    .unwrap();
+    comail_core::db::repo::actions::recover_account_inflight(&conn, parent.account_id).unwrap();
+    core.send_now(result.action_id).await.unwrap();
+    wait_for(
+        "accepted action recovered",
+        Duration::from_secs(30),
+        || async {
+            let state: String = conn
+                .query_row(
+                    "SELECT state FROM pending_actions WHERE id=?1",
+                    [result.action_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (state == "done").then_some(())
+        },
+    )
+    .await;
+    let deliveries = std::fs::read_dir(&sink_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry.path().extension().and_then(|s| s.to_str()) == Some("eml")
+                && std::fs::read_to_string(entry.path())
+                    .unwrap()
+                    .contains("revenue section looks solid")
+        })
+        .count();
+    assert_eq!(deliveries, 1, "bookkeeping recovery must not repeat SMTP");
+    eprintln!(
+        "send e2e OK: SMTP delivery, References headers, Sent APPEND, local thread state, accepted recovery"
+    );
 }
