@@ -180,7 +180,11 @@ export function useContactSuggestions(query: string) {
 export function useAccounts() {
   return useQuery({
     queryKey: ["accounts"],
-    queryFn: () => call("list_accounts", {}),
+    queryFn: async () => {
+      const accounts = await call("list_accounts", {});
+      useUi.getState().retainNetworkAccounts(accounts.map((account) => account.id));
+      return accounts;
+    },
     staleTime: 60_000,
   });
 }

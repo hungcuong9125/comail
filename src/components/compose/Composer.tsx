@@ -1,3 +1,4 @@
+import { trackSendToast } from "../../queries/sendFeedback";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
@@ -488,7 +489,7 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         }
 
         if (opts.instant) {
-          pushToast({ kind: "info", message: t("compose:sent"), durationMs: 2500 });
+          trackSendToast(res.actionId, pushToast({ kind: "info", message: t("compose:sending"), durationMs: 60 * 60 * 1000 }));
         } else if (opts.sendAt) {
           pushToast({
             kind: "info",
@@ -516,6 +517,7 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
             actionLabel: t("compose:undo"),
             onAction: () => buildCommandContext().undo(),
           });
+          trackSendToast(res.actionId, toastId);
           useUi.getState().set({
             lastUndo: { type: "send", actionId: res.actionId, toastId, reopen },
           });

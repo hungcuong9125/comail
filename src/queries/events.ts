@@ -17,6 +17,7 @@ import { normalizeSyncStatus } from "../lib/syncStatus";
 import { useUi } from "../stores/ui";
 import { queryClient } from "./client";
 import { handlePermanentDeleteState } from "./permanentDelete";
+import { handleSendState } from "./sendFeedback";
 
 let notifyPermission: boolean | null = null;
 
@@ -187,6 +188,7 @@ export function useBackendEvents() {
       }),
       onEvent("action:state", ({ actionId, kind, state, error }) => {
         const ui = useUi.getState();
+        handleSendState({ actionId, kind, state });
         if (kind === "delete_permanently") {
           handlePermanentDeleteState({ actionId, kind, state, error });
           return;
@@ -246,8 +248,8 @@ export function useBackendEvents() {
           void queryClient.invalidateQueries({ queryKey: ["emailStats"] });
         }
       }),
-      onEvent("network:state", ({ online }) => {
-        useUi.getState().set({ offline: !online });
+      onEvent("network:state", ({ accountId, online }) => {
+        useUi.getState().setAccountOnline(accountId, online);
       }),
       onEvent("calendar:updated", () => {
         void queryClient.invalidateQueries({ queryKey: ["events"] });
@@ -468,7 +470,9 @@ export function useBackendEvents() {
       void refreshStatusSnapshot();
       // Back from sleep: the reconnect backoff timer doesn't advance while the
       // Mac sleeps, so nudge an offline actor to retry right away.
-      if (useUi.getState().offline) void call("sync_now", {}).catch(() => {});
+      if (Object.values(useUi.getState().accountOnline).some((online) => !online)) {
+        void call("sync_now", {}).catch(() => {});
+      }
     };
     const onVisibility = () => {
       if (document.visibilityState === "visible") recoverVisibleMail();

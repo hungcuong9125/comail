@@ -46,6 +46,7 @@ pub enum CoreEvent {
         thread_id: i64,
     },
     NetworkState {
+        account_id: i64,
         online: bool,
     },
     AccountState {

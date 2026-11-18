@@ -242,6 +242,9 @@ interface UiState {
   keySequence: string;
   toasts: ToastItem[];
   offline: boolean;
+  accountOnline: Record<number, boolean>;
+  setAccountOnline: (accountId: number, online: boolean) => void;
+  retainNetworkAccounts: (accountIds: number[]) => void;
   /** Authoritative synchronization state, keyed by account id. */
   syncStatuses: Record<number, SyncStatus>;
   lastUndo: Undoable | null;
@@ -335,6 +338,18 @@ export const useUi = create<UiState>((set, get) => ({
   keySequence: "",
   toasts: [],
   offline: false,
+  accountOnline: {},
+  setAccountOnline: (accountId, online) => set((state) => {
+    const accountOnline = { ...state.accountOnline, [accountId]: online };
+    return { accountOnline, offline: Object.values(accountOnline).every((value) => !value) };
+  }),
+  retainNetworkAccounts: (accountIds) => set((state) => {
+    const accountOnline = Object.fromEntries(
+      accountIds.map((id) => [id, state.accountOnline[id] ?? true]),
+    );
+    const values = Object.values(accountOnline);
+    return { accountOnline, offline: values.length > 0 && values.every((value) => !value) };
+  }),
   syncStatuses: {},
   lastUndo: null,
 

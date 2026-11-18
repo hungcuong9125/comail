@@ -85,8 +85,11 @@ fn emit(app: &AppHandle, ev: CoreEvent) {
         CoreEvent::ThreadWoke { thread_id } => {
             let _ = app.emit("thread:woke", json!({ "threadId": thread_id }));
         }
-        CoreEvent::NetworkState { online } => {
-            let _ = app.emit("network:state", json!({ "online": online }));
+        CoreEvent::NetworkState { account_id, online } => {
+            let _ = app.emit(
+                "network:state",
+                json!({ "accountId": account_id, "online": online }),
+            );
         }
         CoreEvent::AccountState {
             account_id,
