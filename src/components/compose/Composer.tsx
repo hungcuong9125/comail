@@ -489,7 +489,7 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         }
 
         if (opts.instant) {
-          trackSendToast(res.actionId, pushToast({ kind: "info", message: t("compose:sending"), durationMs: 60 * 60 * 1000 }));
+          trackSendToast(res.actionId, pushToast({ kind: "info", message: t("compose:sending"), durationMs: 120_000 }), true);
         } else if (opts.sendAt) {
           pushToast({
             kind: "info",

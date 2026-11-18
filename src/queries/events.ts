@@ -17,7 +17,7 @@ import { normalizeSyncStatus } from "../lib/syncStatus";
 import { useUi } from "../stores/ui";
 import { queryClient } from "./client";
 import { handlePermanentDeleteState } from "./permanentDelete";
-import { handleSendState } from "./sendFeedback";
+import { handleSendState, isSentBookkeepingError } from "./sendFeedback";
 
 let notifyPermission: boolean | null = null;
 
@@ -213,9 +213,10 @@ export function useBackendEvents() {
           }
         }
         if (state === "failed") {
+          const sentWithWarning = kind === "send" && isSentBookkeepingError(error);
           ui.pushToast({
-            kind: "error",
-            message: kind === "send"
+            kind: sentWithWarning ? "info" : "error",
+            message: sentWithWarning ? i18n.t("compose:sentLocalCopyWarning") : kind === "send"
               ? (error ? `Couldn't send: ${error}` : "Sending failed")
               : i18n.t("commands:actionFailed", { detail: error ?? i18n.t("errors:unknown") }),
           });

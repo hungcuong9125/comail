@@ -65,6 +65,8 @@
   "bcc": "Bcc",
   "recipientPlaceholder": "name@example.com",
   "addRecipient": "Thêm ít nhất một người nhận",
+  "stillSending": "Vẫn đang gửi — hãy kiểm tra Hộp thư đi hoặc thư Đã gửi",
+  "sentLocalCopyWarning": "Đã gửi, nhưng Comail chưa cập nhật được bản sao trên máy",
   "sending": "Đang gửi…",
   "sent": "Đã gửi",
   "scheduled": "Đã lên lịch. Sẽ gửi {{date}}",

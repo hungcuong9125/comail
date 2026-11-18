@@ -3006,6 +3006,7 @@ export async function mockInvoke(
       if (p) {
         clearTimeout(p.timer);
         pendingSends.delete(p.draftId);
+        emitMockEvent("action:state", { actionId: p.actionId, kind: "send", state: "cancelled", error: null });
         return delay({ cancelled: true });
       }
       return delay({ cancelled: false });
@@ -3028,8 +3029,10 @@ export async function mockInvoke(
       const actionId = id();
       const timer = setTimeout(
         () => {
+          emitMockEvent("action:state", { actionId, kind: "send", state: "inflight", error: null });
           dispatchSend(q.draftId);
           pendingSends.delete(q.draftId);
+          emitMockEvent("action:state", { actionId, kind: "send", state: "done", error: null });
         },
         Math.max(0, dispatchAt - Date.now()),
       );

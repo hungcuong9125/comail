@@ -67,6 +67,8 @@
   "bcc": "Bcc",
   "recipientPlaceholder": "name@example.com",
   "addRecipient": "Add at least one recipient",
+  "stillSending": "Still sending — check Outbox or Sent",
+  "sentLocalCopyWarning": "Sent, but Comail couldn’t update the local copy",
   "sending": "Sending…",
   "sent": "Sent",
   "scheduled": "Scheduled. Will send {{date}}",
