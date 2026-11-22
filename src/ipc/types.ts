@@ -206,10 +206,33 @@ export interface ConnectionTestResult {
 
 export type ComposeMode = "new" | "reply" | "reply_all" | "forward";
 
-/** A file staged on a draft; the backend reads it from disk at dispatch. */
-export interface DraftAttachment {
-  filePath: string;
+/** How a draft attachment reaches the backend. The webview can only refer to
+ *  sources Rust already approved - never name an arbitrary source path,
+ *  which would be an arbitrary-local-file read/exfil primitive. */
+export type DraftAttachment =
+  /** Opaque single-use token minted by `pick_draft_attachments` (native file
+   *  dialog) or `claim_dropped_attachments` (OS drop). Expires ~30 min; the
+   *  save that consumes it copies the file into staging. */
+  | { kind: "token"; token: string }
+  /** A file already staged on this same draft - the shape `get_draft` and
+   *  `save_draft` return; echoed back verbatim on re-save. `filename` is
+   *  display-only; the persisted name comes from the draft's own row. */
+  | { kind: "staged"; filePath: string; filename: string }
+  /** A received attachment carried into a forward, resolved in Rust by its
+   *  attachments-row id - no filesystem path crosses the IPC boundary. */
+  | { kind: "forward"; attachmentId: number };
+
+/** A user-approved attachment source, returned by `pick_draft_attachments`
+ *  and `claim_dropped_attachments`. Only `token` can reach `save_draft`; the
+ *  rest is display metadata for the attachment chip. */
+export interface ApprovedAttachment {
+  token: string;
   filename: string;
+  /** Canonical source path - chip tooltips and dedupe only; it is not
+   *  accepted as a staging source. */
+  path: string;
+  size: number;
+  mimeType: string | null;
 }
 
 export interface SaveDraftArgs {
@@ -225,6 +248,14 @@ export interface SaveDraftArgs {
   mode: ComposeMode;
   /** message being replied to / forwarded, for References headers + quoting */
   inReplyToMessageId: number | null;
+  attachments: DraftAttachment[];
+}
+
+/** What `save_draft` returns: the draft id plus every attachment as it was
+ *  persisted - always `staged` entries the composer swaps in for one-shot
+ *  `token`/`forward` entries so the next save can echo them. */
+export interface SaveDraftResult {
+  draftId: number;
   attachments: DraftAttachment[];
 }
 
@@ -1203,7 +1234,17 @@ export interface Commands {
   cancel_send(args: { actionId: number }): Promise<{ cancelled: boolean }>;
   send_now(args: { actionId: number }): Promise<{ sent: boolean }>;
 
-  save_draft(args: { args: SaveDraftArgs }): Promise<{ draftId: number }>;
+  /** Opens the native file picker from Rust and returns one approval token
+   *  per chosen file (empty when the dialog was cancelled). */
+  pick_draft_attachments(
+    args: Record<string, never>,
+  ): Promise<ApprovedAttachment[]>;
+  /** Exchanges OS-drop paths Rust observed on the window for approval
+   *  tokens. Paths the Rust drop handler never saw are refused. */
+  claim_dropped_attachments(args: {
+    paths: string[];
+  }): Promise<ApprovedAttachment[]>;
+  save_draft(args: { args: SaveDraftArgs }): Promise<SaveDraftResult>;
   get_draft(args: { draftId: number }): Promise<SaveDraftArgs>;
   delete_draft(args: { draftId: number }): Promise<void>;
   queue_send(args: { args: QueueSendArgs }): Promise<QueueSendResult>;

@@ -20,12 +20,14 @@ import type {
   McpStatus,
   AskCitation,
   AskResult,
+  ApprovedAttachment,
   AttachmentMeta,
   AttachmentPreview,
   CalendarEvent,
   Commands,
   ConnectionTestResult,
   ContactSuggestion,
+  DraftAttachment,
   EmailStats,
   FolderInfo,
   Label,
@@ -36,6 +38,7 @@ import type {
   QueueSendArgs,
   QueueSendResult,
   SaveDraftArgs,
+  SaveDraftResult,
   SearchArgs,
   SearchChip,
   SearchExplain,
@@ -2199,7 +2202,48 @@ interface DraftLoc {
 const draftIndex = new Map<number, DraftLoc>();
 const draftArgsById = new Map<number, SaveDraftArgs>();
 
-function saveDraft(args: SaveDraftArgs): { draftId: number } {
+// Approval tokens the mock mints for picks/drops; mirrors the Rust registry
+// so save_draft can resolve token entries to staged ones.
+const mockAttachmentTokens = new Map<
+  string,
+  { filename: string; path: string; size: number }
+>();
+let mockTokenSeq = 0;
+
+function mockApproved(filename: string, path?: string): ApprovedAttachment {
+  const token = `mock-token-${++mockTokenSeq}`;
+  const p = path ?? `/tmp/comail-mock/${filename}`;
+  mockAttachmentTokens.set(token, { filename, path: p, size: 2048 });
+  return { token, filename, path: p, size: 2048, mimeType: null };
+}
+
+function mockAttachmentName(attachmentId: number): string {
+  for (const t of threads)
+    for (const m of t.messages)
+      for (const a of m.attachments)
+        if (a.id === attachmentId)
+          return a.filename ?? `attachment-${attachmentId}`;
+  return `attachment-${attachmentId}`;
+}
+
+/** Resolve incoming attachment entries to the staged references a real
+ *  save_draft returns (tokens/forward ids become `staged` rows). */
+function stageAttachments(atts: DraftAttachment[]): DraftAttachment[] {
+  return atts.map((a) => {
+    if (a.kind === "staged") return a;
+    const filename =
+      a.kind === "token"
+        ? (mockAttachmentTokens.get(a.token)?.filename ?? "attachment")
+        : mockAttachmentName(a.attachmentId);
+    return {
+      kind: "staged" as const,
+      filePath: `/tmp/comail-mock/staged/${id()}/${filename}`,
+      filename,
+    };
+  });
+}
+
+function saveDraft(args: SaveDraftArgs): SaveDraftResult {
   let loc = args.draftId != null ? draftIndex.get(args.draftId) : undefined;
   let thread: MockThread | undefined;
   let msg: MockMessage | undefined;
@@ -2265,10 +2309,12 @@ function saveDraft(args: SaveDraftArgs): { draftId: number } {
     if (thread && thread.folder === "drafts")
       thread.subject = args.subject || thread.subject;
   }
-  // Staged files replace the draft's attachment set on every save.
-  msg.attachments = (args.attachments ?? []).map((a) => ({
+  // Staged files replace the draft's attachment set on every save; the
+  // stored args keep the staged echoes a real get_draft returns.
+  const staged = stageAttachments(args.attachments ?? []);
+  msg.attachments = staged.map((a) => ({
     id: id(),
-    filename: a.filename,
+    filename: a.kind === "staged" ? a.filename : "attachment",
     mimeType: null,
     size: null,
     isInline: false,
@@ -2279,9 +2325,9 @@ function saveDraft(args: SaveDraftArgs): { draftId: number } {
     to: [...args.to],
     cc: [...args.cc],
     bcc: [...args.bcc],
-    attachments: [...(args.attachments ?? [])],
+    attachments: staged,
   });
-  return { draftId: msg.id };
+  return { draftId: msg.id, attachments: staged };
 }
 
 function getDraft(draftId: number): SaveDraftArgs {
@@ -3087,6 +3133,21 @@ export async function mockInvoke(
       }
       return delay({ cancelled: false });
     }
+
+    case "pick_draft_attachments": {
+      // The mock "dialog" picks one file per click.
+      const n = mockAttachmentTokens.size + 1;
+      return delay([
+        mockApproved(`quarterly-report-${n}.pdf`),
+      ]);
+    }
+
+    case "claim_dropped_attachments":
+      return delay(
+        (a.paths as string[]).map((p) =>
+          mockApproved(p.split(/[\\/]/).pop() || p, p),
+        ),
+      );
 
     case "save_draft":
       return delay(saveDraft(a.args as SaveDraftArgs));

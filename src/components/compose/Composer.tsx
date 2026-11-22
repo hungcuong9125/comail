@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import i18n from "../../i18n";
 import { errorMessage, parseError } from "../../ipc/errors";
 import { call } from "../../ipc/commands";
 import { MOCK_MODE } from "../../ipc/mock";
 import { subscribeEvent } from "../../ipc/events";
-import type { Address, AiDraftAction, DraftAttachment, MessageDetail, Snippet } from "../../ipc/types";
+import type { Address, AiDraftAction, ApprovedAttachment, DraftAttachment, MessageDetail, Snippet } from "../../ipc/types";
 import { RecipientField } from "./RecipientField";
 import { Checkbox } from "../ui/Field";
 import { onComposerAction } from "../../keyboard/commands";
@@ -64,6 +63,52 @@ function forwardBlock(m: MessageDetail): string {
     "",
     m.textBody ?? m.snippet,
   ].join("\n");
+}
+
+/** A composer attachment chip: the `DraftAttachment` the backend consumes
+ *  plus the display metadata the wire type doesn't always carry (a `token`
+ *  entry gets its name from the `ApprovedAttachment` it was minted with). */
+interface AttachmentChip {
+  entry: DraftAttachment;
+  filename: string;
+  /** Source path for tooltip + dedupe on token/staged entries; null for
+   *  forwarded attachments, which are identified by row id. */
+  path: string | null;
+  size: number | null;
+}
+
+/** Stable identity for dedupe/removal: token by token, forward by row id,
+ *  staged by staged path. */
+function attKey(entry: DraftAttachment): string {
+  switch (entry.kind) {
+    case "token":
+      return `tok:${entry.token}`;
+    case "forward":
+      return `fwd:${entry.attachmentId}`;
+    case "staged":
+      return `staged:${entry.filePath}`;
+  }
+}
+
+/** Wrap a wire `DraftAttachment` for display. Staged entries carry their own
+ *  filename; anything else shows the fallback. */
+function chipFromEntry(entry: DraftAttachment): AttachmentChip {
+  return {
+    entry,
+    filename: entry.kind === "staged" ? entry.filename : "attachment",
+    path: entry.kind === "staged" ? entry.filePath : null,
+    size: null,
+  };
+}
+
+/** Wrap an approval result (dialog pick or drop claim) for display. */
+function chipFromApproved(a: ApprovedAttachment): AttachmentChip {
+  return {
+    entry: { kind: "token", token: a.token },
+    filename: a.filename,
+    path: a.path,
+    size: a.size,
+  };
 }
 
 /** The quoted/forwarded original, kept out of the editable body and shown
@@ -228,15 +273,12 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   const [sendLaterOpen, setSendLaterOpen] = useState(false);
   const [snippetOpen, setSnippetOpen] = useState(false);
   const [sending, setSending] = useState(false);
-  const [attachments, setAttachments] = useState<DraftAttachment[]>(
-    state.initial?.attachments ?? [],
+  const [attachments, setAttachments] = useState<AttachmentChip[]>(
+    (state.initial?.attachments ?? []).map(chipFromEntry),
   );
   const [dragOver, setDragOver] = useState(false);
-  /** forwarded originals still being extracted; sending waits for them */
-  const [forwardPending, setForwardPending] = useState(0);
-  const forwardPendingRef = useRef(0);
-  /** the original's extracted files, kept so the toggle can re-add them */
-  const forwardFilesRef = useRef<DraftAttachment[]>([]);
+  /** the original's attachments, kept so the toggle can re-add them */
+  const forwardFilesRef = useRef<AttachmentChip[]>([]);
   const [includeForwardFiles, setIncludeForwardFiles] = useState(true);
   const includeForwardFilesRef = useRef(true);
   const forwardFileCount = (state.replyTo?.attachments ?? []).filter((a) => !a.isInline).length;
@@ -331,7 +373,12 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
               f.quote,
               f.quoteRemoved,
             );
-            const { draftId: newId } = await call("save_draft", {
+            // Snapshot the chips this save consumes: on success the backend
+            // hands back the same attachments as `staged` entries (in order),
+            // which replace one-shot token/forward entries so a later save
+            // can echo them.
+            const snapshot = f.attachments;
+            const result = await call("save_draft", {
               args: {
                 draftId: existingId,
                 accountId: f.accountId,
@@ -343,10 +390,20 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
                 bodyHtml,
                 mode: state.mode,
                 inReplyToMessageId: state.replyTo?.id ?? null,
-                attachments: f.attachments,
+                attachments: snapshot.map((a) => a.entry),
               },
             });
-            return newId;
+            const resolved = result.attachments.map(chipFromEntry);
+            const at = new Map(snapshot.map((a, i) => [a, i]));
+            setAttachments((cur) => {
+              const next = cur.map((a) => {
+                const i = at.get(a);
+                return i == null ? a : resolved[i];
+              });
+              fieldsRef.current.attachments = next;
+              return next;
+            });
+            return result.draftId;
           },
           onSaved: (id, clean) => {
             setDraftId(id);
@@ -427,49 +484,25 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   }, [activeSig]);
 
   // A fresh forward carries the original's files (not inline images, which
-  // belong to the quoted body). Each is extracted to disk, then staged like a
-  // picked file when the draft saves.
+  // belong to the quoted body) by attachments-row id; Rust resolves the ids
+  // to cached bytes when the draft saves - no path ever crosses the IPC.
   useEffect(() => {
     if (state.mode !== "forward" || state.initial || state.draftId) return;
     const files = (state.replyTo?.attachments ?? []).filter((a) => !a.isInline);
     if (files.length === 0) return;
-    let cancelled = false;
-    forwardPendingRef.current = files.length;
-    setForwardPending(files.length);
-    void Promise.all(
-      files.map(async (a) => {
-        try {
-          const filePath = await call("get_attachment", { attachmentId: a.id });
-          if (cancelled) return;
-          const file = { filePath, filename: a.filename ?? t("thread:attachment.fallbackName") };
-          forwardFilesRef.current.push(file);
-          if (!includeForwardFilesRef.current) return;
-          setAttachments((cur) =>
-            cur.some((x) => x.filePath === filePath) ? cur : [...cur, file],
-          );
-        } catch (e) {
-          if (!cancelled) {
-            pushToast({
-              kind: "error",
-              message: t("compose:forwardAttachFailed", {
-                name: a.filename ?? t("thread:attachment.fallbackName"),
-                detail: errorMessage(e),
-              }),
-            });
-          }
-        } finally {
-          if (!cancelled) {
-            forwardPendingRef.current -= 1;
-            setForwardPending(forwardPendingRef.current);
-          }
-        }
-      }),
-    );
-    return () => {
-      cancelled = true;
-      forwardPendingRef.current = 0;
-      forwardFilesRef.current = [];
-    };
+    const chips: AttachmentChip[] = files.map((a) => ({
+      entry: { kind: "forward", attachmentId: a.id },
+      filename: a.filename ?? t("thread:attachment.fallbackName"),
+      path: null,
+      size: a.size ?? null,
+    }));
+    forwardFilesRef.current = chips;
+    if (includeForwardFilesRef.current) {
+      setAttachments((cur) => {
+        const have = new Set(cur.map((x) => attKey(x.entry)));
+        return [...cur, ...chips.filter((c) => !have.has(attKey(c.entry)))];
+      });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -523,10 +556,6 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         pushToast({ kind: "error", message: t("compose:addRecipient"), durationMs: 3000 });
         return;
       }
-      if (forwardPendingRef.current > 0 && includeForwardFilesRef.current) {
-        pushToast({ kind: "info", message: t("compose:forwardAttaching"), durationMs: 3000 });
-        return;
-      }
       if (sending) return;
       setSending(true);
       try {
@@ -562,7 +591,7 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
             subject: f.subject,
             body: htmlToText(f.body),
             bodyHtml: f.body,
-            attachments: f.attachments,
+            attachments: f.attachments.map((a) => a.entry),
           },
         };
         closeComposer();
@@ -633,37 +662,24 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
     [saver, sending, state.mode, state.replyTo, closeComposer, pushToast, t],
   );
 
-  // Merge picked/dropped paths into the attachment list, skipping dupes.
-  const stageAttachmentPaths = (paths: string[]) => {
+  // Merge approved picks/drops into the attachment list, skipping dupes by
+  // their canonical source path.
+  const addApproved = (approved: ApprovedAttachment[]) => {
+    if (approved.length === 0) return;
     setAttachments((cur) => [
       ...cur,
-      ...paths
-        .filter((p) => !cur.some((a) => a.filePath === p))
-        .map((p) => ({ filePath: p, filename: p.split(/[\\/]/).pop() || p })),
+      ...approved
+        .filter((p) => !cur.some((a) => a.path === p.path))
+        .map(chipFromApproved),
     ]);
     markDirty();
   };
 
-  // Stage files to attach; the backend reads them from disk at dispatch time.
+  // The backend opens the native dialog itself and returns approval tokens;
+  // the webview never sees a usable source path.
   const attachFiles = useCallback(async () => {
-    if (MOCK_MODE) {
-      // fake picker: add one mock file chip
-      setAttachments((cur) => [
-        ...cur,
-        {
-          filePath: `/tmp/comail-mock/quarterly-report-${cur.length + 1}.pdf`,
-          filename: `quarterly-report-${cur.length + 1}.pdf`,
-        },
-      ]);
-      markDirty();
-      return;
-    }
     try {
-      const picked = await openFileDialog({ multiple: true });
-      if (!picked) return;
-      const paths = Array.isArray(picked) ? picked : [picked];
-      if (paths.length === 0) return;
-      stageAttachmentPaths(paths);
+      addApproved(await call("pick_draft_attachments", {}));
     } catch (err) {
       pushToast({
         kind: "error",
@@ -684,7 +700,20 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
       .onDragDropEvent((event) => {
         if (event.payload.type === "drop") {
           setDragOver(false);
-          stageAttachmentPaths(event.payload.paths);
+          // The Rust window-event handler already registered these paths as
+          // a real OS drop; the claim only exchanges paths Rust saw.
+          void call("claim_dropped_attachments", {
+            paths: event.payload.paths,
+          })
+            .then(addApproved)
+            .catch((err) =>
+              pushToast({
+                kind: "error",
+                message: t("compose:couldntPickFiles", {
+                  error: errorMessage(err),
+                }),
+              }),
+            );
         } else if (event.payload.type === "enter" || event.payload.type === "over") {
           setDragOver(true);
         } else {
@@ -704,16 +733,16 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
     includeForwardFilesRef.current = next;
     setIncludeForwardFiles(next);
     const files = forwardFilesRef.current;
-    const paths = new Set(files.map((f) => f.filePath));
+    const keys = new Set(files.map((f) => attKey(f.entry)));
     setAttachments((cur) => {
-      const rest = cur.filter((a) => !paths.has(a.filePath));
+      const rest = cur.filter((a) => !keys.has(attKey(a.entry)));
       return next ? [...rest, ...files] : rest;
     });
     markDirty();
   };
 
-  const removeAttachment = (filePath: string) => {
-    setAttachments((cur) => cur.filter((a) => a.filePath !== filePath));
+  const removeAttachment = (key: string) => {
+    setAttachments((cur) => cur.filter((a) => attKey(a.entry) !== key));
     markDirty();
   };
 
@@ -1268,19 +1297,17 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
                   />
                 </div>
               )}
-              {includeForwardFiles && forwardPending > 0 && (
-                <span className="co-chip text-ink-faint">
-                  <Icon name="paperclip" size={11} />
-                  {t("compose:forwardAttachingCount", { count: forwardPending })}
-                </span>
-              )}
               {attachments.map((a) => (
-                <span key={a.filePath} className="co-chip" title={a.filePath}>
+                <span
+                  key={attKey(a.entry)}
+                  className="co-chip"
+                  title={a.path ?? a.filename}
+                >
                   <Icon name="paperclip" size={11} />
                   {a.filename}
                   <button
                     className="ml-0.5 rounded px-0.5 text-ink-faint hover:text-danger"
-                    onClick={() => removeAttachment(a.filePath)}
+                    onClick={() => removeAttachment(attKey(a.entry))}
                     aria-label={t("compose:removeNamed", { name: a.filename })}
                   >
                     ×
