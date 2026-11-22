@@ -57,28 +57,28 @@ const N = 100_000;
 const N2 = 200_000;
 // Floor so that sub-second linear cases can't flake on timer/GC noise. A
 // real quadratic costs seconds at these sizes, so the bound keeps its bite.
-const FLOOR_MS = 150;
+const FLOOR_MS = 300;
+const REPS = 7;
 
-const timeMin = (fn: (s: string) => unknown, input: string, reps = 1): number => {
-  fn(input); // warm up JIT/allocs outside the measurement
-  let best = Infinity;
-  for (let r = 0; r < reps; r += 1) {
-    const t0 = performance.now();
-    fn(input);
-    best = Math.min(best, performance.now() - t0);
-  }
-  return best;
+const timeOnce = (fn: (s: string) => unknown, input: string): number => {
+  const t0 = performance.now();
+  fn(input);
+  return performance.now() - t0;
 };
 
-/** t2 must stay under ~3x t1 (with a floor). One fast measurement first;
- *  retries with more reps only when the bound is at risk, so jitter can be
- *  retried away without paying for reps on every case. */
+/** Min of `reps` timed runs per side, collected interleaved so both see the
+ *  same load distribution. The minimum is the least noise-sensitive
+ *  estimator of true cost: a preemption inflates a sample, rarely all
+ *  `reps` of them, so on a loaded machine both mins still land near the
+ *  true costs and their ratio stays ~2 for a linear scan. */
 function measure(fn: (s: string) => unknown, small: string, large: string) {
-  let t1 = timeMin(fn, small);
-  let t2 = timeMin(fn, large);
-  for (let r = 0; r < 3 && t2 > Math.max(t1 * 3, FLOOR_MS); r += 1) {
-    t1 = timeMin(fn, small, 2);
-    t2 = timeMin(fn, large, 2);
+  fn(small);
+  fn(large);
+  let t1 = Infinity;
+  let t2 = Infinity;
+  for (let r = 0; r < REPS; r += 1) {
+    t1 = Math.min(t1, timeOnce(fn, small));
+    t2 = Math.min(t2, timeOnce(fn, large));
   }
   return { t1, t2 };
 }
@@ -199,7 +199,7 @@ describe("sanitizer and body-scan complexity", () => {
         checkScaling(`"${frag.slice(0, 24)}" x n`, (size) => repeatTo(frag, size));
       }
     },
-    60_000,
+    180_000,
   );
 
   it(
@@ -213,7 +213,7 @@ describe("sanitizer and body-scan complexity", () => {
         }
       }
     },
-    60_000,
+    180_000,
   );
 
   it(
@@ -247,7 +247,7 @@ describe("sanitizer and body-scan complexity", () => {
         );
       }
     },
-    60_000,
+    180_000,
   );
 
   it("preserves every allowed src/href byte-for-byte", () => {

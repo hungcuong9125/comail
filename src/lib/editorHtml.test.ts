@@ -210,33 +210,57 @@ describe("sanitizeEditorHtml", () => {
     expect((shallow.match(/<\/div>/g) ?? []).length).toBe(256);
   });
 
-  it("stays fast on pathological and large inputs", () => {
-    const timed = (html: string, minLen = 100_000) => {
-      expect(html.length).toBeGreaterThanOrEqual(minLen);
-      const t0 = performance.now();
-      sanitizeEditorHtml(html);
-      expect(performance.now() - t0).toBeLessThan(1000);
-    };
-    // Unterminated-tag soup (was quadratic in the regex tokenizer).
-    timed(`<div>${"<a ".repeat(12000)}x${"<b href=\"".repeat(12000)}`);
-    // Deep same-tag nesting, then deep nesting + mismatched end tags
-    // (was quadratic in the stack scans).
-    timed("<div>".repeat(80_000), 400_000);
-    timed(`${"<span>".repeat(30_000)}${"</b>".repeat(30_000)}`, 300_000);
-    // Alternating implied closes, and a flood of unmatched end tags.
-    timed("<p>x<div>".repeat(30_000), 200_000);
-    timed("</b>".repeat(50_000), 200_000);
-    // One tag with tens of thousands of attributes, one attribute of ~1 MB.
-    timed(`<div ${Array.from({ length: 30_000 }, (_, i) => `a${i}="v"`).join(" ")}>x`);
-    timed(`<div title="${"v".repeat(1_000_000)}">x`, 1_000_000);
-    // A style attribute with tens of thousands of declarations.
-    timed(`<div style="${"color:red;".repeat(30_000)}">x`, 300_000);
-    // Ordinary well-formed mail HTML at multi-MB scale.
-    timed(
-      `<div>Hi <b>there</b>, <a href="https://x.dev">link</a><br></div>`.repeat(50_000),
-      3_000_000,
-    );
-  });
+  it(
+    "stays fast on pathological and large inputs",
+    () => {
+      // Calibrate on a known-linear baseline - the sanitizer over ordinary
+      // well-formed mail HTML - so the bound tracks this machine's speed
+      // instead of a fixed wall-clock millisecond count.
+      const mailUnit = `<div>Hi <b>there</b>, <a href="https://x.dev">link</a><br></div>`;
+      const baseline = mailUnit.repeat(15_000); // ~1 MB
+      const run = (html: string) => {
+        const t0 = performance.now();
+        sanitizeEditorHtml(html);
+        return performance.now() - t0;
+      };
+      run(baseline); // warm up outside the measurement
+      let baselineMs = Infinity;
+      for (let i = 0; i < 3; i += 1) baselineMs = Math.min(baselineMs, run(baseline));
+      const perByteMs = baselineMs / baseline.length;
+      // 6x the baseline's per-byte cost, plus an absolute floor for timer
+      // granularity. Linear cases measure at ~1x baseline; the historical
+      // quadratics this guards were 10x-1000x.
+      const boundFor = (len: number) => Math.max(perByteMs * len * 6, 250);
+
+      const timed = (html: string, minLen = 100_000) => {
+        expect(html.length).toBeGreaterThanOrEqual(minLen);
+        // Min of 3: the least noise-sensitive estimate of true cost.
+        let best = Infinity;
+        for (let i = 0; i < 3; i += 1) best = Math.min(best, run(html));
+        expect(best).toBeLessThan(boundFor(html.length));
+      };
+      // Unterminated-tag soup (was quadratic in the regex tokenizer).
+      timed(`<div>${"<a ".repeat(12000)}x${"<b href=\"".repeat(12000)}`);
+      // Deep same-tag nesting, then deep nesting + mismatched end tags
+      // (was quadratic in the stack scans).
+      timed("<div>".repeat(80_000), 400_000);
+      timed(`${"<span>".repeat(30_000)}${"</b>".repeat(30_000)}`, 300_000);
+      // Alternating implied closes, and a flood of unmatched end tags.
+      timed("<p>x<div>".repeat(30_000), 200_000);
+      timed("</b>".repeat(50_000), 200_000);
+      // One tag with tens of thousands of attributes, one attribute of ~1 MB.
+      timed(`<div ${Array.from({ length: 30_000 }, (_, i) => `a${i}="v"`).join(" ")}>x`);
+      timed(`<div title="${"v".repeat(1_000_000)}">x`, 1_000_000);
+      // A style attribute with tens of thousands of declarations.
+      timed(`<div style="${"color:red;".repeat(30_000)}">x`, 300_000);
+      // Ordinary well-formed mail HTML at multi-MB scale.
+      timed(
+        `<div>Hi <b>there</b>, <a href="https://x.dev">link</a><br></div>`.repeat(50_000),
+        3_000_000,
+      );
+    },
+    30_000,
+  );
 
   it("returns empty for empty input", () => {
     expect(sanitizeEditorHtml("")).toBe("");
