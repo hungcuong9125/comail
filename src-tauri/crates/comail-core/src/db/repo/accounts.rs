@@ -91,7 +91,7 @@ pub fn insert(conn: &Connection, a: &NewAccount) -> Result<i64> {
 /// thousands of messages; batching keeps each contentless-delete index update
 /// (and the rowid subquery materialization) bounded instead of one giant
 /// delete inside the single writer's transaction.
-const FTS_DELETE_BATCH: i64 = 5_000;
+pub const FTS_DELETE_BATCH: i64 = 5_000;
 
 /// Delete an account and every auxiliary structure keyed to it that the FK
 /// cascade does not reach. Must run inside the caller's transaction: the FTS
@@ -109,20 +109,28 @@ const FTS_DELETE_BATCH: i64 = 5_000;
 /// labels, snoozes, pending actions, embeddings, calendar/contacts sync
 /// state, sync_failures, notification_outbox, ...) is covered by an
 /// `ON DELETE CASCADE` back to `accounts` or `messages`.
-pub fn delete(conn: &Connection, id: i64) -> Result<()> {
+/// Deletes up to one batch of the account's `messages_fts` rows; returns the
+/// number deleted. Callers loop until the result is short of the batch size.
+/// Split into per-batch transactions by `remove_account` so the single FIFO
+/// writer stays responsive on large accounts.
+pub fn sweep_fts_batch(conn: &Connection, id: i64) -> Result<usize> {
     // The LIMIT must bound the FTS rowids, not the message ids: the messages
     // rows are only dropped by the cascade below, so limiting their SELECT
-    // would return the same first N ids on every pass and stop early. Each
-    // pass deletes up to BATCH of the account's remaining FTS rows.
+    // would return the same first N ids on every pass and stop early.
+    Ok(conn.execute(
+        "DELETE FROM messages_fts WHERE rowid IN (
+             SELECT rowid FROM messages_fts
+             WHERE rowid IN (SELECT id FROM messages WHERE account_id = ?1)
+             LIMIT ?2)",
+        params![id, FTS_DELETE_BATCH],
+    )?)
+}
+
+pub fn delete(conn: &Connection, id: i64) -> Result<()> {
+    // Re-sweep inside the final transaction: it catches any rows re-indexed
+    // between the pre-commit sweep batches and this delete (normally none).
     loop {
-        let n = conn.execute(
-            "DELETE FROM messages_fts WHERE rowid IN (
-                 SELECT rowid FROM messages_fts
-                 WHERE rowid IN (SELECT id FROM messages WHERE account_id = ?1)
-                 LIMIT ?2)",
-            params![id, FTS_DELETE_BATCH],
-        )?;
-        if n < FTS_DELETE_BATCH as usize {
+        if sweep_fts_batch(conn, id)? < FTS_DELETE_BATCH as usize {
             break;
         }
     }
