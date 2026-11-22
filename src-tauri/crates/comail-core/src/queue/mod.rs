@@ -1425,7 +1425,7 @@ fn finalize_sent_draft(
 }
 
 /// Tiny extension-based MIME guess for outgoing attachments.
-fn mime_guess_from_name(name: &str) -> String {
+pub(crate) fn mime_guess_from_name(name: &str) -> String {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "pdf" => "application/pdf",

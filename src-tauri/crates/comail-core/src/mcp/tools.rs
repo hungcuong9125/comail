@@ -478,7 +478,8 @@ pub(super) async fn call(core: &Core, name: &str, args: Value) -> ToolResult {
                     in_reply_to_message_id: None,
                     attachments: Vec::new(),
                 })
-                .await?;
+                .await?
+                .draft_id;
             json!({ "draft_id": draft_id, "status": "saved to Drafts in comail (not sent)" })
         }
         "create_reply_draft" => {
@@ -496,7 +497,7 @@ pub(super) async fn call(core: &Core, name: &str, args: Value) -> ToolResult {
                 .map(|a| a.email.to_lowercase())
                 .collect();
             let draft = reply_draft(&original, &body, reply_all, &own);
-            let draft_id = core.save_draft(draft).await?;
+            let draft_id = core.save_draft(draft).await?.draft_id;
             json!({ "draft_id": draft_id, "status": "reply saved to Drafts in comail (not sent)" })
         }
         "update_draft" => {

@@ -332,11 +332,41 @@ pub struct ActionResult {
     pub action_ids: Vec<i64>,
 }
 
+/// How a draft attachment reaches the staging area. The webview can never
+/// name a source path: a compromised renderer with path-passing ability
+/// could attach (and then send) any readable local file. Every variant
+/// therefore refers to something Rust has authority over.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum DraftAttachmentIn {
+    /// A file the user approved through a trusted Rust path - the native
+    /// file dialog or an OS drop exchanged via `claim_dropped_attachments`.
+    /// The token is opaque, single-use and expires (see `approval.rs`); the
+    /// staged copy is taken at save time.
+    Token { token: String },
+    /// A file already staged under the staging root that THIS draft already
+    /// references - the shape `get_draft` and `save_draft` return, echoed
+    /// back on re-save. `filename` is echoed for display only; the persisted
+    /// name comes from the draft's existing row.
+    Staged { file_path: String, filename: String },
+    /// A received attachment carried into a forward, resolved in Rust by its
+    /// `attachments` row id - never a filesystem path from the caller.
+    Forward { attachment_id: i64 },
+}
+
+/// A user-approved attachment source: what `pick_draft_attachments` and
+/// `claim_dropped_attachments` return. `token` is the only part `save_draft`
+/// can consume; the rest is display metadata for the attachment chip.
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DraftAttachmentIn {
-    pub file_path: String,
+pub struct ApprovedAttachment {
+    pub token: String,
     pub filename: String,
+    /// Canonical source path - chip tooltips and dedupe only; it cannot be
+    /// used as a staging source again.
+    pub path: String,
+    pub size: u64,
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -355,6 +385,16 @@ pub struct SaveDraftArgs {
     pub mode: String,
     pub in_reply_to_message_id: Option<i64>,
     #[serde(default)]
+    pub attachments: Vec<DraftAttachmentIn>,
+}
+
+/// What `save_draft` returns: the draft id plus every attachment as it was
+/// persisted - always `Staged` entries the caller echoes back on re-save
+/// (one-shot `Token`/`Forward` entries must not be replayed).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDraftResult {
+    pub draft_id: i64,
     pub attachments: Vec<DraftAttachmentIn>,
 }
 
