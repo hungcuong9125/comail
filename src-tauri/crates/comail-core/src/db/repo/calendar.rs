@@ -40,6 +40,9 @@ pub struct SyncRow {
     pub caldav_href: Option<String>,
     pub etag: Option<String>,
     pub ical_raw: Option<String>,
+    /// Occurrence start the last reminder fired for (the reminder scan reads
+    /// it here instead of a second query per master).
+    pub notified_at: Option<i64>,
     pub deleted: bool,
 }
 
@@ -51,6 +54,7 @@ fn sync_row(row: &Row) -> rusqlite::Result<SyncRow> {
         caldav_href: row.get("caldav_href")?,
         etag: row.get("etag")?,
         ical_raw: row.get("ical_raw")?,
+        notified_at: row.get("notified_at")?,
         deleted: row.get::<_, i64>("deleted")? != 0,
     })
 }
