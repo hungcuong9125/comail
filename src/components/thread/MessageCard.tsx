@@ -677,6 +677,34 @@ function HtmlBody({ html: fullHtml, messageId }: { html: string; messageId: numb
   const onLoad = () => {
     const doc = iframeRef.current?.contentDocument;
     if (!doc?.body) return;
+    // The sandboxed iframe runs no scripts, so links can't reach a browser on
+    // their own. Intercept EVERY activation of an anchored link from out here:
+    // http(s)/mailto go to the OS (default browser / mail client), #anchors
+    // keep their native in-document scroll, and anything else (data:, cid:,
+    // javascript:, relative paths) is swallowed so it can never navigate the
+    // iframe or the app window. Middle-click arrives as auxclick; keyboard
+    // activation arrives as a plain click, so both paths land here.
+    //
+    // This runs FIRST on every load - before fitWidth, dark-mode adaptation
+    // and the observers below - so an exception in a later step can never
+    // leave a loaded document without link interception (in which case an
+    // http link would navigate the frame itself). Listeners attach to the
+    // fresh contentDocument, so each srcdoc reload re-registers them.
+    const onLinkActivation = (e: Event) => {
+      if (e.type === "auxclick" && (e as MouseEvent).button !== 1) return;
+      const anchor = (e.target as HTMLElement | null)?.closest?.("a[href]") as
+        | HTMLAnchorElement
+        | null;
+      if (!anchor) return;
+      const action = bodyLinkAction(anchor.getAttribute("href"));
+      if (action === "native") return;
+      e.preventDefault();
+      if (action === "external") {
+        void openUrl(anchor.href).catch(() => {});
+      }
+    };
+    doc.addEventListener("click", onLinkActivation, true);
+    doc.addEventListener("auxclick", onLinkActivation, true);
     // Fresh document (srcDoc/theme change) starts unzoomed.
     zoomRef.current = 1;
     // Blend the email into the dark theme now that its CSS has resolved. On the
@@ -747,28 +775,6 @@ function HtmlBody({ html: fullHtml, messageId }: { html: string; messageId: numb
       if (mod && (key === "a" || key === "x" || key === "v")) return;
       dispatchKeyboardEvent(e);
     });
-    // The sandboxed iframe runs no scripts, so links can't reach a browser on
-    // their own. Intercept EVERY activation of an anchored link from out here:
-    // http(s)/mailto go to the OS (default browser / mail client), #anchors
-    // keep their native in-document scroll, and anything else (data:, cid:,
-    // javascript:, relative paths) is swallowed so it can never navigate the
-    // iframe or the app window. Middle-click arrives as auxclick; keyboard
-    // activation arrives as a plain click, so both paths land here.
-    const onLinkActivation = (e: Event) => {
-      if (e.type === "auxclick" && (e as MouseEvent).button !== 1) return;
-      const anchor = (e.target as HTMLElement | null)?.closest?.("a[href]") as
-        | HTMLAnchorElement
-        | null;
-      if (!anchor) return;
-      const action = bodyLinkAction(anchor.getAttribute("href"));
-      if (action === "native") return;
-      e.preventDefault();
-      if (action === "external") {
-        void openUrl(anchor.href).catch(() => {});
-      }
-    };
-    doc.addEventListener("click", onLinkActivation, true);
-    doc.addEventListener("auxclick", onLinkActivation, true);
   };
 
   useEffect(() => () => observerRef.current?.disconnect(), []);
