@@ -13,10 +13,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use sha2::Digest;
+
+use crate::netguard;
 
 /// How long a resolved picture (or a miss) is trusted before re-checking.
 const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -71,7 +74,11 @@ fn http() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
-            .redirect(reqwest::redirect::Policy::limited(3))
+            // Every hop (initial request and each redirect) must stay on
+            // public https destinations; DNS answers are filtered to public
+            // addresses at connect time.
+            .dns_resolver(netguard::dns_resolver())
+            .redirect(netguard::redirect_policy(3))
             .user_agent(concat!("comail/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default()
@@ -90,14 +97,18 @@ fn data_url(mime: &str, bytes: &[u8]) -> String {
 pub async fn resolve(data_dir: &Path, email: &str) -> Option<String> {
     let email = email.trim().to_ascii_lowercase();
     let domain = email.rsplit_once('@')?.1.to_string();
-    if domain.is_empty() || !domain.contains('.') {
+    // The domain is attacker-controlled (any From address). It must be a
+    // real DNS hostname before it steers fetches — and it never goes near a
+    // path raw: cache files are named by its hash, like the person key.
+    if !netguard::is_dns_hostname(&domain) {
         return None;
     }
     let dir = data_dir.join("avatars");
     let hash = hex(&sha2::Sha256::digest(email.as_bytes()));
+    let domain_hash = hex(&sha2::Sha256::digest(domain.as_bytes()));
 
     let person_key = dir.join(format!("p-{hash}"));
-    let domain_key = dir.join(format!("d-{domain}"));
+    let domain_key = dir.join(format!("d-{domain_hash}"));
     let use_logo = !WEBMAIL_DOMAINS.contains(&domain.as_str());
 
     // Fast path: everything needed is already cached.
@@ -162,12 +173,22 @@ async fn gravatar(hash: &str) -> Option<String> {
     fetch_image(&format!("https://gravatar.com/avatar/{hash}?s=96&d=404")).await
 }
 
-async fn bimi(domain: &str) -> Option<String> {
-    let resolver = hickory_resolver::TokioResolver::builder_tokio()
+/// One DNS resolver for all BIMI lookups; building it reads system config.
+/// A build failure is not cached, so a transient failure can still recover.
+fn dns() -> Option<&'static hickory_resolver::TokioResolver> {
+    static RESOLVER: OnceLock<hickory_resolver::TokioResolver> = OnceLock::new();
+    if let Some(r) = RESOLVER.get() {
+        return Some(r);
+    }
+    let built = hickory_resolver::TokioResolver::builder_tokio()
         .ok()?
         .build()
         .ok()?;
-    let txt = resolver
+    Some(RESOLVER.get_or_init(|| built))
+}
+
+async fn bimi(domain: &str) -> Option<String> {
+    let txt = dns()?
         .txt_lookup(format!("default._bimi.{domain}."))
         .await
         .ok()?;
@@ -199,9 +220,15 @@ fn bimi_logo_url(record: &str) -> Option<String> {
         .filter(|v| v.starts_with("https://"))
 }
 
-/// GET an image; None unless it is a real, reasonably sized image.
+/// GET an image; None unless it is a real, reasonably sized image. The URL
+/// comes from a sender domain or a BIMI record, so it must be https and land
+/// somewhere public — the shared client's DNS filter and redirect policy
+/// enforce the same on every connection and hop.
 async fn fetch_image(url: &str) -> Option<String> {
-    let resp = http().get(url).send().await.ok()?;
+    let url = url::Url::parse(url)
+        .ok()
+        .filter(netguard::is_public_https_url)?;
+    let mut resp = http().get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -223,12 +250,25 @@ async fn fetch_image(url: &str) -> Option<String> {
     {
         return None;
     }
-    let bytes = resp.bytes().await.ok()?;
-    if bytes.len() < 64 || bytes.len() > MAX_BYTES {
+    let bytes = read_capped(&mut resp).await?;
+    if bytes.len() < 64 {
         return None;
     }
     let mime = sniff_mime(&mime, &bytes)?;
     Some(data_url(mime, &bytes))
+}
+
+/// Read a body chunk by chunk, aborting as soon as it exceeds `MAX_BYTES` —
+/// a malicious server must never get us to buffer more than the cap.
+async fn read_capped(resp: &mut reqwest::Response) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if buf.len() + chunk.len() > MAX_BYTES {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(buf)
 }
 
 /// Trust the declared type only when it is an image; favicons are often
@@ -275,9 +315,28 @@ fn org_domain(domain: &str) -> String {
     labels[n - keep..].join(".")
 }
 
+/// Only `p-<sha256>`/`d-<sha256>` file names are cache keys. Both `cached`
+/// and `store` refuse anything else, so even a future bug that lets attacker
+/// input reach the key cannot read or write outside the avatars dir.
+fn is_cache_key(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(hex_part) = name.strip_prefix("p-").or_else(|| name.strip_prefix("d-")) else {
+        return false;
+    };
+    hex_part.len() == 64
+        && hex_part
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
 /// Cache file contents: `Some(Some(url))` hit, `Some(None)` cached miss,
 /// `None` absent or expired.
 fn cached(path: &PathBuf) -> Option<Option<String>> {
+    if !is_cache_key(path) {
+        return None;
+    }
     let meta = std::fs::metadata(path).ok()?;
     let age = meta
         .modified()
@@ -291,14 +350,31 @@ fn cached(path: &PathBuf) -> Option<Option<String>> {
 }
 
 fn store(path: &Path, value: Option<&str>) {
+    if !is_cache_key(path) {
+        return;
+    }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     // Write-then-rename so a concurrent reader never sees half a data URL.
-    let tmp = path.with_extension("part");
+    // The temp name must be unique per call: with_extension("part") would
+    // make d-example.com and d-example.org share d-example.part while up to
+    // MAX_CONCURRENT stores run at once.
+    let tmp = temp_path(path);
     if std::fs::write(&tmp, value.unwrap_or("")).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
+}
+
+/// `<name>.<pid>-<counter>.part`: unique across calls and processes.
+fn temp_path(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("x");
+    path.with_file_name(format!(
+        "{name}.{}-{}.part",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -367,13 +443,107 @@ mod tests {
     #[test]
     fn cache_round_trip_hit_and_miss() {
         let dir = std::env::temp_dir().join(format!("comail-avatars-{}", std::process::id()));
-        let hit = dir.join("p-hit");
-        let miss = dir.join("p-miss");
+        let hit = dir.join(format!("p-{}", "a".repeat(64)));
+        let miss = dir.join(format!("p-{}", "b".repeat(64)));
         store(&hit, Some("data:image/png;base64,AA"));
         store(&miss, None);
         assert_eq!(cached(&hit), Some(Some("data:image/png;base64,AA".into())));
         assert_eq!(cached(&miss), Some(None));
-        assert_eq!(cached(&dir.join("absent")), None);
+        assert_eq!(cached(&dir.join(format!("p-{}", "c".repeat(64)))), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_keys_must_be_hashes() {
+        assert!(is_cache_key(Path::new(&format!("p-{}", "0".repeat(64)))));
+        assert!(is_cache_key(Path::new(&format!("d-{}", "f".repeat(64)))));
+        for bad in [
+            "d-example.com",
+            "p-hit",
+            "../x",
+            "p-",
+            "d-a/../../comail.db",
+            "x-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(!is_cache_key(Path::new(bad)), "{bad} must not be a key");
+        }
+        // A 63- or 65-char suffix is not a sha256 hex digest.
+        assert!(!is_cache_key(Path::new(&format!("p-{}", "a".repeat(63)))));
+        assert!(!is_cache_key(Path::new(&format!("p-{}", "a".repeat(65)))));
+    }
+
+    /// cached()/store() never touch a path that is not a key name, even
+    /// when it exists and is readable.
+    #[test]
+    fn cache_io_refuses_non_key_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("comail.db");
+        std::fs::write(&outside, "sentinel").unwrap();
+        assert_eq!(cached(&outside), None);
+        store(&outside, Some("data:image/png;base64,AA"));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "sentinel");
+    }
+
+    /// Every traversal/bogus domain is refused before any filesystem or
+    /// network work, and nothing outside the avatars dir is touched.
+    #[tokio::test]
+    async fn traversal_domains_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("comail.db");
+        std::fs::write(&sentinel, "sentinel").unwrap();
+        for email in [
+            "x@a/../../comail.db",
+            "x@..",
+            "x@a\\..\\comail.db",
+            "x@a/b.com",
+            "x@127.0.0.1",
+            "x@[::1]",
+            "x@a..com",
+            "x@-bad.com",
+            "x@localhost",
+            "x@foo.localhost",
+        ] {
+            assert_eq!(resolve(dir.path(), email).await, None, "{email}");
+        }
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "sentinel");
+        // Nothing was created for these addresses at all.
+        let avatars_dir = dir.path().join("avatars");
+        assert!(!avatars_dir.exists() || std::fs::read_dir(&avatars_dir).unwrap().count() == 0);
+    }
+
+    /// The .part temp name is unique per call, so two concurrent stores of
+    /// different keys can never share one.
+    #[test]
+    fn temp_names_are_unique() {
+        let p = Path::new("/tmp/x").join(format!("d-{}", "a".repeat(64)));
+        let t1 = temp_path(&p);
+        let t2 = temp_path(&p);
+        assert_ne!(t1, t2);
+        assert!(t1.file_name().unwrap().to_string_lossy().ends_with(".part"));
+    }
+
+    /// Oversized bodies are aborted mid-read instead of buffered whole.
+    #[tokio::test]
+    async fn read_capped_aborts_oversized_body() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // No content-length: the client cannot pre-check the size.
+            let head = b"HTTP/1.0 200 OK\r\ncontent-type: image/png\r\n\r\n";
+            if s.write_all(head).await.is_err() {
+                return;
+            }
+            let _ = s.write_all(&vec![b'x'; MAX_BYTES + 4096]).await;
+            let _ = s.shutdown().await;
+        });
+        let client = reqwest::Client::new();
+        let mut resp = client
+            .get(format!("http://127.0.0.1:{port}/x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_capped(&mut resp).await, None);
     }
 }
