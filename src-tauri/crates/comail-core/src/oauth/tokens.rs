@@ -262,7 +262,8 @@ impl TokenProvider {
         if let Some(tok) = self.cached_scoped(&key).await {
             return Ok(tok);
         }
-        let (client_id, client_secret) = crate::oauth::providers::resolve_credentials(provider)?;
+        let (client_id, client_secret) =
+            crate::oauth::providers::resolve_credentials(provider).await?;
         let refresh_token = credentials::load_async(account_id, Slot::RefreshToken).await?;
 
         let mut form = vec![
@@ -311,7 +312,8 @@ impl TokenProvider {
         provider: Provider,
         token_url: &str,
     ) -> Result<CachedToken> {
-        let (client_id, client_secret) = crate::oauth::providers::resolve_credentials(provider)?;
+        let (client_id, client_secret) =
+            crate::oauth::providers::resolve_credentials(provider).await?;
         let refresh_token = credentials::load_async(account_id, Slot::RefreshToken).await?;
 
         let mut form = vec![
@@ -756,7 +758,12 @@ mod tests {
             ));
             unsafe { std::env::set_var("COMAIL_CREDENTIALS_INSECURE_FILE", path) };
         });
-        crate::oauth::providers::set_configured(Provider::Gmail, "test-client-id", "");
+        crate::oauth::providers::set_configured(
+            Provider::Gmail,
+            "test-client-id",
+            None,
+            crate::oauth::providers::SecretState::Unset,
+        );
         guard
     }
 

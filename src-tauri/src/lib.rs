@@ -344,7 +344,7 @@ pub fn run() {
                     .await
                     .expect("failed to start comail core");
                 events::spawn_forwarder(handle.clone(), core.bus.subscribe());
-                let lang = resolve_lang(&core.get_settings().await.unwrap_or_default().language);
+                let lang = resolve_lang(&core.settings().await.unwrap_or_default().language);
                 handle.manage(AppState { core: core.clone() });
                 apple_intents::install(&handle);
                 notifications::spawn_dispatcher(handle.clone(), core);
@@ -521,6 +521,7 @@ pub fn run() {
             commands::email_stats,
             commands::ai_plan_automation,
             commands::set_ai_key,
+            commands::set_oauth_client_secret,
             commands::set_decision_key,
             commands::test_decision_provider,
             commands::create_category,

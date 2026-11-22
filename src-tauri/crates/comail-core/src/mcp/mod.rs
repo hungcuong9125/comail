@@ -94,7 +94,7 @@ impl Core {
     /// Start, stop or restart the server to match the saved settings. Called at
     /// startup and after every settings save; a no-op when nothing changed.
     pub async fn mcp_apply_settings(&self) -> Result<()> {
-        let settings = self.get_settings().await?;
+        let settings = self.settings().await?;
         let port = if settings.mcp_port == 0 {
             DEFAULT_PORT
         } else {
@@ -150,7 +150,7 @@ impl Core {
     }
 
     pub async fn mcp_status(&self) -> Result<McpStatus> {
-        let settings = self.get_settings().await?;
+        let settings = self.settings().await?;
         let running = self.mcp.running.lock().await;
         let port = running
             .as_ref()
@@ -408,7 +408,7 @@ async fn dispatch(
                 .as_str()
                 .unwrap_or("unknown client")
                 .to_string();
-            let settings = ctx.core.get_settings().await.unwrap_or_default();
+            let settings = ctx.core.settings().await.unwrap_or_default();
             let instructions = guide::instructions(&ctx.core, &settings).await;
             let sid = format!("{}{}", now_ms(), crate::mime::rand_token());
             ctx.core
@@ -433,7 +433,7 @@ async fn dispatch(
             }))
         }
         "ping" => Ok(json!({})),
-        "tools/list" => match ctx.core.get_settings().await {
+        "tools/list" => match ctx.core.settings().await {
             Ok(settings) => Ok(json!({ "tools": tools::list(&settings) })),
             Err(e) => Err((-32603, e.to_string())),
         },

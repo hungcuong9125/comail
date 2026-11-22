@@ -629,6 +629,22 @@ pub async fn set_ai_key(state: State<'_, AppState>, api_key: String) -> CmdResul
     state.core.set_ai_key(api_key).await.map_err(err)
 }
 
+/// Store (empty = clear) the user-supplied OAuth client secret for
+/// "google"/"gmail" | "microsoft". Lives in the OS keyring; settings only
+/// carry a presence flag.
+#[tauri::command]
+pub async fn set_oauth_client_secret(
+    state: State<'_, AppState>,
+    provider: String,
+    secret: String,
+) -> CmdResult<()> {
+    state
+        .core
+        .set_oauth_client_secret(provider, secret)
+        .await
+        .map_err(err)
+}
+
 #[tauri::command]
 pub async fn set_decision_key(
     state: State<'_, AppState>,

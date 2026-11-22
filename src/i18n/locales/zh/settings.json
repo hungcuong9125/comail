@@ -269,7 +269,7 @@
       "g2": "OAuth 同意屏幕：选择“外部”（仅当你有 Workspace 组织时才选“内部”），填写应用名称，把你的邮箱填为支持和开发者联系人，并把你自己的 Gmail 地址添加到“测试用户”。",
       "g3": "范围：点击“添加或移除范围”，把 https://mail.google.com/ 粘贴到手动输入框并添加。这是 Google 用于 IMAP/SMTP XOAUTH2 接受的唯一范围；无需启用 Gmail API。",
       "g4": "凭据：创建凭据，OAuth 客户端 ID，应用类型选择桌面应用。桌面客户端会自动接受 http://127.0.0.1 环回地址，因此无需配置重定向 URI。",
-      "g5": "将客户端 ID（以 .apps.googleusercontent.com 结尾）和客户端密钥（以 GOCSPX- 开头）复制到下方字段。字段在失焦或按 Enter 时保存。",
+      "g5": "将客户端 ID（以 .apps.googleusercontent.com 结尾）和客户端密钥（以 GOCSPX- 开头）复制到下方字段。客户端 ID 在失焦或按 Enter 时保存；客户端密钥通过其“保存”按钮保存，并存放在系统钥匙串中。",
       "g6": "登录成功后，回到同意屏幕点击“发布应用”（正式版）。在测试状态下，Google 会在 7 天后使刷新令牌过期，账户每周需要重新验证；发布可避免这种情况。",
       "g7": "要同步日历（连接 Google 日历）：在同一项目中启用 Google Calendar API（API 和服务、库、搜索 Google Calendar API、启用），并在同意屏幕添加范围 https://www.googleapis.com/auth/calendar。缺少任一项，连接都会失败并提示日历服务器错误。",
       "msTitle": "Microsoft (Outlook / 365)",
@@ -283,7 +283,12 @@
       "msNote": "个人 Outlook.com / Hotmail / Live 账户？仍然在这里注册应用。用你的个人账户登录门户（免费，无需 Azure 订阅），并在第 2 步选择多租户 + 个人选项。用于注册的账户和你连接的邮箱可以不同。",
       "docsHint": "想查看包含截图和故障排除的完整教程？",
       "viewDocs": "在 GitHub 上查看完整指南"
-    }
+    },
+    "secretSaved": "客户端密钥已保存",
+    "secretCleared": "客户端密钥已清除",
+    "secretStored": "已存储在系统钥匙串中，永不显示。",
+    "secretClear": "清除",
+    "secretClearConfirm": "确认清除"
   },
   "accounts": {
     "signedOut": "已退出登录。重新登录前邮件同步将暂停。",

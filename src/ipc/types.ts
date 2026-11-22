@@ -505,12 +505,14 @@ export interface Settings {
   aiTierDraft: AiTier;
   aiTierSummarize: AiTier;
   aiTierVoice: AiTier;
-  /** OAuth app registrations; env vars (COMAIL_GOOGLE_CLIENT_ID…) override. */
+  /** OAuth app registrations; env vars (COMAIL_GOOGLE_CLIENT_ID…) override.
+   *  Client secrets live in the OS keychain — only presence flags cross IPC;
+   *  set/clear via `set_oauth_client_secret`. */
   googleClientId: string;
-  googleClientSecret: string;
+  hasGoogleClientSecret: boolean;
   msClientId: string;
-  /** Only for Web-type Entra registrations; leave empty for desktop apps. */
-  msClientSecret: string;
+  /** Only for Web-type Entra registrations; leave unset for desktop apps. */
+  hasMsClientSecret: boolean;
   /** Desktop notification on new mail. */
   notificationsEnabled: boolean;
   /** Which incoming mail raises a desktop notification: "important" (mail that
@@ -1390,6 +1392,11 @@ export interface Commands {
   email_stats(args: Record<string, never>): Promise<EmailStats>;
   ai_plan_automation(args: { prompt: string }): Promise<AiAutomationPlan>;
   set_ai_key(args: { apiKey: string }): Promise<void>;
+  /** Store (empty = clear) the OAuth client secret in the OS keychain. */
+  set_oauth_client_secret(args: {
+    provider: "google" | "microsoft";
+    secret: string;
+  }): Promise<void>;
   set_decision_key(args: {
     provider: Exclude<DecisionProvider, "off">;
     apiKey: string;

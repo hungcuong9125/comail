@@ -998,7 +998,7 @@ pub struct AiAutomationPlan {
     pub issues: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub theme: String,
@@ -1066,13 +1066,26 @@ pub struct Settings {
     /// (COMAIL_GOOGLE_CLIENT_ID etc.) override these when set.
     #[serde(default)]
     pub google_client_id: String,
+    /// Whether a Google OAuth client secret is stored in the OS keyring.
+    /// Presence only: the value never crosses IPC; `set_oauth_client_secret`
+    /// stores or clears it.
     #[serde(default)]
+    pub has_google_client_secret: bool,
+    /// Retired field: settings rows written before secrets moved to the OS
+    /// keyring carry the secret inline. Deserialized only so the startup
+    /// migration can move it; `skip_serializing` keeps it out of every row
+    /// rewrite and every IPC reply.
+    #[serde(default, skip_serializing)]
     pub google_client_secret: String,
     #[serde(default)]
     pub ms_client_id: String,
-    /// Only for Web-type Entra registrations; public (desktop) clients must
-    /// leave this empty or Microsoft rejects the token request.
+    /// Whether a Microsoft OAuth client secret is stored in the OS keyring
+    /// (only Web-type Entra registrations use one; public desktop clients
+    /// must leave it unset or Microsoft rejects the token request).
     #[serde(default)]
+    pub has_ms_client_secret: bool,
+    /// Retired inline copy, same contract as `google_client_secret`.
+    #[serde(default, skip_serializing)]
     pub ms_client_secret: String,
     /// Semantic-search embedding backend: "local" | "off". Local runs a small
     /// model on-device; off disables vector indexing (keyword search only).
@@ -1272,6 +1285,21 @@ pub struct SignatureDefaults {
     pub reply_id: Option<String>,
 }
 
+/// The retired inline secrets are redacted: even while a row copy is still
+/// pending keyring migration, a Debug dump must not leak it to logs.
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |s: &str| if s.is_empty() { "" } else { "<redacted>" };
+        f.debug_struct("Settings")
+            .field(
+                "google_client_secret",
+                &redacted(&self.google_client_secret),
+            )
+            .field("ms_client_secret", &redacted(&self.ms_client_secret))
+            .finish_non_exhaustive()
+    }
+}
+
 impl Settings {
     /// The retired "holiday" theme reads back as Snow (it was a light theme),
     /// both globally and as a per-account override.
@@ -1426,8 +1454,10 @@ impl Default for Settings {
             ai_tier_summarize: default_tier_instant(),
             ai_tier_voice: default_tier_cheap(),
             google_client_id: String::new(),
+            has_google_client_secret: false,
             google_client_secret: String::new(),
             ms_client_id: String::new(),
+            has_ms_client_secret: false,
             ms_client_secret: String::new(),
             embedding_backend: default_embedding_backend(),
             embedding_model: default_embedding_model(),
