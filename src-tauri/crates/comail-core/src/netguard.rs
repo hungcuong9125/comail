@@ -15,8 +15,19 @@
 //!    connector dials exactly the filtered list. A name that resolves to no
 //!    public address fails, and there is no check-then-connect window because
 //!    the address list the OS dials is the one we vetted.
+//!
+//! Proxies are disabled on guarded clients ([`guarded_builder`] calls
+//! `no_proxy`): these clients fetch attacker-influenced URLs, and a proxy
+//! would (a) bypass the DNS filter — the connector would only ever resolve
+//! the proxy's own name while the real destination is resolved by the
+//! proxy — and (b) fail outright when the proxy is a typical corporate one
+//! on a private address. Direct connections only. reqwest reads
+//! `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` from the environment even with
+//! `default-features = false` (the env reader lives in hyper-util's
+//! unconditional `client-proxy` feature, not `system-proxy`), so `no_proxy`
+//! here is load-bearing, not cosmetic.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use url::{Host, Url};
@@ -25,8 +36,16 @@ use url::{Host, Url};
 /// addresses. Install with `ClientBuilder::dns_resolver`.
 pub struct PublicDnsResolver;
 
-/// Shared instance for `ClientBuilder::dns_resolver`.
-pub fn dns_resolver() -> Arc<PublicDnsResolver> {
+/// A `ClientBuilder` with the public-only DNS resolver installed and
+/// proxies disabled. Callers add their own timeout / redirect policy /
+/// user-agent.
+pub fn guarded_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .dns_resolver(dns_resolver())
+        .no_proxy()
+}
+
+fn dns_resolver() -> Arc<PublicDnsResolver> {
     Arc::new(PublicDnsResolver)
 }
 
@@ -35,12 +54,26 @@ pub fn dns_resolver() -> Arc<PublicDnsResolver> {
 /// itself (callers already treat non-2xx as failure).
 pub fn redirect_policy(max_hops: usize) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() < max_hops && is_public_https_url(attempt.url()) {
+        if should_follow(attempt.previous().len(), max_hops, attempt.url()) {
             attempt.follow()
         } else {
             attempt.stop()
         }
     })
+}
+
+/// Whether to follow a redirect. `visited` is `attempt.previous().len()`,
+/// which includes the initial URL, so `visited <= max_hops` follows exactly
+/// `max_hops` redirects — matching `Policy::limited(max_hops)`.
+fn should_follow(visited: usize, max_hops: usize, next: &Url) -> bool {
+    visited <= max_hops && is_public_https_url(next)
+}
+
+/// Parse `url` and require a public https destination; `None` otherwise.
+/// Domain names pass the static checks here and are vetted for real at
+/// connect time by [`PublicDnsResolver`].
+pub fn public_https_url(url: &str) -> Option<Url> {
+    Url::parse(url).ok().filter(is_public_https_url)
 }
 
 /// https scheme plus a public destination. IP literals are classified here;
@@ -128,6 +161,29 @@ fn is_allowed_dns_name(name: &str) -> bool {
         && !name.ends_with(".home.arpa")
 }
 
+/// Normalize a sender-supplied domain to its ASCII (punycode) form and
+/// validate it with [`is_dns_hostname`]. Unicode IDN labels become `xn--`
+/// labels, case folds, one FQDN trailing dot is dropped, and UTS-46
+/// equivalences apply — fullwidth `。` maps to `.` and is then validated
+/// like any other label separator. `None` when the result is not a public
+/// DNS hostname; the returned string is the validated ASCII form.
+pub fn to_ascii_domain(domain: &str) -> Option<String> {
+    // AsciiDenyList::URL adds the WHATWG forbidden-domain-code-point check
+    // (/ : \ | control chars, ...) on top of UTS-46 mapping; our own label
+    // validation below is stricter still.
+    let ascii = idna::domain_to_ascii_cow(domain.as_bytes(), idna::AsciiDenyList::URL).ok()?;
+    let ascii = ascii.strip_suffix('.').unwrap_or(&ascii);
+    if ascii.ends_with('.') {
+        return None; // stray extra dot — not a hostname
+    }
+    is_dns_hostname(ascii).then(|| ascii.to_string())
+}
+
+/// Keep only public addresses from a resolution result.
+fn keep_public(addrs: impl Iterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    addrs.filter(|a| is_public_ip(a.ip())).collect()
+}
+
 /// Is `s` a syntactically valid public-style DNS hostname: lowercase ASCII
 /// `[a-z0-9-]` labels of 1-63 chars joined by dots, at least two labels,
 /// total length ≤ 253, not an IP literal. Used to vet sender-domain input
@@ -174,10 +230,7 @@ impl reqwest::dns::Resolve for PublicDnsResolver {
             // port afterwards. Resolve, then keep only public answers so the
             // socket can never land on a loopback/private/LAN peer — not even
             // via a second answer behind a public one.
-            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
-                .await?
-                .filter(|a| is_public_ip(a.ip()))
-                .collect();
+            let addrs = keep_public(tokio::net::lookup_host((host.as_str(), 0)).await?);
             if addrs.is_empty() {
                 return Err(format!("netguard: {host} resolves to no public address").into());
             }
@@ -347,5 +400,96 @@ mod tests {
         assert!(is_dns_hostname(&max_label));
         let long_total = format!("{}.{}.com", "a".repeat(63), "b".repeat(200));
         assert!(!is_dns_hostname(&long_total));
+    }
+
+    /// `should_follow` must match `Policy::limited(max)`: `previous()`
+    /// includes the initial URL, so `visited <= max` allows max redirects.
+    #[test]
+    fn redirect_hop_decision_matches_limited() {
+        let good = Url::parse("https://example.com/x").unwrap();
+        let bad = Url::parse("https://127.0.0.1/x").unwrap();
+        assert!(should_follow(1, 3, &good)); // first redirect
+        assert!(should_follow(3, 3, &good)); // third still allowed
+        assert!(!should_follow(4, 3, &good)); // fourth refused, like limited(3)
+        assert!(!should_follow(1, 3, &bad)); // non-public hop refused
+        assert!(!should_follow(1, 0, &good));
+    }
+
+    #[test]
+    fn to_ascii_domain_normalizes_then_validates() {
+        for (input, want) in [
+            ("example.com", "example.com"),
+            ("EXAMPLE.COM", "example.com"),
+            ("example.com.", "example.com"), // one FQDN dot dropped
+            ("münchen.de", "xn--mnchen-3ya.de"), // Unicode IDN
+            ("a。b.com", "a.b.com"),         // U+3002 maps to a dot
+        ] {
+            assert_eq!(to_ascii_domain(input).as_deref(), Some(want), "{input}");
+        }
+        for bad in [
+            "a/../../comail.db",
+            "a／b.com", // U+FF0F fullwidth solidus
+            "a_b.com",  // underscores are not hostname characters
+            "localhost",
+            "foo.localhost",
+            "evil。localhost", // maps to evil.localhost
+            "a。b。internal",  // maps to a.b.internal
+            "127.0.0.1",
+            "a..b.com",
+            "com..",
+            "..",
+        ] {
+            assert_eq!(to_ascii_domain(bad), None, "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn keep_public_drops_special_addresses() {
+        let parse = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let addrs: Vec<SocketAddr> = [
+            "127.0.0.1:443",
+            "10.0.0.9:443",
+            "8.8.8.8:443",
+            "1.1.1.1:443",
+            "[fe80::1]:443",
+            "[::1]:443",
+            "[::ffff:9.9.9.9]:443",
+        ]
+        .into_iter()
+        .map(parse)
+        .collect();
+        assert_eq!(
+            keep_public(addrs.into_iter()),
+            vec![
+                parse("8.8.8.8:443"),
+                parse("1.1.1.1:443"),
+                parse("[::ffff:9.9.9.9]:443"),
+            ]
+        );
+        assert!(keep_public(vec![parse("192.168.1.1:80")].into_iter()).is_empty());
+    }
+
+    /// The resolver itself: local names are refused before any lookup, and a
+    /// loopback literal resolves (via getaddrinfo's local numeric parse, no
+    /// DNS query) only to a non-public answer, which is filtered to empty.
+    #[tokio::test]
+    async fn resolver_refuses_local_names_and_loopback() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+        for name in [
+            "localhost",
+            "foo.localhost",
+            "printer.local",
+            "x.internal",
+            "x.lan",
+            "127.0.0.1",
+        ] {
+            let name = reqwest::dns::Name::from_str(name).unwrap();
+            let s = name.as_str().to_string();
+            assert!(
+                PublicDnsResolver.resolve(name).await.is_err(),
+                "{s} must not resolve"
+            );
+        }
     }
 }
