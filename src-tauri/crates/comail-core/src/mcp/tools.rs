@@ -477,6 +477,7 @@ pub(super) async fn call(core: &Core, name: &str, args: Value) -> ToolResult {
                     mode: "new".into(),
                     in_reply_to_message_id: None,
                     attachments: Vec::new(),
+                    composer_nonce: None,
                 })
                 .await?
                 .draft_id;
@@ -827,6 +828,7 @@ fn reply_draft(
         mode: if reply_all { "reply_all" } else { "reply" }.into(),
         in_reply_to_message_id: Some(original.id),
         attachments: Vec::new(),
+        composer_nonce: None,
     }
 }
 

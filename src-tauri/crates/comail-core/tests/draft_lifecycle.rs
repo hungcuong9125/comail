@@ -31,7 +31,7 @@ async fn setup() -> (tempfile::TempDir, Core) {
 /// `path` as `pick_draft_attachments` does once the dialog returns.
 async fn token_for(core: &Core, path: &std::path::Path) -> DraftAttachmentIn {
     let approved = core
-        .approve_attachment_sources(vec![path.to_path_buf()])
+        .approve_attachment_sources(vec![path.to_path_buf()], None)
         .unwrap();
     assert_eq!(approved.len(), 1, "approve skipped {path:?}");
     DraftAttachmentIn::Token {
@@ -61,6 +61,7 @@ fn args(attachment: Option<DraftAttachmentIn>) -> SaveDraftArgs {
         mode: "new".into(),
         in_reply_to_message_id: None,
         attachments: attachment.into_iter().collect(),
+        composer_nonce: None,
     }
 }
 

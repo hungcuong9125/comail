@@ -128,6 +128,7 @@ async fn reply_send_reaches_smtp_and_sent_folder() {
             mode: "reply".into(),
             in_reply_to_message_id: Some(parent.id),
             attachments: vec![],
+            composer_nonce: None,
         })
         .await
         .expect("save draft")

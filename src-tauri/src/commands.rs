@@ -211,6 +211,7 @@ pub async fn send_now(state: State<'_, AppState>, action_id: i64) -> CmdResult<s
 pub async fn pick_draft_attachments(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
+    composer_nonce: Option<String>,
 ) -> CmdResult<Vec<ApprovedAttachment>> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -232,18 +233,42 @@ pub async fn pick_draft_attachments(
         .into_iter()
         .filter_map(|f| f.into_path().ok())
         .collect::<Vec<_>>();
-    state.core.approve_attachment_sources(paths).map_err(err)
+    state
+        .core
+        .approve_attachment_sources(paths, composer_nonce)
+        .map_err(err)
 }
 
 /// Exchange paths from an OS drop event for attachment tokens. Only paths
 /// the Rust webview-event handler observed fall on the window are accepted -
-/// the webview cannot mint approvals for paths it merely claims were dropped.
+/// the webview cannot mint approvals for paths it merely claims were
+/// dropped. `composer_nonce` binds the tokens to this composer session.
 #[tauri::command]
 pub async fn claim_dropped_attachments(
     state: State<'_, AppState>,
     paths: Vec<String>,
-) -> CmdResult<Vec<ApprovedAttachment>> {
-    state.core.claim_dropped_attachments(&paths).map_err(err)
+    composer_nonce: Option<String>,
+) -> CmdResult<DropClaim> {
+    state
+        .core
+        .claim_dropped_attachments(&paths, composer_nonce)
+        .map_err(err)
+}
+
+/// Resolve a received attachment (by row id) to an approval token so a
+/// forward chip can carry it. The download/copy happens here, outside
+/// `save_draft`, so a failure fails just this attachment.
+#[tauri::command]
+pub async fn prepare_forward_attachment(
+    state: State<'_, AppState>,
+    attachment_id: i64,
+    composer_nonce: Option<String>,
+) -> CmdResult<ApprovedAttachment> {
+    state
+        .core
+        .prepare_forward_attachment(attachment_id, composer_nonce)
+        .await
+        .map_err(err)
 }
 
 #[tauri::command]

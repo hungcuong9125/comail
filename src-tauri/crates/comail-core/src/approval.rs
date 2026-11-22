@@ -5,28 +5,40 @@
 //! `save_draft` (an XSS, a compromised dependency) would turn the app into an
 //! arbitrary-file exfiltration channel. Approvals are therefore minted only
 //! by trusted Rust paths - the native file dialog, an OS drop observed on the
-//! window, or internal callers (a generated calendar invite) - and
-//! `save_draft` accepts only the opaque tokens this registry hands out.
+//! window, or internal callers (a generated calendar invite, a forwarded
+//! attachment resolved by row id) - and `save_draft` accepts only the opaque
+//! tokens this registry hands out.
 //!
 //! Hardening:
 //! - tokens are unguessable random strings, valid for [`APPROVAL_TTL`] and
-//!   single-use (consumed by the save that stages them);
+//!   single-use: `save_draft` checks one out while its save is in flight and
+//!   consumes it only when the draft transaction commits, so a failed save
+//!   can simply be retried;
+//! - tokens are bound to the composer nonce that minted them (`pick` and
+//!   `claim` take the nonce the composer generated for itself), so a token
+//!   cannot be spent by a different composer session;
 //! - the registry is capped so a misbehaving renderer cannot grow it;
 //! - OS drops are registered here by Rust itself (the webview event handler
 //!   observes the real drop) and expire quickly - the webview can only
-//!   exchange paths Rust already saw fall on the window;
+//!   exchange paths Rust already saw fall on the window. A consumed drop is
+//!   remembered briefly so a duplicate claim (a double-registered JS
+//!   listener) is a silent no-op, not an error toast;
+//! - staged files a save produced are remembered per composer nonce, so a
+//!   draft deleted and recreated inside one session can adopt its own staged
+//!   files - and only that session's files;
 //! - the canonical path recorded at approval time is re-checked when the
 //!   token is used, so a symlink swap between pick and save cannot redirect
 //!   the copy.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::Result;
 use crate::error::CoreError;
-use crate::models::ApprovedAttachment;
+use crate::models::{ApprovedAttachment, DropClaim, SkippedDrop};
 
 /// How long an approval token stays usable after the user gesture that
 /// created it. Covers a long compose session without making yesterday's
@@ -41,10 +53,15 @@ const DROP_TTL: Duration = Duration::from_secs(2 * 60);
 /// Live approval cap; a new approval past this evicts the oldest.
 const MAX_APPROVALS: usize = 256;
 
-/// Unclaimed-drop cap, same rationale as [`MAX_APPROVALS`].
+/// Unclaimed-drop cap, same rationale as [`MAX_APPROVALS`]. The consumed-drop
+/// memory shares the cap: both only ever hold recent OS events.
 const MAX_PENDING_DROPS: usize = 512;
 
+/// Cap on the per-nonce produced-paths memory (session-scale, not global).
+const MAX_PRODUCED: usize = 1024;
+
 /// A file the user approved for attaching, keyed by its opaque token.
+#[derive(Clone)]
 pub(crate) struct Approval {
     /// Canonical path recorded at approval time. Re-canonicalised at use and
     /// required to match, so a symlink swapped in after the pick cannot
@@ -52,6 +69,10 @@ pub(crate) struct Approval {
     pub canonical_path: PathBuf,
     /// Display filename (bidi-stripped) recorded from the approved path.
     pub filename: String,
+    /// The composer nonce this approval is bound to, if any. Internal
+    /// approvals (calendar invites) are nonce-less and can only be spent by
+    /// internal saves, which also carry no nonce.
+    nonce: Option<String>,
     pub at: Instant,
     /// Insertion order - deterministic eviction when entries share `at`.
     seq: u64,
@@ -68,11 +89,27 @@ pub struct AttachmentApprovals {
 struct Inner {
     /// token -> approval
     approvals: HashMap<String, Approval>,
+    /// Tokens checked out by an in-flight `save_draft`: a second save may not
+    /// stage the same token concurrently. Removed by `commit` (token spent)
+    /// or `rollback` (token usable again).
+    in_flight: HashSet<String>,
     /// canonical path -> when the OS drop was observed. Paths land here only
     /// from the Rust-side webview drop handler; the webview exchanges them
     /// for tokens via `claim_drops` and may not register anything itself.
     pending_drops: HashMap<PathBuf, Instant>,
-    /// Monotonic insertion counter for approval entries.
+    /// canonical path -> when a drop was successfully claimed. Lets a
+    /// duplicate claim (double-registered webview listener) no-op instead of
+    /// looking like a path the OS never dropped.
+    consumed_drops: HashMap<PathBuf, Instant>,
+    /// canonical path -> an opaque, session-scoped alias the webview uses to
+    /// dedupe picks/drops of the same file without ever learning its path.
+    source_keys: HashMap<PathBuf, String>,
+    /// canonical staged path -> (composer nonce, seq) of the save that
+    /// produced it. Drives the draft-recreated adoption rule: a `Staged`
+    /// entry is claimable for a draftless save only when the same session
+    /// produced that staged file earlier.
+    produced: HashMap<PathBuf, (String, u64)>,
+    /// Monotonic insertion counter for approval/produced entries.
     next_seq: u64,
 }
 
@@ -82,23 +119,8 @@ impl Inner {
             .retain(|_, a| now.duration_since(a.at) < APPROVAL_TTL);
         self.pending_drops
             .retain(|_, t| now.duration_since(*t) < DROP_TTL);
-    }
-
-    /// Remove the oldest entry of `map` so it stays under `cap`.
-    fn evict_oldest<K>(map: &mut HashMap<K, Instant>, cap: usize)
-    where
-        K: Clone + Eq + std::hash::Hash,
-    {
-        while map.len() >= cap {
-            let Some(oldest) = map
-                .iter()
-                .max_by_key(|(_, t)| t.elapsed())
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            map.remove(&oldest);
-        }
+        self.consumed_drops
+            .retain(|_, t| now.duration_since(*t) < DROP_TTL);
     }
 
     fn evict_oldest_approval(&mut self) {
@@ -114,6 +136,31 @@ impl Inner {
             self.approvals.remove(&oldest);
         }
     }
+
+    /// Drop `key` entries (oldest seq) until `map` is under `cap`.
+    fn trim_produced(&mut self) {
+        while self.produced.len() >= MAX_PRODUCED {
+            let Some(oldest) = self
+                .produced
+                .iter()
+                .min_by_key(|(_, (_, seq))| *seq)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.produced.remove(&oldest);
+        }
+    }
+
+    /// The webview-facing dedupe key for a canonical path: an opaque session
+    /// alias, stable per path so re-picking/re-dropping the same file reads
+    /// as the same source without handing the real path to JS.
+    fn source_key(&mut self, canonical: &std::path::Path) -> String {
+        self.source_keys
+            .entry(canonical.to_path_buf())
+            .or_insert_with(mint_token)
+            .clone()
+    }
 }
 
 /// Opaque approval token: two `rand_token()`s (~103 bits) so it is
@@ -122,18 +169,83 @@ fn mint_token() -> String {
     format!("{}{}", crate::mime::rand_token(), crate::mime::rand_token())
 }
 
+/// `path` must exist and be a regular file (directories, devices, FIFOs,
+/// missing paths fail).
+fn regular_file(path: &PathBuf) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
 impl AttachmentApprovals {
     /// Mint approval tokens for user-picked local files. Callers must be
     /// trusted Rust code: the native file dialog handler, or internal code
-    /// that generated the file itself (e.g. a calendar invite). Non-regular
-    /// files (directories, devices, FIFOs, missing paths) are skipped.
-    pub fn approve(&self, paths: Vec<PathBuf>) -> Result<Vec<ApprovedAttachment>> {
-        self.approve_at(paths, Instant::now())
+    /// that generated/resolved the file itself (a calendar invite, a
+    /// forwarded attachment's cache entry). `nonce` binds the tokens to the
+    /// composer session asking for them; internal callers pass `None`.
+    /// Non-regular files (directories, devices, FIFOs, missing paths) are
+    /// skipped.
+    pub fn approve(
+        &self,
+        paths: Vec<PathBuf>,
+        nonce: Option<String>,
+    ) -> Result<Vec<ApprovedAttachment>> {
+        self.approve_at(paths, Instant::now(), nonce)
+    }
+
+    /// [`approve`] for a single internal source whose display name is not
+    /// its path basename - a forward's cached bytes carry the original
+    /// attachment's filename, not the cache file's name.
+    pub(crate) fn approve_named(
+        &self,
+        path: PathBuf,
+        filename: &str,
+        nonce: Option<String>,
+    ) -> Result<ApprovedAttachment> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.evict_expired(Instant::now());
+        let canonical = std::fs::canonicalize(&path)
+            .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
+        if !regular_file(&canonical) {
+            return Err(CoreError::ActionRejected(format!(
+                "attachment {filename}: not a regular file"
+            )));
+        }
+        if inner.approvals.len() >= MAX_APPROVALS {
+            inner.evict_oldest_approval();
+        }
+        let filename = crate::display_filename(filename);
+        let mime_type = Some(crate::queue::mime_guess_from_name(&filename));
+        let source = inner.source_key(&canonical);
+        let token = mint_token();
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
+        let at = Instant::now();
+        inner.approvals.insert(
+            token.clone(),
+            Approval {
+                canonical_path: canonical.clone(),
+                filename: filename.clone(),
+                nonce,
+                at,
+                seq,
+            },
+        );
+        Ok(ApprovedAttachment {
+            token,
+            filename,
+            source,
+            size: std::fs::metadata(&canonical).map(|m| m.len()).unwrap_or(0),
+            mime_type,
+        })
     }
 
     /// [`approve`] with an explicit timestamp - the test hook for expiry.
     #[doc(hidden)]
-    pub fn approve_at(&self, paths: Vec<PathBuf>, at: Instant) -> Result<Vec<ApprovedAttachment>> {
+    pub fn approve_at(
+        &self,
+        paths: Vec<PathBuf>,
+        at: Instant,
+        nonce: Option<String>,
+    ) -> Result<Vec<ApprovedAttachment>> {
         let mut inner = self.inner.lock().unwrap();
         inner.evict_expired(at);
         let mut out = Vec::with_capacity(paths.len());
@@ -141,12 +253,7 @@ impl AttachmentApprovals {
             let Ok(canonical) = std::fs::canonicalize(&path) else {
                 continue;
             };
-            let Ok(meta) = std::fs::metadata(&canonical) else {
-                continue;
-            };
-            // Regular files only: a directory would fail the copy anyway, a
-            // device or FIFO must never be read into an email.
-            if !meta.file_type().is_file() {
+            if !regular_file(&canonical) {
                 continue;
             }
             if inner.approvals.len() >= MAX_APPROVALS {
@@ -158,6 +265,7 @@ impl AttachmentApprovals {
                 .unwrap_or_else(|| "attachment".into());
             let filename = crate::display_filename(&filename);
             let mime_type = Some(crate::queue::mime_guess_from_name(&filename));
+            let source = inner.source_key(&canonical);
             let token = mint_token();
             let seq = inner.next_seq;
             inner.next_seq += 1;
@@ -166,6 +274,7 @@ impl AttachmentApprovals {
                 Approval {
                     canonical_path: canonical.clone(),
                     filename: filename.clone(),
+                    nonce: nonce.clone(),
                     at,
                     seq,
                 },
@@ -173,8 +282,8 @@ impl AttachmentApprovals {
             out.push(ApprovedAttachment {
                 token,
                 filename,
-                path: canonical.to_string_lossy().into_owned(),
-                size: meta.len(),
+                source,
+                size: std::fs::metadata(&canonical).map(|m| m.len()).unwrap_or(0),
                 mime_type,
             });
         }
@@ -190,12 +299,23 @@ impl AttachmentApprovals {
         inner
             .pending_drops
             .retain(|_, t| now.duration_since(*t) < DROP_TTL);
+        inner
+            .consumed_drops
+            .retain(|_, t| now.duration_since(*t) < DROP_TTL);
         for path in paths {
             let Ok(canonical) = std::fs::canonicalize(path) else {
                 continue;
             };
-            if inner.pending_drops.len() >= MAX_PENDING_DROPS {
-                Inner::evict_oldest(&mut inner.pending_drops, MAX_PENDING_DROPS);
+            while inner.pending_drops.len() >= MAX_PENDING_DROPS {
+                let Some(oldest) = inner
+                    .pending_drops
+                    .iter()
+                    .min_by_key(|(_, t)| **t)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                inner.pending_drops.remove(&oldest);
             }
             inner.pending_drops.insert(canonical, now);
         }
@@ -204,52 +324,165 @@ impl AttachmentApprovals {
     /// Exchange drop-event paths for approval tokens. Every path must be one
     /// this registry saw the OS drop on the window within [`DROP_TTL`] -
     /// anything else fails the whole call, so the webview cannot probe which
-    /// paths are registered. A claimed drop is consumed; a second exchange
-    /// for the same drop fails.
-    pub fn claim_drops(&self, paths: &[String]) -> Result<Vec<ApprovedAttachment>> {
+    /// paths are registered. Observed-but-unusable entries (directories,
+    /// devices) are skipped with a reason the caller can surface, and a path
+    /// whose drop was already claimed is skipped silently (the same OS drop
+    /// reaching two listeners is a no-op, not an error).
+    pub fn claim_drops(&self, paths: &[String], nonce: Option<String>) -> Result<DropClaim> {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .pending_drops
-            .retain(|_, t| now.duration_since(*t) < DROP_TTL);
+        inner.evict_expired(now);
         let mut canonical: Vec<PathBuf> = Vec::with_capacity(paths.len());
+        let mut skipped: Vec<SkippedDrop> = Vec::new();
         for raw in paths {
-            let canon = std::fs::canonicalize(raw).map_err(|_| {
-                CoreError::ActionRejected(format!("attachment {raw}: not dropped on this window"))
-            })?;
+            let canon = match std::fs::canonicalize(raw) {
+                Ok(c) => c,
+                Err(_) => {
+                    // Might be an observed drop that vanished between drop
+                    // and claim - report it if so, refuse it if not.
+                    if inner
+                        .pending_drops
+                        .iter()
+                        .any(|(p, _)| p == &PathBuf::from(raw))
+                    {
+                        skipped.push(SkippedDrop {
+                            path: raw.clone(),
+                            reason: "file no longer exists".into(),
+                        });
+                        continue;
+                    }
+                    return Err(CoreError::ActionRejected(format!(
+                        "attachment {raw}: not dropped on this window"
+                    )));
+                }
+            };
             if canonical.contains(&canon) {
                 continue;
             }
-            if !inner.pending_drops.contains_key(&canon) {
-                return Err(CoreError::ActionRejected(format!(
-                    "attachment {}: not dropped on this window",
-                    canon.to_string_lossy()
-                )));
+            if inner.pending_drops.contains_key(&canon) {
+                // A fresh OS observation wins over an older consumed marker,
+                // so re-dropping the same file claims it again.
+                if regular_file(&canon) {
+                    canonical.push(canon);
+                } else {
+                    skipped.push(SkippedDrop {
+                        path: raw.clone(),
+                        reason: "not a file".into(),
+                    });
+                }
+                continue;
             }
-            canonical.push(canon);
+            if inner.consumed_drops.contains_key(&canon) {
+                // Same drop claimed twice (double-registered listener): the
+                // files are already minted for the first call's chips.
+                continue;
+            }
+            return Err(CoreError::ActionRejected(format!(
+                "attachment {}: not dropped on this window",
+                canon.to_string_lossy()
+            )));
         }
         // Everything verified: consume the drop records before minting, so
         // the same OS drop can only be exchanged once.
         for c in &canonical {
             inner.pending_drops.remove(c);
+            inner.consumed_drops.insert(c.clone(), now);
+        }
+        // Skipped-but-observed drops are also consumed - they can't become
+        // claimable later.
+        for s in &skipped {
+            let p = PathBuf::from(&s.path);
+            let canon = std::fs::canonicalize(&p).unwrap_or(p);
+            inner.pending_drops.remove(&canon);
+            inner.consumed_drops.insert(canon, now);
         }
         drop(inner);
-        self.approve_at(canonical, now)
+        let approved = self.approve_at(canonical, now, nonce)?;
+        Ok(DropClaim { approved, skipped })
     }
 
-    /// Consume an approval token. The token leaves the registry whether or
-    /// not staging then succeeds - a token is single-purpose.
-    pub(crate) fn take(&self, token: &str) -> Result<Approval> {
+    /// Check out a token for a save in flight: the approval must exist, be
+    /// unexpired and match the caller's composer nonce; the token is marked
+    /// in-flight so a concurrent save cannot stage the same file twice.
+    /// The token is consumed only by [`Self::commit`] after the draft
+    /// transaction commits - [`Self::rollback`] on a failed save leaves it
+    /// fully usable, so autosave retries just work.
+    pub(crate) fn checkout(&self, token: &str, nonce: &Option<String>) -> Result<Approval> {
         let mut inner = self.inner.lock().unwrap();
-        match inner.approvals.remove(token) {
-            Some(a) if a.at.elapsed() < APPROVAL_TTL => Ok(a),
-            Some(_) => Err(CoreError::ActionRejected(
-                "attachment approval expired; pick the file again".into(),
-            )),
+        match inner.approvals.get(token) {
             None => Err(CoreError::ActionRejected(
                 "attachment was not approved for sending; pick or drop the file again".into(),
             )),
+            Some(a) if a.at.elapsed() >= APPROVAL_TTL => {
+                inner.approvals.remove(token);
+                Err(CoreError::ActionRejected(
+                    "attachment approval expired; pick the file again".into(),
+                ))
+            }
+            Some(a) if &a.nonce != nonce => Err(CoreError::ActionRejected(
+                "attachment approval belongs to another composer session".into(),
+            )),
+            Some(a) => {
+                if inner.in_flight.contains(token) {
+                    return Err(CoreError::ActionRejected(
+                        "attachment is being saved by another save".into(),
+                    ));
+                }
+                let approval = a.clone();
+                inner.in_flight.insert(token.to_string());
+                Ok(approval)
+            }
         }
+    }
+
+    /// Tokens whose save committed: spent for good (single-use).
+    pub(crate) fn commit(&self, tokens: &[String]) {
+        let mut inner = self.inner.lock().unwrap();
+        for t in tokens {
+            inner.approvals.remove(t);
+            inner.in_flight.remove(t);
+        }
+    }
+
+    /// Tokens whose save failed: usable again on the next save.
+    pub(crate) fn rollback(&self, tokens: &[String]) {
+        let mut inner = self.inner.lock().unwrap();
+        for t in tokens {
+            inner.in_flight.remove(t);
+        }
+    }
+
+    /// Record staged paths a committed save produced under `nonce` (fresh
+    /// copies AND echoed staged refs), so a draft deleted and recreated
+    /// inside the same composer session can adopt them via `Staged` entries
+    /// with no draft id. `None` nonces (internal saves) are not recorded:
+    /// adoption must always be tied to a real session, since any draftless
+    /// save could otherwise claim every produced file.
+    pub(crate) fn record_produced(&self, paths: &[PathBuf], nonce: &Option<String>) {
+        let Some(nonce) = nonce else { return };
+        let mut inner = self.inner.lock().unwrap();
+        inner.trim_produced();
+        for p in paths {
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            inner.produced.insert(p.clone(), (nonce.clone(), seq));
+        }
+    }
+
+    /// Whether this session produced (and may therefore re-claim) the staged
+    /// file at `canonical_path` for a draftless save. A `None` nonce never
+    /// adopts: it would let any draftless save claim any produced file.
+    pub(crate) fn produced_by(
+        &self,
+        canonical_path: &std::path::Path,
+        nonce: &Option<String>,
+    ) -> bool {
+        let Some(nonce) = nonce else { return false };
+        let inner = self.inner.lock().unwrap();
+        inner
+            .produced
+            .get(canonical_path)
+            .is_some_and(|(n, _)| n == nonce)
     }
 }
 
@@ -264,16 +497,46 @@ mod tests {
     }
 
     #[test]
-    fn expired_tokens_are_refused_on_take() {
+    fn expired_tokens_are_refused_on_checkout() {
         let tmp = tempfile::tempdir().unwrap();
         let reg = AttachmentApprovals::default();
         let f = tmp_file(tmp.path(), "f.txt");
         let old = Instant::now() - APPROVAL_TTL - Duration::from_secs(1);
-        let minted = reg.approve_at(vec![f], old).unwrap();
+        let minted = reg.approve_at(vec![f], old, None).unwrap();
         assert!(matches!(
-            reg.take(&minted[0].token),
+            reg.checkout(&minted[0].token, &None),
             Err(CoreError::ActionRejected(_))
         ));
+    }
+
+    #[test]
+    fn checkout_marks_in_flight_until_commit_or_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AttachmentApprovals::default();
+        let f = tmp_file(tmp.path(), "f.txt");
+        let minted = reg.approve(vec![f], None).unwrap();
+        let tok = &minted[0].token;
+        reg.checkout(tok, &None).unwrap();
+        // A second save cannot stage the same token concurrently...
+        assert!(reg.checkout(tok, &None).is_err());
+        // ...but a failed save hands it back, and a committed save spends it.
+        reg.rollback(std::slice::from_ref(tok));
+        reg.checkout(tok, &None).unwrap();
+        reg.commit(std::slice::from_ref(tok));
+        assert!(reg.checkout(tok, &None).is_err());
+    }
+
+    #[test]
+    fn tokens_are_bound_to_their_composer_nonce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AttachmentApprovals::default();
+        let f = tmp_file(tmp.path(), "f.txt");
+        let minted = reg.approve(vec![f], Some("composer-a".into())).unwrap();
+        let tok = &minted[0].token;
+        // Wrong nonce and no nonce both fail; the right one works.
+        assert!(reg.checkout(tok, &Some("composer-b".into())).is_err());
+        assert!(reg.checkout(tok, &None).is_err());
+        reg.checkout(tok, &Some("composer-a".into())).unwrap();
     }
 
     #[test]
@@ -283,36 +546,52 @@ mod tests {
         let paths: Vec<PathBuf> = (0..MAX_APPROVALS + 1)
             .map(|i| tmp_file(tmp.path(), &format!("f{i}.txt")))
             .collect();
-        let minted = reg.approve(paths).unwrap();
+        let minted = reg.approve(paths, None).unwrap();
         assert_eq!(minted.len(), MAX_APPROVALS + 1);
         // The first pick was evicted by the (cap+1)th; the newest survives.
-        assert!(reg.take(&minted[0].token).is_err());
-        assert!(reg.take(&minted[MAX_APPROVALS].token).is_ok());
+        assert!(reg.checkout(&minted[0].token, &None).is_err());
+        assert!(reg.checkout(&minted[MAX_APPROVALS].token, &None).is_ok());
     }
 
     #[test]
-    fn claimed_drop_cannot_be_reclaimed() {
+    fn claimed_drop_cannot_be_reclaimed_but_second_claim_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let reg = AttachmentApprovals::default();
         let f = tmp_file(tmp.path(), "dropped.txt");
         reg.record_drop(std::slice::from_ref(&f));
         let raw = f.to_string_lossy().into_owned();
         assert_eq!(
-            reg.claim_drops(std::slice::from_ref(&raw)).unwrap().len(),
+            reg.claim_drops(std::slice::from_ref(&raw), None)
+                .unwrap()
+                .approved
+                .len(),
             1
         );
-        assert!(reg.claim_drops(&[raw]).is_err());
+        // A duplicate claim for the same drop no-ops instead of erroring -
+        // the files were minted for the first listener.
+        assert!(reg.claim_drops(&[raw], None).unwrap().approved.is_empty());
     }
 
     #[test]
-    fn unobserved_paths_cannot_be_claimed() {
+    fn unobserved_or_non_file_paths_cannot_be_claimed() {
         let tmp = tempfile::tempdir().unwrap();
         let reg = AttachmentApprovals::default();
         let f = tmp_file(tmp.path(), "never-dropped.txt");
         // Real file, never recorded: the webview cannot mint it.
         assert!(matches!(
-            reg.claim_drops(&[f.to_string_lossy().into_owned()]),
+            reg.claim_drops(&[f.to_string_lossy().into_owned()], None),
             Err(CoreError::ActionRejected(_))
         ));
+        // An observed directory is skipped with a reason the UI can surface,
+        // not silently dropped nor a forge attempt.
+        let dir = tmp.path().join("a-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        reg.record_drop(std::slice::from_ref(&dir));
+        let claim = reg
+            .claim_drops(&[dir.to_string_lossy().into_owned()], None)
+            .unwrap();
+        assert!(claim.approved.is_empty());
+        assert_eq!(claim.skipped.len(), 1);
+        assert_eq!(claim.skipped[0].reason, "not a file");
     }
 }

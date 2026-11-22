@@ -194,6 +194,7 @@ async fn offline_actions_queue_locally_and_survive_restart() {
             mode: "new".into(),
             in_reply_to_message_id: None,
             attachments: vec![],
+            composer_nonce: None,
         })
         .await
         .expect("save draft offline")

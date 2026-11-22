@@ -4,9 +4,11 @@
 //! frontend IPC, copied whatever it named into staging, and later mailed it -
 //! an arbitrary local-file read/exfil primitive for any script in the
 //! webview. Now a draft attachment can only be an approval token minted by a
-//! trusted Rust path (the native file dialog or an OS drop observed in Rust),
-//! a staged path this same draft already owns, or a received attachment
-//! resolved by row id. These tests drive the real `save_draft` path end to
+//! trusted Rust path (the native file dialog, an OS drop observed in Rust,
+//! or a forward source resolved via `prepare_forward_attachment`), a staged
+//! path this same draft already owns, or - inside the same composer session -
+//! a staged path a previous save produced (draft-recreated adoption). These
+//! tests drive the real `save_draft` path end to
 //! end; `approve_attachment_sources` stands in for "the dialog returned this
 //! path" - the dialog call itself is the only line tests cannot drive.
 
@@ -45,6 +47,7 @@ fn draft_args(account_id: i64, atts: Vec<DraftAttachmentIn>) -> SaveDraftArgs {
         mode: "new".into(),
         in_reply_to_message_id: None,
         attachments: atts,
+        composer_nonce: None,
     }
 }
 
@@ -53,7 +56,7 @@ fn draft_args(account_id: i64, atts: Vec<DraftAttachmentIn>) -> SaveDraftArgs {
 /// dialog returns.
 async fn token_for(core: &Core, path: &std::path::Path) -> DraftAttachmentIn {
     let approved = core
-        .approve_attachment_sources(vec![path.to_path_buf()])
+        .approve_attachment_sources(vec![path.to_path_buf()], None)
         .unwrap();
     assert_eq!(approved.len(), 1, "approve skipped {path:?}");
     DraftAttachmentIn::Token {
@@ -283,7 +286,7 @@ async fn save_draft_rejects_unknown_expired_and_consumed_tokens() {
     let old = std::time::Instant::now() - std::time::Duration::from_secs(31 * 60);
     let expired = core
         .attachment_approvals()
-        .approve_at(vec![src.clone()], old)
+        .approve_at(vec![src.clone()], old, None)
         .unwrap();
     assert_eq!(expired.len(), 1);
     let err = core
@@ -301,7 +304,7 @@ async fn save_draft_rejects_unknown_expired_and_consumed_tokens() {
     );
 
     // A token consumed by one save cannot be replayed into another.
-    let consumed = core.approve_attachment_sources(vec![src]).unwrap();
+    let consumed = core.approve_attachment_sources(vec![src], None).unwrap();
     core.save_draft(draft_args(
         1,
         vec![DraftAttachmentIn::Token {
@@ -391,10 +394,16 @@ async fn forward_by_attachment_id_stages_cached_bytes() {
         .await
         .unwrap();
 
+    // What `prepare_forward_attachment` does before save_draft: resolve the
+    // row id to the cached bytes and mint a token for them.
+    let prepared = core.prepare_forward_attachment(60, None).await.unwrap();
+    assert_eq!(prepared.filename, "report.pdf");
     let draft_id = core
         .save_draft(draft_args(
             1,
-            vec![DraftAttachmentIn::Forward { attachment_id: 60 }],
+            vec![DraftAttachmentIn::Token {
+                token: prepared.token,
+            }],
         ))
         .await
         .unwrap()
@@ -796,16 +805,19 @@ async fn approvals_skip_directories_and_missing_paths() {
     std::os::unix::fs::symlink(&dir, &dir_link).unwrap();
 
     let approved = core
-        .approve_attachment_sources({
-            #[cfg(unix)]
+        .approve_attachment_sources(
             {
-                vec![dir.clone(), dir_link.clone(), missing.clone()]
-            }
-            #[cfg(not(unix))]
-            {
-                vec![dir.clone(), missing.clone()]
-            }
-        })
+                #[cfg(unix)]
+                {
+                    vec![dir.clone(), dir_link.clone(), missing.clone()]
+                }
+                #[cfg(not(unix))]
+                {
+                    vec![dir.clone(), missing.clone()]
+                }
+            },
+            None,
+        )
         .unwrap();
     assert!(approved.is_empty(), "approved: {approved:?}");
 }
@@ -871,25 +883,24 @@ async fn claim_dropped_attachments_accepts_only_rust_observed_drops() {
 
     // Exchanging the observed path works...
     let claimed = core
-        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()])
-        .unwrap();
+        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None)
+        .unwrap()
+        .approved;
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].filename, "dropped.png");
 
-    // ...once: the drop record is consumed by the exchange.
-    let err = core
-        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()])
-        .unwrap_err();
-    assert!(
-        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
-        "second claim of same drop: {err:?}"
-    );
+    // ...once: the drop record is consumed by the exchange, and a duplicate
+    // claim for it (e.g. a double-registered listener) is a silent no-op.
+    let dup = core
+        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None)
+        .unwrap();
+    assert!(dup.approved.is_empty());
 
     // A path the OS never dropped - even though it exists and is a regular
     // file - cannot be claimed.
     core.record_os_drop(std::slice::from_ref(&dropped));
     let err = core
-        .claim_dropped_attachments(&[not_dropped.to_string_lossy().into_owned()])
+        .claim_dropped_attachments(&[not_dropped.to_string_lossy().into_owned()], None)
         .unwrap_err();
     assert!(
         matches!(err, comail_core::error::CoreError::ActionRejected(_)),
@@ -897,17 +908,20 @@ async fn claim_dropped_attachments_accepts_only_rust_observed_drops() {
     );
     // And a mixed claim fails whole-call, leaving the real drop claimable.
     let err = core
-        .claim_dropped_attachments(&[
-            dropped.to_string_lossy().into_owned(),
-            not_dropped.to_string_lossy().into_owned(),
-        ])
+        .claim_dropped_attachments(
+            &[
+                dropped.to_string_lossy().into_owned(),
+                not_dropped.to_string_lossy().into_owned(),
+            ],
+            None,
+        )
         .unwrap_err();
     assert!(matches!(
         err,
         comail_core::error::CoreError::ActionRejected(_)
     ));
     assert!(
-        core.claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()])
+        core.claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None)
             .is_ok(),
         "the genuine drop should survive a failed mixed claim"
     );
@@ -915,8 +929,9 @@ async fn claim_dropped_attachments_accepts_only_rust_observed_drops() {
     // The claimed token stages like a picked file.
     core.record_os_drop(std::slice::from_ref(&dropped));
     let claimed = core
-        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()])
-        .unwrap();
+        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None)
+        .unwrap()
+        .approved;
     let draft_id = core
         .save_draft(draft_args(
             1,
@@ -932,4 +947,191 @@ async fn claim_dropped_attachments_accepts_only_rust_observed_drops() {
     let staging_root = std::fs::canonicalize(paths.draft_attachments_dir()).unwrap();
     assert!(std::path::Path::new(&staged[0]).starts_with(&staging_root));
     assert_eq!(std::fs::read(&staged[0]).unwrap(), b"png");
+}
+
+// -----------------------------------------------------------------------
+// Review round 1: token lifecycle (commit-only consumption, nonce binding)
+// and same-session adoption for a recreated draft.
+// -----------------------------------------------------------------------
+
+/// A token is consumed only when the save commits: when ANY attachment in
+/// the same request fails, every token in the request stays usable and no
+/// staged copy survives. The retry then stages normally.
+#[tokio::test]
+async fn failed_save_rolls_back_tokens_and_cleans_staged_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let paths = Paths::for_tests(&data_dir);
+
+    let ok = tmp.path().join("ok.txt");
+    let also_ok = tmp.path().join("also-ok.txt");
+    std::fs::write(&ok, b"ok").unwrap();
+    std::fs::write(&also_ok, b"also").unwrap();
+
+    let core = Core::start(paths.clone()).await.unwrap();
+    core.db
+        .write(|conn| {
+            conn.execute_batch(
+                "INSERT INTO accounts
+                   (id,email,provider,auth_kind,username,imap_host,imap_port,smtp_host,smtp_port,created_at)
+                   VALUES (1,'me@example.com','imap','password','me','h',993,'h',465,0);
+                 INSERT INTO folders (id,account_id,imap_name,role)
+                   VALUES (1,1,'Drafts','drafts');",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let tokens = core
+        .approve_attachment_sources(vec![ok.clone(), also_ok.clone()], None)
+        .unwrap();
+    let stage_root = paths.draft_attachments_dir();
+    std::fs::create_dir_all(&stage_root).unwrap();
+    let stage_root = std::fs::canonicalize(&stage_root).unwrap();
+    let before: Vec<_> = std::fs::read_dir(&stage_root).unwrap().collect();
+
+    // One bad entry anywhere in the request fails the whole save.
+    let err = core
+        .save_draft(draft_args(
+            1,
+            vec![
+                DraftAttachmentIn::Token {
+                    token: tokens[0].token.clone(),
+                },
+                DraftAttachmentIn::Token {
+                    token: "bogus".into(),
+                },
+                DraftAttachmentIn::Token {
+                    token: tokens[1].token.clone(),
+                },
+            ],
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        comail_core::error::CoreError::ActionRejected(_)
+    ));
+
+    // Nothing staged survives from the failed attempt.
+    let after: Vec<_> = std::fs::read_dir(&stage_root).unwrap().collect();
+    assert_eq!(before.len(), after.len());
+
+    // Both tokens are still valid - the very next save stages them.
+    let draft_id = core
+        .save_draft(draft_args(
+            1,
+            tokens
+                .into_iter()
+                .map(|t| DraftAttachmentIn::Token { token: t.token })
+                .collect(),
+        ))
+        .await
+        .unwrap()
+        .draft_id;
+    assert_eq!(stored_paths(&core, draft_id).await.len(), 2);
+}
+
+/// A draft deleted mid-session and recreated under the same composer nonce
+/// adopts the staged files the vanished draft produced; a different nonce
+/// cannot adopt them.
+#[tokio::test]
+async fn recreated_draft_adopts_own_sessions_staged_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let paths = Paths::for_tests(&data_dir);
+
+    let src = tmp.path().join("keep.pdf");
+    std::fs::write(&src, b"keep").unwrap();
+
+    let core = Core::start(paths).await.unwrap();
+    core.db
+        .write(|conn| {
+            conn.execute_batch(
+                "INSERT INTO accounts
+                   (id,email,provider,auth_kind,username,imap_host,imap_port,smtp_host,smtp_port,created_at)
+                   VALUES (1,'me@example.com','imap','password','me','h',993,'h',465,0);
+                 INSERT INTO folders (id,account_id,imap_name,role)
+                   VALUES (1,1,'Drafts','drafts');",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let nonce = Some("session-1".to_string());
+    let minted = core
+        .approve_attachment_sources(vec![src], nonce.clone())
+        .unwrap();
+    let args = SaveDraftArgs {
+        attachments: vec![DraftAttachmentIn::Token {
+            token: minted[0].token.clone(),
+        }],
+        composer_nonce: nonce.clone(),
+        ..draft_args(1, Vec::new())
+    };
+    let draft_id = core.save_draft(args).await.unwrap().draft_id;
+    let staged = stored_paths(&core, draft_id).await[0].clone();
+
+    // The draft vanishes (server-side delete the local client didn't know).
+    core.db
+        .write(move |conn| {
+            conn.execute("DELETE FROM messages WHERE id = ?1", [draft_id])?;
+            conn.execute(
+                "DELETE FROM draft_attachments WHERE draft_id = ?1",
+                [draft_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // Same session, draftless re-save (draft id dropped by the saver):
+    // the staged file is adopted instead of rejected.
+    let adopted = core
+        .save_draft(SaveDraftArgs {
+            attachments: vec![DraftAttachmentIn::Staged {
+                file_path: staged.clone(),
+                filename: "keep.pdf".into(),
+            }],
+            composer_nonce: nonce.clone(),
+            ..draft_args(1, Vec::new())
+        })
+        .await
+        .unwrap()
+        .draft_id;
+    assert_eq!(stored_paths(&core, adopted).await, vec![staged.clone()]);
+
+    // A second vanished draft + a DIFFERENT session nonce: no adoption.
+    core.db
+        .write(move |conn| {
+            conn.execute("DELETE FROM messages WHERE id = ?1", [adopted])?;
+            conn.execute(
+                "DELETE FROM draft_attachments WHERE draft_id = ?1",
+                [adopted],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let err = core
+        .save_draft(SaveDraftArgs {
+            attachments: vec![DraftAttachmentIn::Staged {
+                file_path: staged.clone(),
+                filename: "keep.pdf".into(),
+            }],
+            composer_nonce: Some("other-session".into()),
+            ..draft_args(1, Vec::new())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "foreign nonce: {err:?}"
+    );
+    // The file was not touched either way.
+    assert!(std::path::Path::new(&staged).exists());
 }

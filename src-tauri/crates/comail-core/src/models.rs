@@ -340,33 +340,52 @@ pub struct ActionResult {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum DraftAttachmentIn {
     /// A file the user approved through a trusted Rust path - the native
-    /// file dialog or an OS drop exchanged via `claim_dropped_attachments`.
-    /// The token is opaque, single-use and expires (see `approval.rs`); the
+    /// file dialog, an OS drop exchanged via `claim_dropped_attachments`, or
+    /// a forward source resolved by `prepare_forward_attachment`. The token
+    /// is opaque, single-use-on-commit and expires (see `approval.rs`); the
     /// staged copy is taken at save time.
     Token { token: String },
     /// A file already staged under the staging root that THIS draft already
     /// references - the shape `get_draft` and `save_draft` return, echoed
-    /// back on re-save. `filename` is echoed for display only; the persisted
-    /// name comes from the draft's existing row.
+    /// back on re-save - or a staged file this same composer session
+    /// produced earlier (draft-recreated adoption). `filename` is echoed for
+    /// display only; the persisted name comes from the draft's existing row.
     Staged { file_path: String, filename: String },
-    /// A received attachment carried into a forward, resolved in Rust by its
-    /// `attachments` row id - never a filesystem path from the caller.
-    Forward { attachment_id: i64 },
 }
 
-/// A user-approved attachment source: what `pick_draft_attachments` and
-/// `claim_dropped_attachments` return. `token` is the only part `save_draft`
-/// can consume; the rest is display metadata for the attachment chip.
+/// A user-approved attachment source: what `pick_draft_attachments`,
+/// `claim_dropped_attachments` and `prepare_forward_attachment` return.
+/// `token` is the only part `save_draft` can consume; the rest is display
+/// metadata for the attachment chip. No source path ever crosses to the
+/// webview - `source` is an opaque session alias for dedupe only.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovedAttachment {
     pub token: String,
     pub filename: String,
-    /// Canonical source path - chip tooltips and dedupe only; it cannot be
-    /// used as a staging source again.
-    pub path: String,
+    /// Opaque per-source-file alias, stable within the session: two
+    /// approvals of the same canonical file share it. Dedupe only.
+    pub source: String,
     pub size: u64,
     pub mime_type: Option<String>,
+}
+
+/// What `claim_dropped_attachments` returns: tokens for the usable files the
+/// OS dropped, plus the observed-but-unusable entries (a folder, a file that
+/// vanished) the UI should surface rather than silently drop.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropClaim {
+    pub approved: Vec<ApprovedAttachment>,
+    pub skipped: Vec<SkippedDrop>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedDrop {
+    /// The path as reported by the OS drop event (never used for staging).
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,11 +405,16 @@ pub struct SaveDraftArgs {
     pub in_reply_to_message_id: Option<i64>,
     #[serde(default)]
     pub attachments: Vec<DraftAttachmentIn>,
+    /// The composer session nonce the attachment tokens were minted for.
+    /// Internal saves (calendar invites, MCP drafts) leave it `None`, which
+    /// also matches nonce-less internal approvals.
+    #[serde(default)]
+    pub composer_nonce: Option<String>,
 }
 
 /// What `save_draft` returns: the draft id plus every attachment as it was
-/// persisted - always `Staged` entries the caller echoes back on re-save
-/// (one-shot `Token`/`Forward` entries must not be replayed).
+/// persisted - always `Staged` entries in request order, echoed back on
+/// re-save (one-shot `Token` entries must not be replayed).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveDraftResult {
