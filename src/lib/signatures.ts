@@ -183,10 +183,55 @@ const CLOSES_P = new Set([
 const TABLE_PARTS = new Set(["table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup"]);
 const CELL_SCOPE = new Set(["table", "td", "th", "caption"]);
 
-/** One token: a comment, a doctype / CDATA / `<?xml?>` (all dropped), or a
- *  start or end tag with its raw attribute text. */
-const TOKEN_RE =
-  /<!--[\s\S]*?(?:-->|$)|<[!?][^>]*(?:>|$)|<(\/?)([a-z][^\s/>]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/gi;
+/** A start or end tag, scanned manually (see scanTag). `attrs` is the raw
+ *  text between the tag name and `>`; `raw` the whole `<...>` token. */
+interface TagToken {
+  /** Index just after the tag's `>`. */
+  end: number;
+  closing: boolean;
+  tag: string;
+  attrs: string;
+  raw: string;
+}
+
+/** The tag at `src[pos]` (which must be "<"), or how to treat the "<" when no
+ *  tag can start there. The tag end is found with quote awareness so a `>`
+ *  inside a quoted attribute doesn't end it early. O(token length) and each
+ *  source position is scanned at most once, so pathological input (thousands
+ *  of unterminated `<a "` starts) stays linear where the regex this replaced
+ *  was quadratic. "unterminated" reports the tail as text: a `<tag>` nested
+ *  inside a malformed one was text in the old engine too, just per character. */
+function scanTag(src: string, pos: number): TagToken | "literal" | "unterminated" {
+  let i = pos + 1;
+  const closing = src[i] === "/";
+  if (closing) i += 1;
+  if (!/[a-z]/i.test(src[i] ?? "")) return "literal";
+  const nameStart = i;
+  i += 1;
+  while (i < src.length && !/[\s/>]/.test(src[i])) i += 1;
+  const tag = src.slice(nameStart, i);
+  const attrStart = i;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === ">") {
+      return {
+        end: i + 1,
+        closing,
+        tag,
+        attrs: src.slice(attrStart, i),
+        raw: src.slice(pos, i + 1),
+      };
+    }
+    if (c === '"' || c === "'") {
+      const close = src.indexOf(c, i + 1);
+      if (close < 0) return "unterminated";
+      i = close + 1;
+    } else {
+      i += 1;
+    }
+  }
+  return "unterminated";
+}
 
 const ATTR_RE = /([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*)))?/g;
 
@@ -201,6 +246,15 @@ const EDITOR_LINK = /^(?:https?|mailto|tel|cid):/;
 /** Editor images: raster `data:` only - `data:image/svg` carries markup. */
 const EDITOR_IMAGE =
   /^(?:https?:|cid:|data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)(?=[;,]))/;
+
+/** Image MIME types `EDITOR_IMAGE` accepts as `data:` sources. The image
+ *  tool checks files against this before reading them, so a type the
+ *  allowlist would drop (SVG, TIFF, HEIC) never enters the DOM only to
+ *  disappear when the draft is reopened. Keep in sync with EDITOR_IMAGE. */
+export const EDITOR_IMAGE_TYPES: ReadonlySet<string> = new Set([
+  "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
+  "image/bmp", "image/x-icon", "image/vnd.microsoft.icon",
+]);
 
 /** Editor styles: the presentational properties the toolbar, pasted content
  *  and signature/table markup legitimately use. Anything not listed (position,
@@ -251,15 +305,10 @@ const EDITOR_PROFILE: SanitizeProfile = {
   globalAttrs: GLOBAL_ATTRS,
   allowed: EDITOR_ALLOWED,
   rawText: RAW_TEXT,
-  // Form chrome pasted from a page is dead weight and `<form>` markup doesn't
-  // belong in an email. (Void tags like meta/link/embed/input aren't listed:
-  // they carry no content, and a dropped void tag would skip to an end tag
-  // that never comes, eating the rest of the body.)
-  dropped: new Set([
-    ...DROPPED,
-    "form", "button", "fieldset", "label", "legend", "option", "optgroup",
-    "datalist", "frameset", "picture", "map", "dialog",
-  ]),
+  // Only genuinely dangerous or foreign-content elements lose their content;
+  // everything else unknown unwraps, keeping its children - <picture>'s img,
+  // text in <form>/<button>/<dialog> chrome pasted from a page.
+  dropped: DROPPED,
   linkRe: EDITOR_LINK,
   imageRe: EDITOR_IMAGE,
   classes: new Map([
@@ -324,6 +373,17 @@ function splitDeclarations(css: string): string[] {
   return out;
 }
 
+// CSS functions allowed inside a declaration value. image-set(), cross-fade(),
+// paint(), element() and friends can carry a URL or arbitrary reference, so
+// anything not on this list rejects the whole declaration.
+const SAFE_CSS_FUNCS = new Set([
+  "url", "rgb", "rgba", "hsl", "hsla", "hwb", "lab", "lch", "oklab", "oklch",
+  "color", "calc", "min", "max", "clamp", "cubic-bezier", "steps", "linear",
+  "counter", "counters", "attr", "local", "format",
+  "linear-gradient", "radial-gradient", "conic-gradient",
+  "repeating-linear-gradient", "repeating-radial-gradient", "repeating-conic-gradient",
+]);
+
 /** The style's declarations minus the unsafe ones (same text otherwise). */
 function cleanStyle(raw: string, profile: SanitizeProfile): string {
   return splitDeclarations(decodeCharRefs(raw))
@@ -340,13 +400,25 @@ function cleanStyle(raw: string, profile: SanitizeProfile): string {
         !(profile.cssPrefixes ?? []).some((p) => prop.startsWith(p))
       )
         return false;
+      // Escapes and comments can disguise tokens (u\72l(, u/**/rl()).
+      if (value.includes("\\") || value.includes("/*")) return false;
       if (/expression\s*\(|(?:java|vb)script:/.test(value)) return false;
       // Every url() must parse and point at an image source we allow.
       const urls = [...value.matchAll(/url\(([^)]*)\)/g)];
       if (urls.length !== value.split("url(").length - 1) return false;
-      return urls.every(
-        (u) => profile.imageRe.test(u[1].trim().replace(/^["']|["']$/g, "").trim()),
-      );
+      if (
+        !urls.every((u) =>
+          profile.imageRe.test(u[1].trim().replace(/^["']|["']$/g, "").trim()),
+        )
+      )
+        return false;
+      // Only allowlisted functions may appear in a value (quoted strings -
+      // a font name can contain parens - don't count).
+      const unquoted = value.replace(/"[^"]*"|'[^']*'/g, "");
+      for (const f of unquoted.matchAll(/([a-z][a-z0-9-]*)\s*\(/g)) {
+        if (!SAFE_CSS_FUNCS.has(f[1])) return false;
+      }
+      return true;
     })
     .join(";");
 }
@@ -402,7 +474,6 @@ function cleanAttrs(
 /** The shared tokenizer behind sanitizeSignatureHtml / sanitizeEditorHtml. */
 function sanitizeWith(profile: SanitizeProfile, html: string): string {
   const src = html.replace(/\0/g, "");
-  const re = new RegExp(TOKEN_RE.source, "gi");
   const open: string[] = [];
   let out = "";
   let pos = 0;
@@ -434,13 +505,45 @@ function sanitizeWith(profile: SanitizeProfile, html: string): string {
     return -1;
   };
 
-  for (let m = re.exec(src); m; m = re.exec(src)) {
-    text(src.slice(pos, m.index));
-    pos = re.lastIndex;
-    const [token, slash, rawTag, rawAttrs] = m;
-    if (rawTag === undefined) continue;
-    const tag = rawTag.toLowerCase();
-    const closing = slash === "/";
+  while (pos < src.length) {
+    const lt = src.indexOf("<", pos);
+    if (lt < 0) {
+      text(src.slice(pos));
+      pos = src.length;
+      break;
+    }
+    text(src.slice(pos, lt));
+    const next = src[lt + 1];
+    // Comments, doctype/CDATA and <?pi> are dropped (comments run to --> or
+    // end of input, the rest to the first ">").
+    if (next === "!") {
+      const isComment = src.startsWith("<!--", lt);
+      const end = isComment ? src.indexOf("-->", lt + 4) : src.indexOf(">", lt + 2);
+      pos = end < 0 ? src.length : end + (isComment ? 3 : 1);
+      continue;
+    }
+    if (next === "?") {
+      const end = src.indexOf(">", lt + 2);
+      pos = end < 0 ? src.length : end + 1;
+      continue;
+    }
+    const scan = scanTag(src, lt);
+    if (scan === "literal") {
+      text("<");
+      pos = lt + 1;
+      continue;
+    }
+    if (scan === "unterminated") {
+      // No tag end anywhere in the tail: browsers wouldn't emit it either, so
+      // the "<" and everything after is literal text (and scanning stops,
+      // which keeps adversarial input linear).
+      text(src.slice(lt));
+      pos = src.length;
+      break;
+    }
+    pos = scan.end;
+    const tag = scan.tag.toLowerCase();
+    const closing = scan.closing;
     if (skip) {
       if (tag === skip.tag) skip.depth += closing ? -1 : 1;
       if (skip.depth === 0) skip = null;
@@ -454,16 +557,15 @@ function sanitizeWith(profile: SanitizeProfile, html: string): string {
     if (profile.rawText.has(tag)) {
       const end = src.slice(pos).search(new RegExp(`</${tag}[\\s/>]`, "i"));
       pos = end < 0 ? src.length : pos + end;
-      re.lastIndex = pos;
       continue;
     }
     if (profile.dropped.has(tag)) {
-      if (!token.endsWith("/>")) skip = { tag, depth: 1 };
+      if (!scan.raw.endsWith("/>")) skip = { tag, depth: 1 };
       continue;
     }
     const extra = profile.allowed.get(tag);
     if (!extra) continue;
-    const { attrs, src: hasSrc } = cleanAttrs(rawAttrs, extra, tag, profile);
+    const { attrs, src: hasSrc } = cleanAttrs(scan.attrs, extra, tag, profile);
     // An image whose source didn't survive shows nothing.
     if (tag === "img" && !hasSrc) continue;
     if (CLOSES_P.has(tag)) closeNearest(["p"], ["table", "td", "th", "caption"]);

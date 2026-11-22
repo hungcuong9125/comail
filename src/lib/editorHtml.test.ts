@@ -66,6 +66,37 @@ describe("sanitizeEditorHtml", () => {
     expect(sanitizeEditorHtml(dataBg)).toBe(dataBg);
   });
 
+  it("rejects CSS escapes, comments and non-allowlisted functions", () => {
+    // A backslash escape spells url( without the literal text.
+    expect(
+      sanitizeEditorHtml('<div style="background:u\\72l(javascript:alert(1))">x</div>'),
+    ).toBe("<div>x</div>");
+    expect(
+      sanitizeEditorHtml('<div style="background:\\75\\72\\6c(javascript:alert(1))">x</div>'),
+    ).toBe("<div>x</div>");
+    // A comment splits the token the same way.
+    expect(
+      sanitizeEditorHtml('<div style="background:u/**/rl(javascript:alert(1))">x</div>'),
+    ).toBe("<div>x</div>");
+    // URL-carrying functions are off the allowlist entirely.
+    for (const css of [
+      "background:image-set(url(javascript:alert(1)) 1x)",
+      "background:-webkit-image-set(url(javascript:alert(1)) 1x)",
+      "background:cross-fade(url(https://x.dev/a.png), url(javascript:x) 50%)",
+      "background:paint(evil)",
+      "list-style-image:image-set(url(javascript:alert(1)) 1x)",
+    ]) {
+      expect(sanitizeEditorHtml(`<div style="${css}">x</div>`), css).toBe("<div>x</div>");
+    }
+    // Gradient functions stay - email markup uses them for backgrounds.
+    const grad =
+      '<td style="background:linear-gradient(to right, rgb(1,2,3), #fff)">a</td>';
+    expect(sanitizeEditorHtml(grad)).toBe(grad);
+    // A quoted value that happens to look functional (a font name) still parses.
+    const font = '<span style="font-family:\'Segoe (UI)\', sans-serif">x</span>';
+    expect(sanitizeEditorHtml(font)).toBe(font);
+  });
+
   it("keeps the links the composer makes, drops script and file URLs", () => {
     expect(sanitizeEditorHtml('<a href="mailto:a@b.c">m</a>')).toBe('<a href="mailto:a@b.c">m</a>');
     expect(sanitizeEditorHtml('<a href="tel:+15550100">t</a>')).toBe('<a href="tel:+15550100">t</a>');
@@ -100,7 +131,8 @@ describe("sanitizeEditorHtml", () => {
     expect(sanitizeEditorHtml("<svg><text>no</text></svg>ok")).toBe("ok");
     expect(sanitizeEditorHtml("<math><mi>no</mi></math>ok")).toBe("ok");
     expect(sanitizeEditorHtml("<template><b>no</b></template>ok")).toBe("ok");
-    expect(sanitizeEditorHtml("<form><input value=a><button>Go</button>Jane</form>")).toBe("");
+    // Form chrome unwraps (its children are kept as content); void inputs go.
+    expect(sanitizeEditorHtml("<form><input value=a><button>Go</button>Jane</form>")).toBe("GoJane");
     expect(sanitizeEditorHtml('<meta charset="utf-8"><link href="x"><base href="x">ok')).toBe("ok");
     expect(sanitizeEditorHtml('<div onclick="x" onmouseover=y>Jane</div>')).toBe("<div>Jane</div>");
   });
@@ -108,6 +140,15 @@ describe("sanitizeEditorHtml", () => {
   it("unwraps unknown wrappers instead of dropping content", () => {
     expect(sanitizeEditorHtml("<section><article>hi</article></section>")).toBe("hi");
     expect(sanitizeEditorHtml("<o:p>x</o:p><custom-tag a=1>y</custom-tag>")).toBe("xy");
+    // A responsive-image wrapper goes, its kept <img> stays.
+    expect(
+      sanitizeEditorHtml('<picture><img src="https://x.dev/a.png"></picture>'),
+    ).toBe('<img src="https://x.dev/a.png">');
+    expect(
+      sanitizeEditorHtml('<map name="m"><area href="https://x.dev">x</map><label>L</label><dialog open>D</dialog>'),
+    ).toBe("xLD");
+    // select is chrome whose content is not email content.
+    expect(sanitizeEditorHtml("<select><option>a</option></select>ok")).toBe("ok");
   });
 
   it("keeps table markup from quoted mail", () => {
@@ -130,6 +171,43 @@ describe("sanitizeEditorHtml", () => {
       const once = sanitizeEditorHtml(html);
       expect(sanitizeEditorHtml(once)).toBe(once);
     }
+  });
+
+  it("keeps browser-serialized editor output as fixed points", () => {
+    // The shape innerHTML actually emits: lowercase tags, double-quoted
+    // attributes, &amp; inside URLs, spaced declarations with a trailing ';'.
+    for (const html of [
+      '<div style="font-family: Arial, sans-serif; font-size: 12px;">x</div>',
+      '<div style="color: rgb(18, 52, 86); text-align: center;">x</div>',
+      '<a href="https://x.dev/?a=1&amp;b=2">x</a>',
+      '<img src="https://x.dev/a.png?w=1&amp;h=2" alt="a &amp; b">',
+      '<ul type="disc"><li>one</li></ul><ol start="2" type="a"><li>two</li></ol>',
+      '<td style="padding: 4px; vertical-align: top;">a</td>',
+      '<div dir="ltr" lang="en" align="center" bgcolor="#ffffff">x</div>',
+      '<div>line<br>break &amp; entity</div>',
+    ]) {
+      expect(sanitizeEditorHtml(html), html).toBe(html);
+    }
+    // A foreign draft normalizes once: gmail class/id go, dir and <br> stay.
+    expect(
+      sanitizeEditorHtml(
+        '<div class="gmail_default" dir="ltr">hi<br><div id="x">there</div></div>',
+      ),
+    ).toBe('<div dir="ltr">hi<br><div>there</div></div>');
+  });
+
+  it("stays fast on pathological and large inputs", () => {
+    // Unterminated-tag soup was quadratic in the old regex tokenizer.
+    const hostile = `<div>${"<a ".repeat(12000)}x${"<b href=\"".repeat(12000)}`;
+    const t0 = performance.now();
+    sanitizeEditorHtml(hostile);
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(hostile.length).toBeGreaterThan(100_000);
+    // A normal big draft: a multi-MB inline image body must not slow the pass.
+    const big = `<div><img src="data:image/png;base64,${"A".repeat(4_000_000)}"></div>`;
+    const t1 = performance.now();
+    sanitizeEditorHtml(big);
+    expect(performance.now() - t1).toBeLessThan(500);
   });
 
   it("returns empty for empty input", () => {
