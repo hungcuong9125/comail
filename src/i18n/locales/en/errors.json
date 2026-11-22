@@ -21,6 +21,7 @@
   "connectionFailed": "Connection failed",
   "caldav": "Calendar server error",
   "carddav": "Contacts server error",
+  "noBackend": "This build of Comail has no mail backend. Open it inside the Comail app, or run pnpm dev for the in-browser demo.",
   "crash": {
     "title": "Something went wrong",
     "body": "This view hit an unexpected error. Your mail is safe — try again, or reload the app.",
