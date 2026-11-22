@@ -72,12 +72,12 @@ fn semaphore() -> &'static tokio::sync::Semaphore {
 fn http() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        // Every hop (initial request and each redirect) must stay on
+        // public https destinations; DNS answers are filtered to public
+        // addresses at connect time, and no proxy is honoured so the
+        // filter always sees the real destination.
+        netguard::guarded_builder()
             .timeout(Duration::from_secs(8))
-            // Every hop (initial request and each redirect) must stay on
-            // public https destinations; DNS answers are filtered to public
-            // addresses at connect time.
-            .dns_resolver(netguard::dns_resolver())
             .redirect(netguard::redirect_policy(3))
             .user_agent(concat!("comail/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -96,19 +96,17 @@ fn data_url(mime: &str, bytes: &[u8]) -> String {
 /// Picture for `email` as a data URL, or None when no source has one.
 pub async fn resolve(data_dir: &Path, email: &str) -> Option<String> {
     let email = email.trim().to_ascii_lowercase();
-    let domain = email.rsplit_once('@')?.1.to_string();
-    // The domain is attacker-controlled (any From address). It must be a
-    // real DNS hostname before it steers fetches — and it never goes near a
-    // path raw: cache files are named by its hash, like the person key.
-    if !netguard::is_dns_hostname(&domain) {
-        return None;
-    }
+    let raw_domain = email.rsplit_once('@')?.1;
+    // The domain is attacker-controlled (any From address). Normalize it to
+    // its ASCII (punycode) form — Unicode IDN works, look-alike dots and
+    // slashes are rejected — and use that form for everything after: DNS,
+    // URLs and the cache key.
+    let domain = netguard::to_ascii_domain(raw_domain)?;
     let dir = data_dir.join("avatars");
     let hash = hex(&sha2::Sha256::digest(email.as_bytes()));
-    let domain_hash = hex(&sha2::Sha256::digest(domain.as_bytes()));
 
-    let person_key = dir.join(format!("p-{hash}"));
-    let domain_key = dir.join(format!("d-{domain_hash}"));
+    let person_key = person_key(&dir, &email);
+    let domain_key = domain_key(&dir, &domain);
     let use_logo = !WEBMAIL_DOMAINS.contains(&domain.as_str());
 
     // Fast path: everything needed is already cached.
@@ -225,9 +223,7 @@ fn bimi_logo_url(record: &str) -> Option<String> {
 /// somewhere public — the shared client's DNS filter and redirect policy
 /// enforce the same on every connection and hop.
 async fn fetch_image(url: &str) -> Option<String> {
-    let url = url::Url::parse(url)
-        .ok()
-        .filter(netguard::is_public_https_url)?;
+    let url = netguard::public_https_url(url)?;
     let mut resp = http().get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -313,6 +309,23 @@ fn org_domain(domain: &str) -> String {
         2
     };
     labels[n - keep..].join(".")
+}
+
+/// Cache file for a person's photo: `p-<sha256(email)>`.
+fn person_key(dir: &Path, email: &str) -> PathBuf {
+    dir.join(format!(
+        "p-{}",
+        hex(&sha2::Sha256::digest(email.as_bytes()))
+    ))
+}
+
+/// Cache file for a domain's logo: `d-<sha256(domain)>` — the on-disk name
+/// can never contain attacker-chosen path characters.
+fn domain_key(dir: &Path, domain: &str) -> PathBuf {
+    dir.join(format!(
+        "d-{}",
+        hex(&sha2::Sha256::digest(domain.as_bytes()))
+    ))
 }
 
 /// Only `p-<sha256>`/`d-<sha256>` file names are cache keys. Both `cached`
@@ -470,6 +483,57 @@ mod tests {
         // A 63- or 65-char suffix is not a sha256 hex digest.
         assert!(!is_cache_key(Path::new(&format!("p-{}", "a".repeat(63)))));
         assert!(!is_cache_key(Path::new(&format!("p-{}", "a".repeat(65)))));
+    }
+
+    /// The on-disk name must come from the domain's hash, never the domain
+    /// itself — reverting to `d-{domain}` fails this test.
+    #[test]
+    fn domain_key_is_the_domain_hash() {
+        // sha256("example.com")
+        assert_eq!(
+            domain_key(Path::new("/data/avatars"), "example.com"),
+            Path::new("/data/avatars")
+                .join("d-a379a6f6eeafb9a55e378c118034e2751e682fab9f2d30ab13d2125586ce1947")
+        );
+        assert_eq!(
+            person_key(Path::new("/data/avatars"), "a@example.com"),
+            Path::new("/data/avatars")
+                .join("p-08168cd80dfd534ab0f10af10f1303fe00af2d43ab5c1432360d137f8197e17a")
+        );
+    }
+
+    /// End to end, no network: a cached person miss plus a cached domain hit
+    /// is served from `d-<sha256(domain)>`, and a file under the old
+    /// `d-<domain>` name is ignored.
+    #[tokio::test]
+    async fn resolve_reads_hashed_domain_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let avatars = dir.path().join("avatars");
+        std::fs::create_dir_all(&avatars).unwrap();
+        let logo = "data:image/png;base64,QUJD";
+        std::fs::write(person_key(&avatars, "a@example.com"), "").unwrap();
+        std::fs::write(domain_key(&avatars, "example.com"), logo).unwrap();
+        std::fs::write(avatars.join("d-example.com"), "data:decoy").unwrap();
+        assert_eq!(
+            resolve(dir.path(), "a@example.com").await.as_deref(),
+            Some(logo)
+        );
+    }
+
+    /// A Unicode IDN sender domain resolves to the punycode form, which is
+    /// what the cache key hashes — no network needed to prove the pipeline.
+    #[tokio::test]
+    async fn resolve_normalizes_idn_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let avatars = dir.path().join("avatars");
+        std::fs::create_dir_all(&avatars).unwrap();
+        let logo = "data:image/png;base64,QUJD";
+        std::fs::write(person_key(&avatars, "a@münchen.de"), "").unwrap();
+        std::fs::write(domain_key(&avatars, "xn--mnchen-3ya.de"), logo).unwrap();
+        assert_eq!(
+            resolve(dir.path(), "a@München.de").await.as_deref(),
+            Some(logo)
+        );
     }
 
     /// cached()/store() never touch a path that is not a key name, even

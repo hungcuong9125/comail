@@ -137,14 +137,13 @@ fn percent_decode(s: &str) -> String {
 /// are followed (the endpoint must not require them) and no cookies are sent.
 pub async fn post_one_click(url: &str) -> Result<()> {
     // The URL comes from an email header: it must be https and land on a
-    // public host. The DNS filter below enforces the same at connect time,
-    // so a public name resolving to a private address is refused too.
-    let url = url::Url::parse(url)
-        .ok()
-        .filter(crate::netguard::is_public_https_url)
+    // public host. The DNS filter in guarded_builder enforces the same at
+    // connect time, so a public name resolving to a private address is
+    // refused too — and proxies are disabled so the filter always sees the
+    // real destination.
+    let url = crate::netguard::public_https_url(url)
         .ok_or_else(|| CoreError::Network("unsubscribe URL is not a public https URL".into()))?;
-    let client = reqwest::Client::builder()
-        .dns_resolver(crate::netguard::dns_resolver())
+    let client = crate::netguard::guarded_builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
         .user_agent(concat!("comail/", env!("CARGO_PKG_VERSION")))
@@ -254,10 +253,11 @@ mod tests {
         assert_eq!(percent_decode("%zz"), "%zz");
     }
 
-    /// SSRF guard: anything that is not a public https URL is refused before
-    /// any socket is opened.
-    #[tokio::test]
-    async fn one_click_refuses_non_public_targets() {
+    /// SSRF guard, pure part: no network is touched. Removing the URL check
+    /// from post_one_click would let an http:// URL reach a real POST — this
+    /// test would then perform network I/O and fail either way.
+    #[test]
+    fn unsubscribe_url_must_be_public_https() {
         for url in [
             "http://example.com/u",      // no https
             "https://127.0.0.1/u",       // loopback literal
@@ -268,10 +268,24 @@ mod tests {
             "https://app.internal/u",
             "not a url",
         ] {
-            let err = post_one_click(url).await.unwrap_err();
             assert!(
-                matches!(err, CoreError::Network(_)),
+                crate::netguard::public_https_url(url).is_none(),
                 "{url} must be refused"
+            );
+        }
+        assert!(crate::netguard::public_https_url("https://example.com/u?t=1").is_some());
+    }
+
+    /// The guard is actually wired in: refused URLs produce the guard's own
+    /// error, not a connect/DNS error from a real socket attempt.
+    #[tokio::test]
+    async fn one_click_refuses_before_any_socket() {
+        for url in ["https://127.0.0.1/u", "http://example.com/u"] {
+            let err = post_one_click(url).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "network error: unsubscribe URL is not a public https URL",
+                "{url} must hit the guard, not the network"
             );
         }
     }
