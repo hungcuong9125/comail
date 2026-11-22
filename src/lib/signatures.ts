@@ -202,6 +202,19 @@ interface SanitizeProfile {
    *  signature cover the app around the editor; the others are legacy script
    *  hooks. */
   blockedCss: ReadonlySet<string>;
+  /** Per-value ceilings, checked before any per-value processing so a single
+   *  giant attribute can't feed unbounded work downstream. URL attributes
+   *  (href, src, background) are kept whole or dropped whole - never cut,
+   *  because a cut URL is a different URL and a cut data URI is a corrupt
+   *  file; `data:` sources are exempt since inline images legitimately run
+   *  to megabytes. Non-URL values (title, alt, class, style) may be shortened
+   *  or dropped past the cap. The signature profile's bounds sit far beyond
+   *  anything a real signature produces, so its output is unchanged for all
+   *  realistic input. */
+  maxStyleLen: number;
+  maxDeclLen: number;
+  maxAttrLen: number;
+  maxLinkLen: number;
 }
 
 /** Attributes kept on any allowed element: email HTML lays signatures out with
@@ -260,17 +273,29 @@ const CELL_SCOPE = new Set(["table", "td", "th", "caption"]);
  *  emitted string, or the depth the browser's own parser has to handle. */
 const MAX_OPEN = 256;
 
-/** Per-value ceilings, applied before any per-value processing so a single
- *  giant attribute can't feed unbounded work downstream. They are far above
- *  anything the editor or ordinary mail produces: the longest real styles are
- *  signature/table declarations of a few hundred bytes, mail hrefs are well
- *  under 1 KB even with tracking params, and title/alt/class text is short.
- *  Image `src`/`background` are exempt - a base64 `data:` image is
- *  legitimately megabytes and its check is a constant number of linear passes. */
-const MAX_STYLE_LEN = 8 * 1024;
-const MAX_DECL_LEN = 2 * 1024;
-const MAX_ATTR_LEN = 4 * 1024;
-const MAX_LINK_LEN = 4 * 1024;
+/** Per-value ceilings for the editor profile, applied before any per-value
+ *  processing. They are far above anything the editor or ordinary mail
+ *  produces: the longest real styles are pasted table declarations of a few
+ *  hundred bytes, mail hrefs stay under ~1 KB even with tracking params, and
+ *  title/alt text is short. Image `src`/`background` data URIs are exempt
+ *  entirely - a base64 image is legitimately megabytes and its check is a
+ *  constant number of linear passes. */
+const EDITOR_MAX_STYLE_LEN = 8 * 1024;
+const EDITOR_MAX_DECL_LEN = 2 * 1024;
+const EDITOR_MAX_ATTR_LEN = 4 * 1024;
+const EDITOR_MAX_LINK_LEN = 32 * 1024;
+
+/** The signature profile must not change output for any realistic signature
+ *  (the original code had no caps), so its bounds sit ~100x beyond what real
+ *  signatures carry: a logo lives in src (uncapped anyway), styles run to a
+ *  few KB, and title/alt/href text is shorter still. Output can differ from
+ *  the pre-cap code only for a style attribute over 256 KB, a single CSS
+ *  declaration over 64 KB, a non-URL attribute over 64 KB, or a non-data URL
+ *  attribute over 256 KB. */
+const SIG_MAX_STYLE_LEN = 256 * 1024;
+const SIG_MAX_DECL_LEN = 64 * 1024;
+const SIG_MAX_ATTR_LEN = 64 * 1024;
+const SIG_MAX_LINK_LEN = 256 * 1024;
 
 /** Pre-compiled end-tag finders for the raw-text elements, used with exec +
  *  lastIndex so the tail is never copied per element. */
@@ -386,6 +411,10 @@ const SIGNATURE_PROFILE: SanitizeProfile = {
   cssProps: null,
   cssPrefixes: null,
   blockedCss: BLOCKED_CSS,
+  maxStyleLen: SIG_MAX_STYLE_LEN,
+  maxDeclLen: SIG_MAX_DECL_LEN,
+  maxAttrLen: SIG_MAX_ATTR_LEN,
+  maxLinkLen: SIG_MAX_LINK_LEN,
 };
 
 const EDITOR_ALLOWED = new Map<string, readonly string[]>([
@@ -413,6 +442,10 @@ const EDITOR_PROFILE: SanitizeProfile = {
   cssProps: EDITOR_CSS_PROPS,
   cssPrefixes: EDITOR_CSS_PREFIXES,
   blockedCss: new Set(),
+  maxStyleLen: EDITOR_MAX_STYLE_LEN,
+  maxDeclLen: EDITOR_MAX_DECL_LEN,
+  maxAttrLen: EDITOR_MAX_ATTR_LEN,
+  maxLinkLen: EDITOR_MAX_LINK_LEN,
 };
 
 /** Character references, enough to read a URL or style the way the browser
@@ -438,14 +471,17 @@ function decodeCharRefs(s: string): string {
   );
 }
 
-function isSafeUrl(attr: string, raw: string, profile: SanitizeProfile): boolean {
-  // As the URL parser reads it: references decoded, controls and spaces gone.
-  // Decoding is skipped when there is no "&" so a multi-MB base64 src pays
-  // only for the control-strip, lowercase and anchored test below - a
-  // constant number of linear passes either way.
+/** The normalized URL the browser's parser would see - references decoded,
+ *  controls and spaces stripped, lowercased - when it passes the profile's
+ *  scheme allowlist for `attr`, else null. The normalized form is returned
+ *  so callers can inspect it (a `data:` prefix exempts src from the link
+ *  cap). Decoding is skipped when there is no "&" so a multi-MB base64 src
+ *  pays only for the control-strip, lowercase and anchored test: a constant
+ *  number of linear passes either way. */
+function safeUrl(attr: string, raw: string, profile: SanitizeProfile): string | null {
   const decoded = raw.includes("&") ? decodeCharRefs(raw) : raw;
   const url = decoded.replace(/[\x00-\x20\x7f-\x9f]/g, "").toLowerCase();
-  return (attr === "href" ? profile.linkRe : profile.imageRe).test(url);
+  return (attr === "href" ? profile.linkRe : profile.imageRe).test(url) ? url : null;
 }
 
 /** Split a style attribute on the `;`s between declarations (not those inside
@@ -484,48 +520,62 @@ const SAFE_CSS_FUNCS = new Set([
 ]);
 
 /** True when a declaration value's functions are all allowlisted and every
- *  url() points at an allowed image source. Single left-to-right scan: the
- *  `matchAll(/url\(([^)]*)\)/)` + `split("url(")` + regex function scan this
- *  replaces were quadratic on long identifiers and on unclosed `url(` runs
- *  (`url(url(url(…`). Quoted strings are skipped entirely - parens in a font
- *  name are string content, not calls. */
+ *  url() points at an allowed image source. Same accept/reject as the code
+ *  this replaced (every `url(` occurrence - inside quotes included - must
+ *  complete at the next `)` and hold an allowed target; only allowlisted
+ *  functions may appear outside quoted strings), but a single pass: the
+ *  matchAll/split/regex combination was quadratic on long identifiers and
+ *  unclosed `url(` runs. */
 function checkStyleValue(value: string, profile: SanitizeProfile): boolean {
   if (/expression\s*\(|(?:java|vb)script:/.test(value)) return false;
-  let i = 0;
-  while (i < value.length) {
+  // Every `url(` anywhere - quoted strings included - must close at the next
+  // `)` and target an allowed image source: the `matchAll` + `split("url(")`
+  // count check's rule, done with indexOf so an unclosed run can't rescan
+  // the tail per occurrence.
+  for (let u = value.indexOf("url(", 0); u >= 0; u = value.indexOf("url(", u + 1)) {
+    const close = value.indexOf(")", u + 4);
+    if (close < 0) return false;
+    const target = value
+      .slice(u + 4, close)
+      .trim()
+      .replace(/^["']|["']$/g, "")
+      .trim();
+    if (!profile.imageRe.test(target)) return false;
+  }
+  // The unquoted view the old `/"[^"]*"|'[^']*'/g` strip produced: complete
+  // quoted pairs removed, an unclosed quote leaving the tail in place.
+  const parts: string[] = [];
+  let start = 0;
+  for (let i = 0; i < value.length; i += 1) {
     const c = value[i];
     if (c === '"' || c === "'") {
       const close = value.indexOf(c, i + 1);
-      i = close < 0 ? value.length : close + 1;
-      continue;
+      if (close < 0) break;
+      parts.push(value.slice(start, i));
+      start = close + 1;
+      i = close;
     }
+  }
+  parts.push(value.slice(start));
+  const unquoted = parts.join("");
+  // Non-URL function calls in the unquoted view must be allowlisted:
+  // `identifier` + optional whitespace + `(`. One left-to-right pass over
+  // the ~decl-sized string.
+  for (let i = 0; i < unquoted.length; i += 1) {
+    const c = unquoted[i];
     if (c >= "a" && c <= "z") {
-      const start = i;
-      while (i < value.length) {
-        const d = value.charCodeAt(i);
+      const from = i;
+      while (i < unquoted.length) {
+        const d = unquoted.charCodeAt(i);
         if (!(d === 45 || (d >= 48 && d <= 57) || (d >= 97 && d <= 122))) break;
         i += 1;
       }
-      const name = value.slice(start, i);
       let j = i;
-      while (j < value.length && /\s/.test(value[j])) j += 1;
-      if (value[j] !== "(") continue;
-      if (name === "url") {
-        const close = value.indexOf(")", j + 1);
-        // An unclosed url( or one holding another url( rejects, as the old
-        // "every url( must be a match" count check did.
-        const nested = value.indexOf("url(", j + 1);
-        if (close < 0 || (nested >= 0 && nested < close)) return false;
-        const target = value.slice(j + 1, close).trim().replace(/^["']|["']$/g, "").trim();
-        if (!profile.imageRe.test(target)) return false;
-        i = close + 1;
-        continue;
-      }
-      if (!SAFE_CSS_FUNCS.has(name)) return false;
-      i = j + 1;
+      while (j < unquoted.length && /\s/.test(unquoted[j])) j += 1;
+      if (unquoted[j] === "(" && !SAFE_CSS_FUNCS.has(unquoted.slice(from, i)))
+        return false;
       continue;
     }
-    i += 1;
   }
   return true;
 }
@@ -534,7 +584,7 @@ function checkStyleValue(value: string, profile: SanitizeProfile): boolean {
 function cleanStyle(raw: string, profile: SanitizeProfile): string {
   return splitDeclarations(decodeCharRefs(raw))
     .filter((decl) => {
-      if (decl.length > MAX_DECL_LEN) return false;
+      if (decl.length > profile.maxDeclLen) return false;
       if (!decl.trim()) return true;
       const colon = decl.indexOf(":");
       if (colon < 0) return false;
@@ -554,8 +604,46 @@ function cleanStyle(raw: string, profile: SanitizeProfile): string {
     .join(";");
 }
 
+/** The `'`/`<`/`>` escaping applied to attribute values (character
+ *  references in the source stay literal). */
+function escapeAttr(value: string): string {
+  return value.replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Shorten a non-URL attribute value so its ESCAPED form fits the cap: the
+ *  cut lands on a code-point boundary of the raw value (never inside a
+ *  surrogate pair), backs off a trailing partial `&…` so no character
+ *  reference is cut in half, and budgets for the `"`→`&quot;`/`<`→`&lt;`
+ *  expansion so a second pass reads the value back under the cap and the
+ *  output stays a fixed point. */
+function capAttrValue(raw: string, cap: number): string {
+  let escapedLen = 0;
+  let end = 0;
+  while (end < raw.length) {
+    const cc = raw.charCodeAt(end);
+    const units =
+      cc >= 0xd800 &&
+      cc <= 0xdbff &&
+      raw.charCodeAt(end + 1) >= 0xdc00 &&
+      raw.charCodeAt(end + 1) <= 0xdfff
+        ? 2
+        : 1;
+    const cost = cc === 34 ? 6 : cc === 60 || cc === 62 ? 4 : units;
+    if (escapedLen + cost > cap) break;
+    escapedLen += cost;
+    end += units;
+  }
+  if (end === raw.length) return raw;
+  let kept = raw.slice(0, end);
+  const partial = /&[#a-zA-Z0-9]*$/.exec(kept);
+  if (partial) kept = kept.slice(0, partial.index);
+  return kept;
+}
+
 /** Allowed attributes, re-quoted. Values keep their character references
- *  (only a quote or angle bracket is escaped), except style, rebuilt above. */
+ *  (only a quote or angle bracket is escaped), except style, rebuilt above.
+ *  URL attributes are kept whole or dropped whole - never truncated, since a
+ *  cut URL is a different URL and a cut data URI is a corrupt file. */
 function cleanAttrs(
   raw: string,
   extra: readonly string[],
@@ -571,11 +659,12 @@ function cleanAttrs(
     if (seen.has(name)) continue;
     seen.add(name);
     if (!profile.globalAttrs.has(name) && !extra.includes(name)) continue;
-    let value = m[2] ?? m[3] ?? m[4] ?? "";
+    const value = m[2] ?? m[3] ?? m[4] ?? "";
     if (name === "class") {
       const tokens = profile.classes.get(tag);
       if (!tokens) continue;
-      if (value.length > MAX_ATTR_LEN) value = value.slice(0, MAX_ATTR_LEN);
+      // Allowed classes are a token or two; a huge list is dropped whole.
+      if (value.length > profile.maxAttrLen) continue;
       const kept: string[] = [];
       const dedup = new Set<string>();
       for (const tok of value.split(/\s+/)) {
@@ -593,24 +682,27 @@ function cleanAttrs(
       continue;
     }
     if (name === "style") {
-      if (value.length > MAX_STYLE_LEN) continue;
+      if (value.length > profile.maxStyleLen) continue;
       const css = cleanStyle(value, profile);
       if (css.trim()) out.push(` style="${escapeHtml(css)}"`);
       continue;
     }
-    // The caps apply to the escaped form: that is what a second pass reads
-    // back, so the output stays a fixed point.
-    const escaped = value.replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    if (name === "href") {
-      if (escaped.length > MAX_LINK_LEN || !isSafeUrl(name, value, profile)) continue;
-    } else if (
-      (name === "src" || name === "background") &&
-      !isSafeUrl(name, value, profile)
-    ) {
+    if (name === "href" || name === "src" || name === "background") {
+      const url = safeUrl(name, value, profile);
+      if (!url) continue;
+      const escaped = escapeAttr(value);
+      // Kept whole or dropped whole: `data:` image sources are exempt (a
+      // base64 inline image is legitimately megabytes); every other URL
+      // caps like a link. The escaped length is what a second pass reads
+      // back, so a kept attribute is a fixed point.
+      if (escaped.length > profile.maxLinkLen && !(name !== "href" && url.startsWith("data:")))
+        continue;
+      if (name === "src") src = true;
+      out.push(` ${name}="${escaped}"`);
       continue;
     }
-    if (name === "src") src = true;
-    out.push(` ${name}="${escaped.slice(0, MAX_ATTR_LEN)}"`);
+    // Text attributes may be shortened, never a URL.
+    out.push(` ${name}="${escapeAttr(capAttrValue(value, profile.maxAttrLen))}"`);
   }
   return { attrs: out.join(""), src };
 }
