@@ -1673,6 +1673,15 @@ impl Core {
             filename.push_str(ext);
         }
         let cached = self.get_attachment(attachment_id).await?;
+        // Bound the bytes a session can queue as unconsumed forwards so a
+        // prepare->save loop cannot grow disk usage without bound.
+        let size = std::fs::metadata(&cached).map(|m| m.len()).unwrap_or(0);
+        if self.approvals.pending_bytes(&nonce).saturating_add(size) > MAX_SESSION_PREPARED_BYTES {
+            return Err(CoreError::ActionRejected(format!(
+                "attachment {filename}: prepared forwards pending for this draft exceed {} MB",
+                MAX_SESSION_PREPARED_BYTES / (1024 * 1024)
+            )));
+        }
         self.approvals
             .approve_named(std::path::PathBuf::from(&cached), &filename, nonce)
     }
@@ -1696,12 +1705,12 @@ impl Core {
         draft_id: Option<i64>,
         owned: &HashMap<String, String>,
         nonce: &Option<String>,
-        used_tokens: &mut Vec<String>,
+        tokens: &mut approval::TokenGuard<'_>,
     ) -> Result<StagedAttachment> {
         match att {
             DraftAttachmentIn::Token { token } => {
                 let approval = self.approvals.checkout(token, nonce)?;
-                used_tokens.push(token.clone());
+                tokens.track(token);
                 stage_approved_attachment(staging_root, &approval).await
             }
             DraftAttachmentIn::Staged {
@@ -1734,10 +1743,16 @@ impl Core {
                             "attachment {filename}: does not belong to this draft"
                         ))),
                     }
-                } else if self.approvals.produced_by(&canon, nonce) {
+                } else if self.approvals.produced_by(&canon, nonce)
+                    && !self.staged_path_referenced(&canon_str).await?
+                {
                     // Same-session adoption: this composer session produced
                     // the staged copy for a draft that no longer exists, so
                     // the recreated draft may keep it rather than restage.
+                    // The DB check is the real guard: produced is a session
+                    // cache, but adoption may only take a file no live
+                    // draft references - a staged file is owned by at most
+                    // one draft at a time.
                     Ok(StagedAttachment {
                         path: canon_str,
                         filename: display_filename(filename),
@@ -1750,6 +1765,23 @@ impl Core {
                 }
             }
         }
+    }
+
+    /// Whether ANY `draft_attachments` row (any draft) references this
+    /// canonical staged path. Enforces the invariant every cleanup path
+    /// assumes: a staged file is referenced by at most one draft.
+    async fn staged_path_referenced(&self, canon_str: &str) -> Result<bool> {
+        let canon_str = canon_str.to_string();
+        self.db
+            .read(move |conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM draft_attachments WHERE file_path = ?1",
+                    rusqlite::params![canon_str],
+                    |r| r.get(0),
+                )?;
+                Ok(count > 0)
+            })
+            .await
     }
 
     pub async fn save_draft(&self, args: SaveDraftArgs) -> Result<SaveDraftResult> {
@@ -1797,9 +1829,9 @@ impl Core {
         // Copies this call created; removed if the save is rejected (they are
         // referenced by nothing until the transaction commits).
         let mut fresh_paths: Vec<String> = Vec::new();
-        // Tokens checked out by resolutions below: consumed on commit, rolled
-        // back on any failure so a retry can reuse them.
-        let mut used_tokens: Vec<String> = Vec::new();
+        // Tokens checked out by resolutions below: consumed on commit; the
+        // guard rolls them back on drop so a failed/aborted save can retry.
+        let mut tokens = approval::TokenGuard::new(&self.approvals);
         for att in &args.attachments {
             match self
                 .resolve_draft_attachment(
@@ -1808,7 +1840,7 @@ impl Core {
                     args.draft_id,
                     &owned,
                     &args.composer_nonce,
-                    &mut used_tokens,
+                    &mut tokens,
                 )
                 .await
             {
@@ -1819,11 +1851,14 @@ impl Core {
                     staged.push(staged_file);
                 }
                 Err(e) => {
-                    self.approvals.rollback(&used_tokens);
                     remove_staged_draft_files(&staging_root, &fresh_paths).await;
                     return Err(e);
                 }
             }
+        }
+        if let Err(e) = check_draft_attachment_limits(&staged).await {
+            remove_staged_draft_files(&staging_root, &fresh_paths).await;
+            return Err(e);
         }
         let new_paths: HashSet<String> = staged.iter().map(|a| a.path.clone()).collect();
         // The persisted form of every attachment - all `Staged` references
@@ -1957,6 +1992,21 @@ impl Core {
                     rusqlite::params![draft_id],
                 )?;
                 for att in &staged {
+                    // A staged file may be referenced by at most one draft:
+                    // every cleanup path deletes files the saving draft
+                    // stops referencing, so sharing one staged path would
+                    // silently break whichever draft is re-saved first.
+                    let shared: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM draft_attachments WHERE file_path = ?1 AND draft_id != ?2",
+                        rusqlite::params![att.path, draft_id],
+                        |r| r.get(0),
+                    )?;
+                    if shared > 0 {
+                        return Err(CoreError::ActionRejected(format!(
+                            "attachment {}: already attached to another draft",
+                            att.filename
+                        )));
+                    }
                     tx.execute(
                         "INSERT INTO draft_attachments (draft_id, file_path, filename) VALUES (?1,?2,?3)",
                         rusqlite::params![draft_id, att.path, att.filename],
@@ -1979,19 +2029,21 @@ impl Core {
             Ok(v) => v,
             Err(e) => {
                 // Rejected save: the freshly staged copies belong to no
-                // draft, and every checked-out token goes back so the next
-                // save can reuse it.
-                self.approvals.rollback(&used_tokens);
+                // draft, and the token guard's drop rolls every checked-out
+                // token back so the next save can reuse it.
                 remove_staged_draft_files(&staging_root, &fresh_paths).await;
                 return Err(e);
             }
         };
-        // Committed: the tokens are spent for real now, and every staged
-        // path this draft references is recorded against this composer
-        // session so a deleted-and-recreated draft can adopt them later.
-        self.approvals.commit(&used_tokens);
+        // Committed: the tokens are spent for real now, and the staged
+        // paths this save freshly created are recorded against this
+        // composer session so a deleted-and-recreated draft can adopt them
+        // later. Only fresh copies count - recording echoed `Staged` refs
+        // would let a save "produce" (and later adopt) a file another live
+        // draft already owns.
+        tokens.commit();
         self.approvals.record_produced(
-            &new_paths
+            &fresh_paths
                 .iter()
                 .map(std::path::PathBuf::from)
                 .collect::<Vec<_>>(),
@@ -6302,6 +6354,49 @@ fn safe_filename(name: &str) -> String {
     } else {
         base.to_string()
     }
+}
+
+/// Per-draft attachment bounds, consistent with what mail providers accept
+/// (e.g. ~150 MB total message size): generous for real use, small enough
+/// that a misbehaving caller cannot fill the disk via repeated staging.
+const MAX_DRAFT_ATTACHMENTS: usize = 100;
+const MAX_DRAFT_ATTACHMENT_BYTES: u64 = 150 * 1024 * 1024;
+/// Total source bytes of not-yet-consumed prepared forwards one composer
+/// session may queue. Each staged copy is per-draft capped already; this
+/// caps the in-flight queue so a prepare->save loop cannot grow it.
+const MAX_SESSION_PREPARED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Pure limit check over (count, total bytes) so it is testable without
+/// touching the filesystem.
+fn within_draft_attachment_limits(count: usize, total_bytes: u64) -> Result<()> {
+    if count > MAX_DRAFT_ATTACHMENTS {
+        return Err(CoreError::ActionRejected(format!(
+            "a draft can have at most {MAX_DRAFT_ATTACHMENTS} attachments"
+        )));
+    }
+    if total_bytes > MAX_DRAFT_ATTACHMENT_BYTES {
+        return Err(CoreError::ActionRejected(format!(
+            "attachments total more than {} MB per draft",
+            MAX_DRAFT_ATTACHMENT_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+/// Enforce the per-draft attachment bounds on a resolved save request.
+/// Staged copies exist on disk already, so this runs before the write
+/// transaction and the caller removes them on failure.
+async fn check_draft_attachment_limits(staged: &[StagedAttachment]) -> Result<()> {
+    let mut total: u64 = 0;
+    for s in staged {
+        total = total.saturating_add(
+            tokio::fs::metadata(&s.path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0),
+        );
+    }
+    within_draft_attachment_limits(staged.len(), total)
 }
 
 /// One file staged into the draft-attachment staging area.

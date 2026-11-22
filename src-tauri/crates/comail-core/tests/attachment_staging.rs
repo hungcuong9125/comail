@@ -1135,3 +1135,225 @@ async fn recreated_draft_adopts_own_sessions_staged_files() {
     // The file was not touched either way.
     assert!(std::path::Path::new(&staged).exists());
 }
+
+// -----------------------------------------------------------------------
+// Review round 2: staged-path single-owner invariant + per-draft limits.
+// -----------------------------------------------------------------------
+
+/// The attack an over-broad produced map made possible: get_draft(D1) hands
+/// out D1's staged path; echoing it on a save of D1 must NOT let a later
+/// draftless save adopt it while D1 still references the file. The DB-level
+/// invariant rejects step 3 even though the session produced the file.
+#[tokio::test]
+async fn staged_echo_of_live_draft_cannot_be_adopted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_paths, core) = setup_core(&tmp).await;
+
+    let src = tmp.path().join("doc.pdf");
+    std::fs::write(&src, b"doc").unwrap();
+    let nonce = Some("session-9".to_string());
+    let minted = core
+        .approve_attachment_sources(vec![src], nonce.clone())
+        .unwrap();
+
+    // 1. D1 saves with the token: X is fresh-staged and produced under M.
+    let draft_id = core
+        .save_draft(SaveDraftArgs {
+            attachments: vec![DraftAttachmentIn::Token {
+                token: minted[0].token.clone(),
+            }],
+            composer_nonce: nonce.clone(),
+            ..draft_args(1, Vec::new())
+        })
+        .await
+        .unwrap()
+        .draft_id;
+    let staged = stored_paths(&core, draft_id).await[0].clone();
+
+    // 2. D1 re-saves echoing its staged path under the same nonce (what
+    //    get_draft + save looks like). Must not re-record it as produced.
+    core.save_draft(SaveDraftArgs {
+        draft_id: Some(draft_id),
+        attachments: vec![DraftAttachmentIn::Staged {
+            file_path: staged.clone(),
+            filename: "doc.pdf".into(),
+        }],
+        composer_nonce: nonce.clone(),
+        ..draft_args(1, Vec::new())
+    })
+    .await
+    .unwrap();
+
+    // 3. A draftless save (a "new draft") under nonce M tries to adopt X.
+    //    produced_by says yes; the single-owner invariant says no - D1
+    //    still references the file.
+    let err = core
+        .save_draft(SaveDraftArgs {
+            attachments: vec![DraftAttachmentIn::Staged {
+                file_path: staged.clone(),
+                filename: "doc.pdf".into(),
+            }],
+            composer_nonce: nonce,
+            ..draft_args(1, Vec::new())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "live-owner adoption must be rejected: {err:?}"
+    );
+    // D1 is intact: its row and its file are untouched.
+    assert_eq!(stored_paths(&core, draft_id).await, vec![staged.clone()]);
+    assert!(std::path::Path::new(&staged).exists());
+}
+
+/// The DB-level invariant itself: a save must refuse to give draft B a row
+/// for a staged file draft A already references - even if B's rows were
+/// corrupted into "owning" the echo.
+#[tokio::test]
+async fn two_drafts_cannot_share_a_staged_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_paths, core) = setup_core(&tmp).await;
+
+    let src = tmp.path().join("shared.pdf");
+    std::fs::write(&src, b"shared").unwrap();
+    let draft_a = core
+        .save_draft(draft_args(1, vec![token_for(&core, &src).await]))
+        .await
+        .unwrap()
+        .draft_id;
+    let draft_b = core
+        .save_draft(draft_args(1, vec![]))
+        .await
+        .unwrap()
+        .draft_id;
+    let staged = stored_paths(&core, draft_a).await[0].clone();
+
+    // Corrupt B's rows to point at A's file (simulates any path by which B
+    // "learns" A's staged path - the invariant must hold regardless).
+    let row_path = staged.clone();
+    core.db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO draft_attachments (draft_id,file_path,filename,mime_type)
+                 VALUES (?1,?2,'shared.pdf','application/pdf')",
+                rusqlite::params![draft_b, row_path],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let err = core
+        .save_draft(SaveDraftArgs {
+            draft_id: Some(draft_b),
+            attachments: vec![DraftAttachmentIn::Staged {
+                file_path: staged.clone(),
+                filename: "shared.pdf".into(),
+            }],
+            ..draft_args(1, Vec::new())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "cross-draft share must be rejected: {err:?}"
+    );
+    // The transaction rolled back: B's rows were not deleted/reinserted,
+    // and A's row + file are untouched.
+    assert_eq!(stored_paths(&core, draft_a).await, vec![staged.clone()]);
+    assert!(std::path::Path::new(&staged).exists());
+}
+
+/// Per-draft bounds: over 100 attachments or over 150 MB total fails the
+/// save outright (and the staged copies it made are removed).
+#[tokio::test]
+async fn per_draft_attachment_limits_are_enforced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, core) = setup_core(&tmp).await;
+    std::fs::create_dir_all(paths.draft_attachments_dir()).unwrap();
+    let staging_root = std::fs::canonicalize(paths.draft_attachments_dir()).unwrap();
+
+    // Too many: 101 one-byte files.
+    let mut atts = Vec::new();
+    for i in 0..101usize {
+        let f = tmp.path().join(format!("f{i}.txt"));
+        std::fs::write(&f, b"x").unwrap();
+        let approved = core.approve_attachment_sources(vec![f], None).unwrap();
+        atts.push(DraftAttachmentIn::Token {
+            token: approved[0].token.clone(),
+        });
+    }
+    let err = core.save_draft(draft_args(1, atts)).await.unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "count limit: {err:?}"
+    );
+    // The staged copies of a rejected save were cleaned up.
+    let leftovers = std::fs::read_dir(&staging_root).unwrap().count();
+    assert_eq!(leftovers, 0, "staged copies of a rejected save leaked");
+
+    // Too big: one sparse 160 MB file (sparse: no real disk cost).
+    let big = tmp.path().join("big.bin");
+    let file = std::fs::File::create(&big).unwrap();
+    file.set_len(160 * 1024 * 1024).unwrap();
+    drop(file);
+    let approved = core.approve_attachment_sources(vec![big], None).unwrap();
+    let err = core
+        .save_draft(draft_args(
+            1,
+            vec![DraftAttachmentIn::Token {
+                token: approved[0].token.clone(),
+            }],
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "byte limit: {err:?}"
+    );
+    let leftovers = std::fs::read_dir(&staging_root).unwrap().count();
+    assert_eq!(leftovers, 0);
+}
+
+/// A prepared forward whose cached file would push the session's
+/// not-yet-consumed prepared bytes over the cap is refused - a prepare/save
+/// loop cannot queue unbounded bytes. Sparse files keep this cheap.
+#[tokio::test]
+async fn prepared_forward_bytes_are_capped_per_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_paths, core) = setup_core(&tmp).await;
+
+    let cached = tmp.path().join("huge.bin");
+    let file = std::fs::File::create(&cached).unwrap();
+    file.set_len(600 * 1024 * 1024).unwrap();
+    drop(file);
+    let cache_path = cached.to_string_lossy().into_owned();
+    core.db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO messages
+                   (id,account_id,thread_id,folder_id,uid,message_id,subject,date,
+                    is_draft,is_outgoing,has_attachments,snippet,body_state)
+                 VALUES (70,1,NULL,1,1,'<big@x>','big',1000,0,0,1,'s','cached')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO attachments (id,message_id,part_id,filename,mime_type,file_path)
+                 VALUES (71,70,'2','huge.bin','application/octet-stream',?1)",
+                [cache_path],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let err = core
+        .prepare_forward_attachment(71, Some("session-big".into()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "prepared bytes cap: {err:?}"
+    );
+}

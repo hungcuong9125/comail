@@ -15,8 +15,16 @@
 //!   consumes it only when the draft transaction commits, so a failed save
 //!   can simply be retried;
 //! - tokens are bound to the composer nonce that minted them (`pick` and
-//!   `claim` take the nonce the composer generated for itself), so a token
-//!   cannot be spent by a different composer session;
+//!   `claim` take the nonce the composer generated for itself). What this
+//!   does: a token minted for one composer session cannot be spent by a
+//!   save naming another session's nonce, so tokens and produced-staged
+//!   files cannot leak across composer sessions. What it does NOT do: a
+//!   script that can call these commands at all can still attach every
+//!   file the user explicitly chose (it can mint its own nonce and use it
+//!   end to end) - the nonce is a session boundary, not a secret;
+//! - webview-facing nonces are namespaced (`js:` prefix applied in the
+//!   command layer), so the nonce-less scope internal approvals use can
+//!   never be produced by IPC - internal tokens are unreachable from JS;
 //! - the registry is capped so a misbehaving renderer cannot grow it;
 //! - OS drops are registered here by Rust itself (the webview event handler
 //!   observes the real drop) and expire quickly - the webview can only
@@ -69,9 +77,12 @@ pub(crate) struct Approval {
     pub canonical_path: PathBuf,
     /// Display filename (bidi-stripped) recorded from the approved path.
     pub filename: String,
-    /// The composer nonce this approval is bound to, if any. Internal
-    /// approvals (calendar invites) are nonce-less and can only be spent by
-    /// internal saves, which also carry no nonce.
+    /// Source size recorded at approval time (feeds the per-session
+    /// pending-bytes cap on prepared forwards).
+    pub size: u64,
+    /// The composer nonce this approval is bound to, if any. `None` is the
+    /// internal scope (calendar invites): the command layer namespaces every
+    /// webview-supplied nonce, so no IPC value can ever equal it.
     nonce: Option<String>,
     pub at: Instant,
     /// Insertion order - deterministic eviction when entries share `at`.
@@ -123,11 +134,14 @@ impl Inner {
             .retain(|_, t| now.duration_since(*t) < DROP_TTL);
     }
 
+    /// Evict the oldest approval not checked out by an in-flight save:
+    /// removing one would strand its token in `in_flight` forever.
     fn evict_oldest_approval(&mut self) {
         while self.approvals.len() >= MAX_APPROVALS {
             let Some(oldest) = self
                 .approvals
                 .iter()
+                .filter(|(t, _)| !self.in_flight.contains(*t))
                 .min_by_key(|(_, a)| a.seq)
                 .map(|(k, _)| k.clone())
             else {
@@ -219,11 +233,13 @@ impl AttachmentApprovals {
         let seq = inner.next_seq;
         inner.next_seq += 1;
         let at = Instant::now();
+        let size = std::fs::metadata(&canonical).map(|m| m.len()).unwrap_or(0);
         inner.approvals.insert(
             token.clone(),
             Approval {
                 canonical_path: canonical.clone(),
                 filename: filename.clone(),
+                size,
                 nonce,
                 at,
                 seq,
@@ -233,7 +249,7 @@ impl AttachmentApprovals {
             token,
             filename,
             source,
-            size: std::fs::metadata(&canonical).map(|m| m.len()).unwrap_or(0),
+            size,
             mime_type,
         })
     }
@@ -269,11 +285,13 @@ impl AttachmentApprovals {
             let token = mint_token();
             let seq = inner.next_seq;
             inner.next_seq += 1;
+            let size = std::fs::metadata(&canonical).map(|m| m.len()).unwrap_or(0);
             inner.approvals.insert(
                 token.clone(),
                 Approval {
                     canonical_path: canonical.clone(),
                     filename: filename.clone(),
+                    size,
                     nonce: nonce.clone(),
                     at,
                     seq,
@@ -283,7 +301,7 @@ impl AttachmentApprovals {
                 token,
                 filename,
                 source,
-                size: std::fs::metadata(&canonical).map(|m| m.len()).unwrap_or(0),
+                size,
                 mime_type,
             });
         }
@@ -378,8 +396,7 @@ impl AttachmentApprovals {
                 continue;
             }
             return Err(CoreError::ActionRejected(format!(
-                "attachment {}: not dropped on this window",
-                canon.to_string_lossy()
+                "attachment {raw}: not dropped on this window"
             )));
         }
         // Everything verified: consume the drop records before minting, so
@@ -452,12 +469,27 @@ impl AttachmentApprovals {
         }
     }
 
-    /// Record staged paths a committed save produced under `nonce` (fresh
-    /// copies AND echoed staged refs), so a draft deleted and recreated
-    /// inside the same composer session can adopt them via `Staged` entries
-    /// with no draft id. `None` nonces (internal saves) are not recorded:
-    /// adoption must always be tied to a real session, since any draftless
-    /// save could otherwise claim every produced file.
+    /// Total source bytes of approvals bound to `nonce` that a save has not
+    /// consumed yet (live + in-flight). Bounds the in-flight queue of
+    /// prepared forward attachments per composer session, so a
+    /// prepare->save loop cannot mint unbounded pending bytes.
+    pub(crate) fn pending_bytes(&self, nonce: &Option<String>) -> u64 {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .approvals
+            .values()
+            .filter(|a| &a.nonce == nonce)
+            .map(|a| a.size)
+            .sum()
+    }
+
+    /// Record staged paths a committed save freshly staged under `nonce`,
+    /// so a draft deleted and recreated inside the same composer session
+    /// can adopt them via `Staged` entries with no draft id. Callers pass
+    /// only files this save copied from a token - never echoed `Staged`
+    /// refs, which would let any save "produce" (and later adopt) a file
+    /// some other live draft already owns. `None` nonces (internal saves)
+    /// are not recorded: adoption must always be tied to a real session.
     pub(crate) fn record_produced(&self, paths: &[PathBuf], nonce: &Option<String>) {
         let Some(nonce) = nonce else { return };
         let mut inner = self.inner.lock().unwrap();
@@ -472,6 +504,9 @@ impl AttachmentApprovals {
     /// Whether this session produced (and may therefore re-claim) the staged
     /// file at `canonical_path` for a draftless save. A `None` nonce never
     /// adopts: it would let any draftless save claim any produced file.
+    /// Necessary, not sufficient: `save_draft` additionally requires the
+    /// database to show no live draft referencing the file, so an echoed
+    /// `Staged` entry can never adopt a file another draft owns.
     pub(crate) fn produced_by(
         &self,
         canonical_path: &std::path::Path,
@@ -483,6 +518,46 @@ impl AttachmentApprovals {
             .produced
             .get(canonical_path)
             .is_some_and(|(n, _)| n == nonce)
+    }
+}
+
+/// Tracks tokens checked out by one `save_draft` call. Tokens are consumed
+/// only via [`Self::commit`] after the draft transaction commits; dropping
+/// the guard without committing - early return, panics, a dropped save
+/// future - rolls every tracked token back so it can never stay marked
+/// in-flight forever.
+pub(crate) struct TokenGuard<'a> {
+    registry: &'a AttachmentApprovals,
+    tokens: Vec<String>,
+    committed: bool,
+}
+
+impl<'a> TokenGuard<'a> {
+    pub(crate) fn new(registry: &'a AttachmentApprovals) -> Self {
+        Self {
+            registry,
+            tokens: Vec::new(),
+            committed: false,
+        }
+    }
+
+    pub(crate) fn track(&mut self, token: &str) {
+        self.tokens.push(token.to_string());
+    }
+
+    /// Consume all tracked tokens (single-use semantics) and disarm the
+    /// drop-time rollback.
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+        self.registry.commit(&self.tokens);
+    }
+}
+
+impl Drop for TokenGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.registry.rollback(&self.tokens);
+        }
     }
 }
 
@@ -593,5 +668,44 @@ mod tests {
         assert!(claim.approved.is_empty());
         assert_eq!(claim.skipped.len(), 1);
         assert_eq!(claim.skipped[0].reason, "not a file");
+    }
+
+    #[test]
+    fn pending_bytes_tracks_unconsumed_approvals_per_nonce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AttachmentApprovals::default();
+        let f = tmp_file(tmp.path(), "f.txt"); // 1 byte
+        let nonce = Some("session-a".to_string());
+        let minted = reg.approve(vec![f], nonce.clone()).unwrap();
+        assert_eq!(reg.pending_bytes(&nonce), 1);
+        // Other nonces count nothing; in-flight still counts...
+        assert_eq!(reg.pending_bytes(&Some("other".into())), 0);
+        reg.checkout(&minted[0].token, &nonce).unwrap();
+        assert_eq!(reg.pending_bytes(&nonce), 1);
+        // ...and commit (consumed) frees the budget.
+        reg.commit(std::slice::from_ref(&minted[0].token));
+        assert_eq!(reg.pending_bytes(&nonce), 0);
+    }
+
+    #[test]
+    fn dropped_token_guard_rolls_back_commit_consumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AttachmentApprovals::default();
+        let f = tmp_file(tmp.path(), "f.txt");
+        let minted = reg.approve(vec![f], None).unwrap();
+        let tok = minted[0].token.clone();
+        // A guard dropped uncommitted returns the checkout...
+        {
+            let mut guard = TokenGuard::new(&reg);
+            reg.checkout(&tok, &None).unwrap();
+            guard.track(&tok);
+            drop(guard);
+        }
+        // ...so the same token can be checked out again by the retry.
+        let mut guard = TokenGuard::new(&reg);
+        reg.checkout(&tok, &None).unwrap();
+        guard.track(&tok);
+        guard.commit();
+        assert!(reg.checkout(&tok, &None).is_err());
     }
 }

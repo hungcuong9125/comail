@@ -202,6 +202,14 @@ pub async fn send_now(state: State<'_, AppState>, action_id: i64) -> CmdResult<s
 
 // ---------- compose ----------
 
+/// Namespace every webview-supplied composer nonce so IPC can never produce
+/// the `None` scope internal approvals use: an internal token (a generated
+/// calendar invite) is then unreachable from any webview save, no matter
+/// what `composer_nonce` it sends.
+fn webview_nonce(composer_nonce: Option<String>) -> Option<String> {
+    Some(format!("js:{}", composer_nonce.unwrap_or_default()))
+}
+
 /// Open the native multi-select file dialog from Rust and register the
 /// user's picks as approved attachment sources. Returns opaque tokens plus
 /// display metadata - never the raw paths the webview could replay into
@@ -235,7 +243,7 @@ pub async fn pick_draft_attachments(
         .collect::<Vec<_>>();
     state
         .core
-        .approve_attachment_sources(paths, composer_nonce)
+        .approve_attachment_sources(paths, webview_nonce(composer_nonce))
         .map_err(err)
 }
 
@@ -251,7 +259,7 @@ pub async fn claim_dropped_attachments(
 ) -> CmdResult<DropClaim> {
     state
         .core
-        .claim_dropped_attachments(&paths, composer_nonce)
+        .claim_dropped_attachments(&paths, webview_nonce(composer_nonce))
         .map_err(err)
 }
 
@@ -266,7 +274,7 @@ pub async fn prepare_forward_attachment(
 ) -> CmdResult<ApprovedAttachment> {
     state
         .core
-        .prepare_forward_attachment(attachment_id, composer_nonce)
+        .prepare_forward_attachment(attachment_id, webview_nonce(composer_nonce))
         .await
         .map_err(err)
 }
@@ -274,8 +282,9 @@ pub async fn prepare_forward_attachment(
 #[tauri::command]
 pub async fn save_draft(
     state: State<'_, AppState>,
-    args: SaveDraftArgs,
+    mut args: SaveDraftArgs,
 ) -> CmdResult<SaveDraftResult> {
+    args.composer_nonce = webview_nonce(args.composer_nonce);
     state.core.save_draft(args).await.map_err(err)
 }
 
