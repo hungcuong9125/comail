@@ -52,6 +52,7 @@
   "footerHints": "{{send}} 发送 · {{sendDone}} 发送并完成",
   "draftSaved": "草稿已保存",
   "discardFailed": "无法丢弃草稿：{{detail}}",
+  "draftSaveFailed": "无法保存草稿：{{detail}}",
   "unsaved": "未保存",
   "keepDraft": "保留此草稿？",
   "saveDraftButton": "保存草稿",

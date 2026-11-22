@@ -54,6 +54,7 @@
   "footerHints": "{{send}} envoyer · {{sendDone}} envoyer et terminer",
   "draftSaved": "Brouillon enregistré",
   "discardFailed": "Impossible de supprimer le brouillon : {{detail}}",
+  "draftSaveFailed": "Impossible d’enregistrer le brouillon : {{detail}}",
   "unsaved": "Non enregistré",
   "keepDraft": "Conserver ce brouillon ?",
   "saveDraftButton": "Enregistrer le brouillon",

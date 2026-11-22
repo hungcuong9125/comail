@@ -54,6 +54,7 @@
   "footerHints": "{{send}} enviar · {{sendDone}} enviar y hecho",
   "draftSaved": "Borrador guardado",
   "discardFailed": "No se pudo descartar el borrador: {{detail}}",
+  "draftSaveFailed": "No se pudo guardar el borrador: {{detail}}",
   "unsaved": "Sin guardar",
   "keepDraft": "¿Conservar este borrador?",
   "saveDraftButton": "Guardar borrador",

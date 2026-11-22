@@ -52,6 +52,7 @@
   "footerHints": "{{send}} gửi · {{sendDone}} gửi & hoàn tất",
   "draftSaved": "Đã lưu bản nháp",
   "discardFailed": "Không thể bỏ bản nháp: {{detail}}",
+  "draftSaveFailed": "Không thể lưu bản nháp: {{detail}}",
   "unsaved": "Chưa lưu",
   "keepDraft": "Giữ bản nháp này?",
   "saveDraftButton": "Lưu bản nháp",

@@ -24,6 +24,7 @@ import {
   stripSignature,
   type ComposeMode,
 } from "../../lib/signatures";
+import { DraftSaver } from "../../lib/draftSaver";
 import { playSound } from "../../lib/sound";
 import { RichBody, type RichBodyHandle } from "./RichBody";
 import { deleteDrafts, performThreadAction } from "../../queries/actions";
@@ -307,6 +308,63 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
     quote: init.quote, quoteRemoved,
   };
 
+  // One serialized saver per composer instance: autosave, Send,
+  // save-and-close and Discard all funnel through it so at most one
+  // save_draft call is ever in flight. onSaved only fires while the composer
+  // is open, so a save completing after close can't write global state.
+  const saver = useMemo(
+    () =>
+      new DraftSaver(
+        {
+          save: async (existingId) => {
+            const f = fieldsRef.current;
+            const plain = htmlToText(f.body);
+            const withQuote = f.quote !== "" && !f.quoteRemoved;
+            const fullBody = withQuote
+              ? `${plain.replace(/\s+$/, "")}\n\n${f.quote}`
+              : plain;
+            const fullHtml = withQuote ? `${f.body}<br><br>${quoteToHtml(f.quote)}` : f.body;
+            const { draftId: newId } = await call("save_draft", {
+              args: {
+                draftId: existingId,
+                accountId: f.accountId,
+                to: f.to,
+                cc: f.cc,
+                bcc: f.bcc,
+                subject: f.subject,
+                bodyText: fullBody,
+                bodyHtml: fullHtml,
+                mode: state.mode,
+                inReplyToMessageId: state.replyTo?.id ?? null,
+                attachments: f.attachments,
+              },
+            });
+            return newId;
+          },
+          onSaved: (id, clean) => {
+            setDraftId(id);
+            fieldsRef.current.draftId = id;
+            setSavedAt(Date.now());
+            // Edits made while the save was in flight stay dirty: the Esc
+            // confirm and the next autosave tick must still see them.
+            set(
+              clean
+                ? { composerDirty: false, editingDraftId: id }
+                : { editingDraftId: id },
+            );
+            if (clean) dirtyRef.current = false;
+          },
+        },
+        state.draftId ?? null,
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  // No new saves once this instance is gone; a drain already in flight
+  // settles silently so Discard can still learn the created draft id.
+  useEffect(() => () => saver.close(), [saver]);
+
   useEffect(() => {
     if (accounts && !accounts.some((a) => a.id === accountId) && accounts[0]) {
       setAccountId(accounts[0].id);
@@ -398,48 +456,35 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   }, []);
 
   const markDirty = () => {
+    saver.markChanged();
     if (!dirtyRef.current) {
       dirtyRef.current = true;
       set({ composerDirty: true });
     }
   };
 
-  const saveDraft = useCallback(async (): Promise<number> => {
-    const f = fieldsRef.current;
-    const plain = htmlToText(f.body);
-    const withQuote = f.quote !== "" && !f.quoteRemoved;
-    const fullBody = withQuote ? `${plain.replace(/\s+$/, "")}\n\n${f.quote}` : plain;
-    const fullHtml = withQuote ? `${f.body}<br><br>${quoteToHtml(f.quote)}` : f.body;
-    const { draftId: newId } = await call("save_draft", {
-      args: {
-        draftId: f.draftId,
-        accountId: f.accountId,
-        to: f.to,
-        cc: f.cc,
-        bcc: f.bcc,
-        subject: f.subject,
-        bodyText: fullBody,
-        bodyHtml: fullHtml,
-        mode: state.mode,
-        inReplyToMessageId: state.replyTo?.id ?? null,
-        attachments: f.attachments,
-      },
-    });
-    setDraftId(newId);
-    fieldsRef.current.draftId = newId;
-    setSavedAt(Date.now());
-    dirtyRef.current = false;
-    set({ composerDirty: false, editingDraftId: newId });
-    return newId;
-  }, [state.mode, state.replyTo, set]);
-
-  // Auto-save every 3s while dirty.
+  // Auto-save every 3s while dirty. saveIfDirty queues behind any in-flight
+  // save, so a slow network can never create a second draft. Failures are
+  // surfaced like other save errors, throttled so a persistent failure
+  // doesn't toast on every tick.
+  const lastSaveErrorToast = useRef(0);
   useEffect(() => {
-    const t = setInterval(() => {
-      if (dirtyRef.current && !sending) void saveDraft();
+    const tick = setInterval(() => {
+      if (saver.dirty && !sending) {
+        void saver.saveIfDirty().catch((err: unknown) => {
+          const now = Date.now();
+          if (now - lastSaveErrorToast.current > 30_000) {
+            lastSaveErrorToast.current = now;
+            pushToast({
+              kind: "error",
+              message: t("compose:draftSaveFailed", { detail: errorMessage(err) }),
+            });
+          }
+        });
+      }
     }, 3000);
-    return () => clearInterval(t);
-  }, [saveDraft, sending]);
+    return () => clearInterval(tick);
+  }, [saver, sending, pushToast, t]);
 
   // Focus: recipients for new/forward, body for replies.
   useEffect(() => {
@@ -463,13 +508,17 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
       }
       if (sending) return;
       setSending(true);
-      // Play the "whoosh" synchronously on the user's send gesture - webviews
-      // block audio started later from an async callback (no user activation).
-      playSound("send");
       try {
-        const id = await saveDraft();
+        // Await any in-flight save and persist whatever is still dirty; the
+        // draft id the last save produced is the one that gets queued, so a
+        // pending first save can't leave a duplicate draft behind.
+        const id = await saver.flush();
+        if (id == null) return; // unreachable: any edit makes the draft dirty
         const sendAt = opts.instant ? Date.now() : opts.sendAt;
         const res = await call("queue_send", { args: { draftId: id, sendAt } });
+        // The whoosh plays only once the send is actually queued - never on
+        // a save or queue failure.
+        playSound("send");
         const reopen: ComposerState = {
           mode: state.mode,
           draftId: id,
@@ -550,7 +599,7 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         setSending(false);
       }
     },
-    [saveDraft, sending, state.mode, state.replyTo, closeComposer, pushToast, t],
+    [saver, sending, state.mode, state.replyTo, closeComposer, pushToast, t],
   );
 
   // Merge picked/dropped paths into the attachment list, skipping dupes.
@@ -876,9 +925,15 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   };
 
   const discard = async () => {
-    if (draftId != null) {
+    // Close the saver first: no new saves can start, and an in-flight create
+    // completes silently so its draft id can be deleted instead of surviving
+    // as an orphan.
+    saver.close();
+    await saver.idle();
+    const id = saver.id;
+    if (id != null) {
       try {
-        await deleteDrafts([draftId]);
+        await deleteDrafts([id]);
       } catch (err) {
         pushToast({
           kind: "error",
@@ -891,7 +946,16 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   };
 
   const saveAndClose = async () => {
-    await saveDraft();
+    try {
+      await saver.flush();
+    } catch (err) {
+      pushToast({
+        kind: "error",
+        message: t("compose:draftSaveFailed", { detail: errorMessage(err) }),
+      });
+      return;
+    }
+    saver.close();
     void queryClient.invalidateQueries({ queryKey: ["threads"] });
     void queryClient.invalidateQueries({ queryKey: ["thread"] });
     closeComposer();

@@ -54,6 +54,7 @@
   "footerHints": "{{send}} send · {{sendDone}} send & done",
   "draftSaved": "Draft saved",
   "discardFailed": "Couldn’t discard draft: {{detail}}",
+  "draftSaveFailed": "Couldn’t save draft: {{detail}}",
   "unsaved": "Unsaved",
   "keepDraft": "Keep this draft?",
   "saveDraftButton": "Save draft",
