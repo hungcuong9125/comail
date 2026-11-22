@@ -1,12 +1,14 @@
-//! Security regression test for the draft-attachment staging fix.
+//! Security regression tests for the draft-attachment staging boundary.
 //!
-//! `save_draft` accepts an attachment `file_path` straight from the frontend
-//! IPC. Historically that exact path was read off disk at dispatch and mailed,
-//! so a malicious/compromised renderer could attach `~/.ssh/id_rsa` or
-//! `/etc/passwd` and exfiltrate it. The fix copies every picked file into an
-//! app-managed staging dir at save time and persists only the staged path;
-//! dispatch additionally refuses to read anything outside that dir. This test
-//! locks in the save-time control (the primary boundary) end-to-end.
+//! `save_draft` once accepted an attachment `file_path` straight from the
+//! frontend IPC, copied whatever it named into staging, and later mailed it -
+//! an arbitrary local-file read/exfil primitive for any script in the
+//! webview. Now a draft attachment can only be an approval token minted by a
+//! trusted Rust path (the native file dialog or an OS drop observed in Rust),
+//! a staged path this same draft already owns, or a received attachment
+//! resolved by row id. These tests drive the real `save_draft` path end to
+//! end; `approve_attachment_sources` stands in for "the dialog returned this
+//! path" - the dialog call itself is the only line tests cannot drive.
 
 use comail_core::Core;
 use comail_core::config::Paths;
@@ -46,6 +48,19 @@ fn draft_args(account_id: i64, atts: Vec<DraftAttachmentIn>) -> SaveDraftArgs {
     }
 }
 
+/// "The dialog (or an approved internal source) returned this path": mint a
+/// token for `path` exactly as `pick_draft_attachments` does after the native
+/// dialog returns.
+async fn token_for(core: &Core, path: &std::path::Path) -> DraftAttachmentIn {
+    let approved = core
+        .approve_attachment_sources(vec![path.to_path_buf()])
+        .unwrap();
+    assert_eq!(approved.len(), 1, "approve skipped {path:?}");
+    DraftAttachmentIn::Token {
+        token: approved[0].token.clone(),
+    }
+}
+
 #[tokio::test]
 async fn save_draft_stages_external_file_into_app_dir() {
     let tmp = tempfile::tempdir().unwrap();
@@ -53,8 +68,8 @@ async fn save_draft_stages_external_file_into_app_dir() {
     std::fs::create_dir_all(&data_dir).unwrap();
     let paths = Paths::for_tests(&data_dir);
 
-    // A "secret" file living OUTSIDE the app data dir - stands in for the
-    // arbitrary local file a malicious frontend might try to attach & send.
+    // A "secret" file living OUTSIDE the app data dir - what the user picked
+    // through the trusted dialog path.
     let secret = tmp.path().join("secret.txt");
     std::fs::write(&secret, b"top secret bytes").unwrap();
 
@@ -76,15 +91,10 @@ async fn save_draft_stages_external_file_into_app_dir() {
     assert_eq!(roles::DRAFTS, "drafts");
 
     let draft_id = core
-        .save_draft(draft_args(
-            1,
-            vec![DraftAttachmentIn {
-                file_path: secret.to_string_lossy().into_owned(),
-                filename: "secret.txt".into(),
-            }],
-        ))
+        .save_draft(draft_args(1, vec![token_for(&core, &secret).await]))
         .await
-        .unwrap();
+        .unwrap()
+        .draft_id;
 
     let stored = stored_paths(&core, draft_id).await;
     assert_eq!(stored.len(), 1);
@@ -102,6 +112,55 @@ async fn save_draft_stages_external_file_into_app_dir() {
     assert_ne!(stored_canon, std::fs::canonicalize(&secret).unwrap());
     // ...and it holds the real bytes.
     assert_eq!(std::fs::read(&stored_canon).unwrap(), b"top secret bytes");
+}
+
+/// A renderer passing a raw source path - the exact pre-fix attack - is
+/// refused and nothing is copied into staging.
+#[tokio::test]
+async fn save_draft_rejects_unapproved_external_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let paths = Paths::for_tests(&data_dir);
+
+    // Stands in for ~/.ssh/id_rsa or the mail database itself.
+    let secret = tmp.path().join("id_rsa");
+    std::fs::write(&secret, b"PRIVATE KEY").unwrap();
+
+    let core = Core::start(paths.clone()).await.unwrap();
+    core.db
+        .write(|conn| {
+            conn.execute_batch(
+                "INSERT INTO accounts
+                   (id,email,provider,auth_kind,username,imap_host,imap_port,smtp_host,smtp_port,created_at)
+                   VALUES (1,'me@example.com','imap','password','me','h',993,'h',465,0);
+                 INSERT INTO folders (id,account_id,imap_name,role)
+                   VALUES (1,1,'Drafts','drafts');",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let err = core
+        .save_draft(draft_args(
+            1,
+            vec![DraftAttachmentIn::Staged {
+                file_path: secret.to_string_lossy().into_owned(),
+                filename: "id_rsa".into(),
+            }],
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "expected ActionRejected, got {err:?}"
+    );
+    let root = paths.draft_attachments_dir();
+    let copied: Vec<_> = std::fs::read_dir(&root)
+        .map(|rd| rd.flatten().collect())
+        .unwrap_or_default();
+    assert!(copied.is_empty(), "staged copy made anyway: {copied:?}");
 }
 
 #[tokio::test]
@@ -129,47 +188,237 @@ async fn save_draft_neutralizes_traversal_filename_and_is_idempotent() {
         .await
         .unwrap();
 
-    // A path-traversal filename must not escape the staging subdir.
+    // The staged name now comes from the real file's name - a renderer can
+    // no longer supply a traversal name for staging at all.
     let draft_id = core
-        .save_draft(draft_args(
-            1,
-            vec![DraftAttachmentIn {
-                file_path: src.to_string_lossy().into_owned(),
-                filename: "../../../../etc/evil".into(),
-            }],
-        ))
+        .save_draft(draft_args(1, vec![token_for(&core, &src).await]))
         .await
-        .unwrap();
+        .unwrap()
+        .draft_id;
 
     let staging_root = std::fs::canonicalize(paths.draft_attachments_dir()).unwrap();
     let staged = stored_paths(&core, draft_id).await[0].clone();
     let staged_canon = std::fs::canonicalize(&staged).unwrap();
     assert!(
         staged_canon.starts_with(&staging_root),
-        "traversal filename escaped staging: {staged_canon:?}"
+        "staged file escaped staging: {staged_canon:?}"
     );
 
     // Re-saving the draft, echoing back the already-staged path (as the reloaded
-    // composer does), must keep it in place rather than fail or re-nest.
-    let draft_id2 = core
+    // composer does), must keep it in place rather than fail or re-nest - and
+    // an echoed display name cannot rename the persisted row.
+    let result = core
         .save_draft(SaveDraftArgs {
             draft_id: Some(draft_id),
             ..draft_args(
                 1,
-                vec![DraftAttachmentIn {
+                vec![DraftAttachmentIn::Staged {
                     file_path: staged.clone(),
-                    filename: "evil".into(),
+                    filename: "../../../etc/evil".into(),
                 }],
             )
         })
         .await
         .unwrap();
-    assert_eq!(draft_id2, draft_id);
+    assert_eq!(result.draft_id, draft_id);
     let restaged = std::fs::canonicalize(&stored_paths(&core, draft_id).await[0]).unwrap();
     assert_eq!(
         restaged, staged_canon,
         "already-staged path should be reused"
     );
+    // And the traversal-ish echoed name was ignored: the row keeps the
+    // filename stored when the file was first staged.
+    match &result.attachments[0] {
+        DraftAttachmentIn::Staged { filename, .. } => {
+            assert_eq!(filename, "payload.bin");
+        }
+        other => panic!("expected a Staged attachment, got {other:?}"),
+    }
+}
+
+/// Tokens are the only way a never-before-staged file reaches a draft, and a
+/// token can stage exactly once.
+#[tokio::test]
+async fn save_draft_rejects_unknown_expired_and_consumed_tokens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let paths = Paths::for_tests(&data_dir);
+
+    let src = tmp.path().join("file.txt");
+    std::fs::write(&src, b"data").unwrap();
+
+    let core = Core::start(paths.clone()).await.unwrap();
+    core.db
+        .write(|conn| {
+            conn.execute_batch(
+                "INSERT INTO accounts
+                   (id,email,provider,auth_kind,username,imap_host,imap_port,smtp_host,smtp_port,created_at)
+                   VALUES (1,'me@example.com','imap','password','me','h',993,'h',465,0);
+                 INSERT INTO folders (id,account_id,imap_name,role)
+                   VALUES (1,1,'Drafts','drafts');",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // A token the registry never minted.
+    let err = core
+        .save_draft(draft_args(
+            1,
+            vec![DraftAttachmentIn::Token {
+                token: "not-a-real-token".into(),
+            }],
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "unknown token: {err:?}"
+    );
+
+    // An already-expired token (minted past the 30-minute TTL via the test
+    // hook in the registry).
+    let old = std::time::Instant::now() - std::time::Duration::from_secs(31 * 60);
+    let expired = core
+        .attachment_approvals()
+        .approve_at(vec![src.clone()], old)
+        .unwrap();
+    assert_eq!(expired.len(), 1);
+    let err = core
+        .save_draft(draft_args(
+            1,
+            vec![DraftAttachmentIn::Token {
+                token: expired[0].token.clone(),
+            }],
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "expired token: {err:?}"
+    );
+
+    // A token consumed by one save cannot be replayed into another.
+    let consumed = core.approve_attachment_sources(vec![src]).unwrap();
+    core.save_draft(draft_args(
+        1,
+        vec![DraftAttachmentIn::Token {
+            token: consumed[0].token.clone(),
+        }],
+    ))
+    .await
+    .unwrap();
+    let err = core
+        .save_draft(draft_args(
+            1,
+            vec![DraftAttachmentIn::Token {
+                token: consumed[0].token.clone(),
+            }],
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "replayed token: {err:?}"
+    );
+}
+
+/// A staged path is bound to the draft that references it: another draft -
+/// or a renderer that guessed the staging layout - cannot claim it.
+#[tokio::test]
+async fn save_draft_rejects_staged_path_of_other_draft() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_paths, core) = setup_core(&tmp).await;
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, b"a").unwrap();
+
+    let draft_a = core
+        .save_draft(draft_args(1, vec![token_for(&core, &a).await]))
+        .await
+        .unwrap()
+        .draft_id;
+    let staged_a = stored_paths(&core, draft_a).await[0].clone();
+
+    // Draft B tries to echo draft A's staged path.
+    let err = core
+        .save_draft(draft_args(
+            1,
+            vec![DraftAttachmentIn::Staged {
+                file_path: staged_a.clone(),
+                filename: "a.txt".into(),
+            }],
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "foreign staged path: {err:?}"
+    );
+    // A's staged copy and row are untouched.
+    assert!(std::path::Path::new(&staged_a).exists());
+    assert_eq!(stored_paths(&core, draft_a).await, vec![staged_a]);
+}
+
+/// A received attachment joins a forward by row id, resolved in Rust - the
+/// webview never names a cache path.
+#[tokio::test]
+async fn forward_by_attachment_id_stages_cached_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, core) = setup_core(&tmp).await;
+
+    // A downloaded attachment: an `attachments` row whose `file_path` cache
+    // entry already exists on disk (see `get_attachment`).
+    let cached = tmp.path().join("cached-report.pdf");
+    std::fs::write(&cached, b"%PDF-forward-me").unwrap();
+    core.db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO messages
+                   (id,account_id,thread_id,folder_id,uid,message_id,subject,date,
+                    is_draft,is_outgoing,has_attachments,snippet,body_state)
+                 VALUES (50,1,NULL,1,1,'<orig@x>','orig',1000,0,0,1,'s','cached')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO attachments (id,message_id,part_id,filename,mime_type,file_path)
+                 VALUES (60,50,'2','report.pdf','application/pdf',?1)",
+                [cached.to_string_lossy().into_owned()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let draft_id = core
+        .save_draft(draft_args(
+            1,
+            vec![DraftAttachmentIn::Forward { attachment_id: 60 }],
+        ))
+        .await
+        .unwrap()
+        .draft_id;
+
+    let staged = stored_paths(&core, draft_id).await;
+    assert_eq!(staged.len(), 1);
+    let staged = &staged[0];
+    let staging_root = std::fs::canonicalize(paths.draft_attachments_dir()).unwrap();
+    assert!(std::path::Path::new(staged).starts_with(&staging_root));
+    assert_eq!(std::fs::read(staged).unwrap(), b"%PDF-forward-me");
+    // The persisted display name comes from the attachment row.
+    let name: String = core
+        .db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT filename FROM draft_attachments WHERE draft_id = ?1",
+                [draft_id],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(name, "report.pdf");
 }
 
 // -----------------------------------------------------------------------
@@ -198,9 +447,11 @@ async fn setup_core(tmp: &tempfile::TempDir) -> (comail_core::config::Paths, Cor
     (paths, core)
 }
 
-fn att(path: &std::path::Path, name: &str) -> DraftAttachmentIn {
-    DraftAttachmentIn {
-        file_path: path.to_string_lossy().into_owned(),
+/// A same-draft staged echo - what `get_draft` hands the reopened composer
+/// and what it must send back unchanged on re-save.
+fn att(path: &str, name: &str) -> DraftAttachmentIn {
+    DraftAttachmentIn::Staged {
+        file_path: path.to_string(),
         filename: name.into(),
     }
 }
@@ -215,9 +466,10 @@ async fn resave_deletes_file_of_removed_attachment() {
     std::fs::write(&b, b"b").unwrap();
 
     let draft_id = core
-        .save_draft(draft_args(1, vec![att(&a, "a.txt")]))
+        .save_draft(draft_args(1, vec![token_for(&core, &a).await]))
         .await
-        .unwrap();
+        .unwrap()
+        .draft_id;
     let staged_a = stored_paths(&core, draft_id).await[0].clone();
     assert!(std::path::Path::new(&staged_a).exists());
 
@@ -225,10 +477,11 @@ async fn resave_deletes_file_of_removed_attachment() {
     let draft_id = core
         .save_draft(SaveDraftArgs {
             draft_id: Some(draft_id),
-            ..draft_args(1, vec![att(&b, "b.txt")])
+            ..draft_args(1, vec![token_for(&core, &b).await])
         })
         .await
-        .unwrap();
+        .unwrap()
+        .draft_id;
     assert!(
         !std::path::Path::new(&staged_a).exists(),
         "orphaned staged file left on disk"
@@ -245,13 +498,7 @@ async fn resave_deletes_file_of_removed_attachment() {
     // Re-save keeping b.txt: its staged file survives.
     core.save_draft(SaveDraftArgs {
         draft_id: Some(draft_id),
-        ..draft_args(
-            1,
-            vec![DraftAttachmentIn {
-                file_path: staged_b.clone(),
-                filename: "b.txt".into(),
-            }],
-        )
+        ..draft_args(1, vec![att(&staged_b, "b.txt")])
     })
     .await
     .unwrap();
@@ -267,9 +514,10 @@ async fn delete_draft_removes_staged_files_local_and_remote() {
 
     // Local-only draft (uid NULL -> message row deleted).
     let local_id = core
-        .save_draft(draft_args(1, vec![att(&src, "f.txt")]))
+        .save_draft(draft_args(1, vec![token_for(&core, &src).await]))
         .await
-        .unwrap();
+        .unwrap()
+        .draft_id;
     let local_path = stored_paths(&core, local_id).await[0].clone();
     core.delete_draft(local_id).await.unwrap();
     assert!(!std::path::Path::new(&local_path).exists());
@@ -278,9 +526,10 @@ async fn delete_draft_removes_staged_files_local_and_remote() {
     // Remote draft (uid set -> message moved to Trash, row survives): the
     // staged copy must still go.
     let remote_id = core
-        .save_draft(draft_args(1, vec![att(&src, "f.txt")]))
+        .save_draft(draft_args(1, vec![token_for(&core, &src).await]))
         .await
-        .unwrap();
+        .unwrap()
+        .draft_id;
     let remote_path = stored_paths(&core, remote_id).await[0].clone();
     core.db
         .write(move |conn| {
@@ -315,7 +564,11 @@ async fn delete_draft_never_removes_paths_outside_staging_root() {
     let outside = tmp.path().join("important.txt");
     std::fs::write(&outside, b"do not delete").unwrap();
 
-    let draft_id = core.save_draft(draft_args(1, vec![])).await.unwrap();
+    let draft_id = core
+        .save_draft(draft_args(1, vec![]))
+        .await
+        .unwrap()
+        .draft_id;
     let outside_str = outside.to_string_lossy().into_owned();
     core.db
         .write(move |conn| {
@@ -346,9 +599,10 @@ async fn startup_sweep_removes_unreferenced_dirs_but_not_recent_or_referenced() 
         comail_core::config::Paths::for_tests(&tmp.path().join("data")).draft_attachments_dir();
 
     let draft_id = core
-        .save_draft(draft_args(1, vec![att(&src, "s.txt")]))
+        .save_draft(draft_args(1, vec![token_for(&core, &src).await]))
         .await
-        .unwrap();
+        .unwrap()
+        .draft_id;
     let staged = stored_paths(&core, draft_id).await[0].clone();
 
     // A "recent" unreferenced dir (as an in-flight save would leave) is
@@ -388,7 +642,11 @@ async fn staged_symlink_pointing_outside_is_never_followed_for_deletion() {
     // A crafted row: the stored path sits inside the staging root but is a
     // symlink resolving outside it. Deleting "the file at the row's path"
     // must not follow the link.
-    let draft_id = core.save_draft(draft_args(1, vec![])).await.unwrap();
+    let draft_id = core
+        .save_draft(draft_args(1, vec![]))
+        .await
+        .unwrap()
+        .draft_id;
     let staging_root =
         comail_core::config::Paths::for_tests(&tmp.path().join("data")).draft_attachments_dir();
     let link_dir = staging_root.join("crafted");
@@ -502,15 +760,10 @@ async fn remove_account_removes_its_staged_draft_attachments() {
     let src = tmp.path().join("keep.bin");
     std::fs::write(&src, b"payload").unwrap();
     let draft_id = core
-        .save_draft(draft_args(
-            2,
-            vec![DraftAttachmentIn {
-                file_path: src.to_string_lossy().into_owned(),
-                filename: "keep.bin".into(),
-            }],
-        ))
+        .save_draft(draft_args(2, vec![token_for(&core, &src).await]))
         .await
-        .unwrap();
+        .unwrap()
+        .draft_id;
     let stored = stored_paths(&core, draft_id).await;
     assert_eq!(stored.len(), 1);
     let staged = std::path::PathBuf::from(&stored[0]);
@@ -522,4 +775,161 @@ async fn remove_account_removes_its_staged_draft_attachments() {
     // the per-file subdirectory is pruned too.
     assert!(!staged.exists(), "staged file left: {staged:?}");
     assert!(!staged.parent().unwrap().exists());
+}
+
+// -----------------------------------------------------------------------
+// The approval boundary itself: what may be minted, and use-time checks.
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn approvals_skip_directories_and_missing_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_paths, core) = setup_core(&tmp).await;
+
+    let dir = tmp.path().join("a-directory");
+    std::fs::create_dir_all(&dir).unwrap();
+    let missing = tmp.path().join("never-existed.bin");
+    // A symlink to a directory is not a regular file either.
+    #[cfg(unix)]
+    let dir_link = tmp.path().join("dir-link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&dir, &dir_link).unwrap();
+
+    let approved = core
+        .approve_attachment_sources({
+            #[cfg(unix)]
+            {
+                vec![dir.clone(), dir_link.clone(), missing.clone()]
+            }
+            #[cfg(not(unix))]
+            {
+                vec![dir.clone(), missing.clone()]
+            }
+        })
+        .unwrap();
+    assert!(approved.is_empty(), "approved: {approved:?}");
+}
+
+/// Replacing the approved file with a symlink (or a directory) at the same
+/// path must fail use-time validation instead of copying the new target.
+#[cfg(unix)]
+#[tokio::test]
+async fn save_draft_refuses_token_after_symlink_swap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_paths, core) = setup_core(&tmp).await;
+
+    let picked = tmp.path().join("picked.txt");
+    std::fs::write(&picked, b"user picked this").unwrap();
+    let victim = tmp.path().join("victim.txt");
+    std::fs::write(&victim, b"never approved").unwrap();
+    let att = token_for(&core, &picked).await;
+
+    // Swap the approved path for a symlink to a different file: the
+    // canonical path at use no longer equals the approved canonical path.
+    std::fs::remove_file(&picked).unwrap();
+    std::os::unix::fs::symlink(&victim, &picked).unwrap();
+
+    let err = core.save_draft(draft_args(1, vec![att])).await.unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "symlink swap: {err:?}"
+    );
+
+    // Same for a directory swapped in under the approved name.
+    let picked2 = tmp.path().join("picked2.txt");
+    std::fs::write(&picked2, b"also picked").unwrap();
+    let att2 = token_for(&core, &picked2).await;
+    std::fs::remove_file(&picked2).unwrap();
+    std::fs::create_dir_all(&picked2).unwrap();
+
+    let err = core
+        .save_draft(draft_args(1, vec![att2]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "dir swap: {err:?}"
+    );
+}
+
+/// The drop exchange: paths Rust observed falling on the window mint tokens;
+/// anything the webview merely asserts was dropped is refused. This is the
+/// trust boundary - `record_os_drop` is called only by the Rust webview-event
+/// handler, which tests stand in for.
+#[tokio::test]
+async fn claim_dropped_attachments_accepts_only_rust_observed_drops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, core) = setup_core(&tmp).await;
+
+    let dropped = tmp.path().join("dropped.png");
+    std::fs::write(&dropped, b"png").unwrap();
+    let not_dropped = tmp.path().join("not-dropped.txt");
+    std::fs::write(&not_dropped, b"nope").unwrap();
+
+    // Rust observed this drop on the window.
+    core.record_os_drop(std::slice::from_ref(&dropped));
+
+    // Exchanging the observed path works...
+    let claimed = core
+        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()])
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].filename, "dropped.png");
+
+    // ...once: the drop record is consumed by the exchange.
+    let err = core
+        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()])
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "second claim of same drop: {err:?}"
+    );
+
+    // A path the OS never dropped - even though it exists and is a regular
+    // file - cannot be claimed.
+    core.record_os_drop(std::slice::from_ref(&dropped));
+    let err = core
+        .claim_dropped_attachments(&[not_dropped.to_string_lossy().into_owned()])
+        .unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "un-observed path: {err:?}"
+    );
+    // And a mixed claim fails whole-call, leaving the real drop claimable.
+    let err = core
+        .claim_dropped_attachments(&[
+            dropped.to_string_lossy().into_owned(),
+            not_dropped.to_string_lossy().into_owned(),
+        ])
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        comail_core::error::CoreError::ActionRejected(_)
+    ));
+    assert!(
+        core.claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()])
+            .is_ok(),
+        "the genuine drop should survive a failed mixed claim"
+    );
+
+    // The claimed token stages like a picked file.
+    core.record_os_drop(std::slice::from_ref(&dropped));
+    let claimed = core
+        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()])
+        .unwrap();
+    let draft_id = core
+        .save_draft(draft_args(
+            1,
+            vec![DraftAttachmentIn::Token {
+                token: claimed[0].token.clone(),
+            }],
+        ))
+        .await
+        .unwrap()
+        .draft_id;
+    let staged = stored_paths(&core, draft_id).await;
+    assert_eq!(staged.len(), 1);
+    let staging_root = std::fs::canonicalize(paths.draft_attachments_dir()).unwrap();
+    assert!(std::path::Path::new(&staged[0]).starts_with(&staging_root));
+    assert_eq!(std::fs::read(&staged[0]).unwrap(), b"png");
 }

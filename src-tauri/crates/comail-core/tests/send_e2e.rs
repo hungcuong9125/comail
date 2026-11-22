@@ -130,7 +130,8 @@ async fn reply_send_reaches_smtp_and_sent_folder() {
             attachments: vec![],
         })
         .await
-        .expect("save draft");
+        .expect("save draft")
+        .draft_id;
     let result = core
         .queue_send(QueueSendArgs {
             draft_id,
