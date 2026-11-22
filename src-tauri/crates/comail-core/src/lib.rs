@@ -285,44 +285,6 @@ impl Core {
         let settings = core.db.read(|conn| repo::settings::get(conn)).await?;
         apply_oauth_settings(&settings);
 
-        // Resume account removals interrupted mid-flight (crash/kill between
-        // the durable marker and the delete commit, or a repair that failed
-        // and kept its marker) - before any account task is spawned, so a
-        // marked account never starts syncing again. On success remove_account
-        // rewrites and clears the marker itself; its failure path already ran
-        // the index repair, so here we only log and the marker survives for
-        // the next start.
-        for account_id in core
-            .db
-            .read(|conn| repo::accounts::removal_markers(conn))
-            .await
-            .unwrap_or_default()
-        {
-            let exists = core
-                .db
-                .read(move |conn| Ok(repo::accounts::get(conn, account_id)?.is_some()))
-                .await
-                .unwrap_or(false);
-            if !exists {
-                // Marker without an account row cannot happen (the marker is
-                // cleared in the same commit as the delete) - sweep it anyway.
-                let _ = core
-                    .db
-                    .write(move |conn| repo::accounts::unmark_removing(conn, account_id))
-                    .await;
-                continue;
-            }
-            match core.remove_account(account_id).await {
-                Ok(()) => tracing::info!(account_id, "resumed interrupted account removal"),
-                Err(error) => tracing::warn!(
-                    account_id,
-                    %error,
-                    "resumed account removal failed; account stays usable, marker kept"
-                ),
-            }
-        }
-        sweep_removal_tombstones(&core.paths).await;
-
         // Recover any actions orphaned mid-flight by a previous crash/kill, so a
         // send that was executing when the app died retries instead of sticking
         // on "Sending…" forever.
@@ -406,6 +368,52 @@ impl Core {
                     _ = core.ui_ready.notified() => {}
                     _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
                 }
+                // Resume account removals interrupted mid-flight (crash/kill
+                // between the durable marker and the delete commit, or a
+                // repair that failed and kept its marker) - strictly before
+                // listing configs, so a marked account never starts syncing
+                // again. This runs in the deferred task, not inline in
+                // start(), so a large interrupted removal does not hold the
+                // Tauri setup blocking the first window; marked accounts are
+                // already hidden from accounts::list. On success
+                // remove_account clears the marker itself; on failure its
+                // error path already repaired the index, and we do NOT call
+                // restore_account_tasks here - the spawn loop below picks the
+                // account back up (a still-marked account is filtered out of
+                // list_configs and stays idle for the next start's resume).
+                for account_id in core
+                    .db
+                    .read(|conn| repo::accounts::removal_markers(conn))
+                    .await
+                    .unwrap_or_default()
+                {
+                    let exists = core
+                        .db
+                        .read(move |conn| Ok(repo::accounts::get(conn, account_id)?.is_some()))
+                        .await
+                        .unwrap_or(false);
+                    if !exists {
+                        // Marker without an account row cannot happen (it is
+                        // cleared in the same commit as the delete) - sweep
+                        // it anyway.
+                        let _ = core
+                            .db
+                            .write(move |conn| repo::accounts::unmark_removing(conn, account_id))
+                            .await;
+                        continue;
+                    }
+                    match core.remove_account_inner(account_id, false).await {
+                        Ok(()) => {
+                            tracing::info!(account_id, "resumed interrupted account removal")
+                        }
+                        Err(error) => tracing::warn!(
+                            account_id,
+                            %error,
+                            "resumed account removal failed; account stays usable, marker kept"
+                        ),
+                    }
+                }
+                sweep_removal_tombstones(&core.paths).await;
                 let configs = match core
                     .db
                     .read(|conn| repo::accounts::list_configs(conn))
@@ -926,6 +934,13 @@ impl Core {
     }
 
     pub async fn remove_account(&self, account_id: i64) -> Result<()> {
+        self.remove_account_inner(account_id, true).await
+    }
+
+    /// `restore_on_failure`: on a pre-commit error the repair runs either way,
+    /// but the task set is only restarted when `true`. Start-up passes `false`
+    /// because the account spawn loop that follows resumes the account itself.
+    async fn remove_account_inner(&self, account_id: i64, restore_on_failure: bool) -> Result<()> {
         // Detach every per-account entry point first so nothing new can be
         // scheduled for this id while teardown runs. (attachment_locks is
         // keyed by attachment id, not account id - nothing to evict here.)
@@ -1045,10 +1060,39 @@ impl Core {
             // message ids (and with them `d{id}` staging dir names) recycle
             // the same way. Leftover tombstones are swept at start-up.
             let tombstones = self.tombstone_account_dirs(account_id, &staged).await;
-            Ok((tombstones, message_ids))
+            #[cfg(test)]
+            if REMOVE_PAUSE_FOR_ADD.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                REMOVE_RESUME_GATE.notified().await;
+            }
+            // Every step keyed by the account id (or by recyclable message
+            // ids) finishes while the lock is still held: the commit ran
+            // already, so these are final, and a queued add that recycles the
+            // id can only run after this section - it can never lose its own
+            // credentials or vectors to a stale cleanup.
+            // Credential deletion and token-cache clearing happen atomically
+            // under the account's refresh lock: a grant still in flight
+            // completes first and its writes are erased by the purge, and a
+            // grant queued behind it finds no refresh token - no rotated
+            // token can be written back into the keyring and no cache entry
+            // resurrected for a removed account.
+            self.tokens.purge(account_id).await;
+            // The persisted vectors cascaded with the messages; evict the
+            // account's copies from the in-memory index too, before any
+            // recycled message id can be repopulated.
+            if !message_ids.is_empty() {
+                let removed: std::collections::HashSet<i64> = message_ids.iter().copied().collect();
+                self.embed
+                    .index
+                    .write()
+                    .await
+                    .retain(|mid| !removed.contains(&mid));
+            }
+            // `_lifecycle` drops here: only work on names that cannot be
+            // reused (the tombstoned directories) runs after the release.
+            Ok(tombstones)
         }
         .await;
-        let (tombstones, message_ids) = match removal {
+        let tombstones = match removal {
             Ok(out) => out,
             Err(error) => {
                 // Pre-commit failure or a rolled-back transaction: the
@@ -1069,29 +1113,17 @@ impl Core {
                          marker kept so start-up finishes the removal"
                     );
                 }
-                self.restore_account_tasks(account_id).await;
+                if restore_on_failure {
+                    self.restore_account_tasks(account_id).await;
+                }
                 return Err(error);
             }
         };
 
-        // Point of no return passed; nothing below can resurrect the account.
-        // Credential deletion and token-cache clearing happen atomically
-        // under the account's refresh lock: a grant still in flight completes
-        // first and its writes are erased by the purge, and a grant queued
-        // behind it finds no refresh token — no rotated token can be written
-        // back into the keyring and no cache entry resurrected for a removed
-        // account (account ids are recycled).
-        self.tokens.purge(account_id).await;
-        // The persisted vectors cascaded with the messages; evict the
-        // account's copies from the in-memory index too.
-        if !message_ids.is_empty() {
-            let removed: std::collections::HashSet<i64> = message_ids.iter().copied().collect();
-            self.embed
-                .index
-                .write()
-                .await
-                .retain(|mid| !removed.contains(&mid));
-        }
+        // Point of no return passed; only work on names that cannot be
+        // reused (the tombstoned directories) runs past this point - the
+        // lock is already released, so account adds proceed while the slow
+        // recursive deletes drain.
         for dir in tombstones {
             let _ = tokio::fs::remove_dir_all(dir).await;
         }
@@ -6674,6 +6706,15 @@ static REMOVE_FAIL_BARRIER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static REMOVE_FAIL_TX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Test-only gate: when `REMOVE_PAUSE_FOR_ADD` is set, a removal holds the
+/// lifecycle lock inside its locked section (post-commit, pre-cleanup) until
+/// `REMOVE_RESUME_GATE` fires - lets a test queue an account add behind the
+/// removal to prove id-keyed cleanup is ordered before the lock is released.
+#[cfg(test)]
+static REMOVE_PAUSE_FOR_ADD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static REMOVE_RESUME_GATE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// Wait for every account's foreground Inbox pass at once. The passes already
 /// run concurrently (one actor per account); this waits on them concurrently
@@ -7744,6 +7785,117 @@ mod remove_account_failpoint_tests {
         drop(lifecycle);
         spawned.await.unwrap().unwrap();
         assert!(core.account_lifecycle.try_lock().is_ok());
+    }
+
+    /// The lifecycle lock is the only thing that makes `account_id` still
+    /// mean "the account being removed" - so every cleanup step keyed by it
+    /// (credential purge) or by recyclable message ids (vector eviction)
+    /// must finish before the lock is released. Hold a removal inside its
+    /// locked section, queue an add behind the lock, and prove the new
+    /// account - which recycles the id - keeps its password and a vector
+    /// pushed on a recycled message id.
+    #[tokio::test]
+    async fn id_keyed_cleanup_finishes_before_the_lifecycle_lock_releases() {
+        let _guard = failpoint_lock().await;
+        let (core, _root) = test_core().await;
+        // Stop the tasks so the removal does not spend the window on the
+        // stop deadline against unreachable hosts.
+        let handle = core.handles.read().await.get(&1).cloned().unwrap();
+        handle.send(SyncCmd::Shutdown);
+        // A vector on one of account 1's messages - the eviction must drop it.
+        let old_mid: i64 = core
+            .db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT id FROM messages WHERE account_id = 1 LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        {
+            let mut idx = core.embed.index.write().await;
+            idx.reset(3, "m");
+            idx.push(old_mid, 0, &[1.0, 0.0, 0.0]);
+        }
+
+        REMOVE_PAUSE_FOR_ADD.store(true, std::sync::atomic::Ordering::SeqCst);
+        let spawned = {
+            let core = core.clone();
+            tokio::spawn(async move { core.remove_account(1).await })
+        };
+        // The flag clears when the removal reaches the gate inside the
+        // locked section - post-commit, before the id-keyed cleanup.
+        while REMOVE_PAUSE_FOR_ADD.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        // Queue the add's locked section. The real add paths
+        // (add_account_password, finish_oauth) hold account_lifecycle across
+        // insert + credential store; they can't run here because
+        // test_connection needs a real TLS IMAP handshake, so this spawns
+        // exactly their locked steps on the same mutex and repo calls.
+        let add = {
+            let core = core.clone();
+            tokio::spawn(async move {
+                let _lifecycle = core.account_lifecycle.lock().await;
+                let id = core
+                    .db
+                    .write(|conn| {
+                        repo::accounts::insert(
+                            conn,
+                            &repo::accounts::NewAccount {
+                                email: "new@test.dev",
+                                display_name: None,
+                                provider: Provider::Imap,
+                                auth_kind: AuthKind::Password,
+                                username: "new",
+                                imap_host: "h",
+                                imap_port: 993,
+                                smtp_host: "h",
+                                smtp_port: 587,
+                            },
+                        )
+                    })
+                    .await
+                    .unwrap();
+                credentials::store_async(id, Slot::Password, "newpass".into())
+                    .await
+                    .unwrap();
+                // A vector on a recycled message id of the new account.
+                core.embed
+                    .index
+                    .write()
+                    .await
+                    .push(old_mid, 0, &[0.0, 1.0, 0.0]);
+                id
+            })
+        };
+        // Let the add reach its lock wait, then release the removal: purge
+        // and eviction run while the lock is still held.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        REMOVE_RESUME_GATE.notify_one();
+        spawned.await.unwrap().unwrap();
+        let new_id = add.await.unwrap();
+        assert_eq!(new_id, 1, "the add must recycle the removed account's id");
+        // ...so the purge could only have deleted the OLD credentials; the
+        // new account's password - stored after the lock released - is intact.
+        assert_eq!(
+            credentials::load_async(1, Slot::Password).await.unwrap(),
+            "newpass"
+        );
+        // And the vector pushed on the recycled message id survived the
+        // removal's eviction, which ran before the add could even insert.
+        let hits = {
+            let idx = core.embed.index.read().await;
+            idx.search(&[0.0, 1.0, 0.0], 5)
+        };
+        assert_eq!(
+            hits.iter().map(|h| h.0).collect::<Vec<_>>(),
+            vec![old_mid],
+            "the recycled-id vector must survive; the old one was evicted"
+        );
     }
 }
 

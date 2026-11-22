@@ -75,7 +75,14 @@ pub fn list(conn: &Connection) -> Result<Vec<Account>> {
 }
 
 pub fn list_configs(conn: &Connection) -> Result<Vec<AccountConfig>> {
-    let mut stmt = conn.prepare("SELECT * FROM accounts ORDER BY id")?;
+    // Accounts marked as removing never get tasks: either the deferred
+    // start-up resume is still finishing them, or a failed repair left the
+    // marker for the next start.
+    let mut stmt = conn.prepare(
+        "SELECT * FROM accounts
+         WHERE id NOT IN (SELECT account_id FROM removing_accounts)
+         ORDER BY id",
+    )?;
     let rows = stmt
         .query_map([], config_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;

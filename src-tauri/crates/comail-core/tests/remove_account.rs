@@ -455,6 +455,43 @@ async fn writer_hold_for_delete_measured_on_100k_messages() {
         "FTS sweep: {:?} total, worst single-batch writer hold {worst_batch:?}",
         sweep_started.elapsed()
     );
+
+    // Measure the repair path: re-indexing everything the sweep removed.
+    // Each batch re-evaluates the NOT IN anti-join over the refilling FTS
+    // table, so the per-batch writer hold is the number that matters.
+    let mut worst_reindex = Duration::ZERO;
+    let reindex_started = Instant::now();
+    let mut reindexed = 0usize;
+    loop {
+        let t = Instant::now();
+        let n = db
+            .write(move |conn| repo::search::reindex_missing_batch(conn, 1, 5_000))
+            .await
+            .unwrap();
+        worst_reindex = worst_reindex.max(t.elapsed());
+        reindexed += n;
+        if n < 5_000 {
+            break;
+        }
+    }
+    eprintln!(
+        "reindex repair: {reindexed} rows in {:?}, worst single-batch writer hold {worst_reindex:?}",
+        reindex_started.elapsed()
+    );
+    assert_eq!(reindexed, N as usize);
+    // Sweep again so the final transaction below measures the same load the
+    // real flow sees (only stragglers).
+    loop {
+        if db
+            .write(move |conn| repo::accounts::sweep_fts_batch(conn, 1))
+            .await
+            .unwrap()
+            < repo::accounts::FTS_DELETE_BATCH as usize
+        {
+            break;
+        }
+    }
+
     let started = Instant::now();
     db.write(move |conn| repo::accounts::delete(conn, 1))
         .await
@@ -529,9 +566,34 @@ async fn killed_mid_sweep_resumes_removal_at_startup() {
     .unwrap();
     drop(db);
 
-    // Start-up must resume: the account is fully removed (row, FTS, creds,
-    // dirs) and the marker is cleared - all before account tasks could spawn.
+    // Start-up must resume: the deferred task (gated on ui_ready, like the
+    // real frontend) finishes the account - row, FTS, creds, dirs - and
+    // clears the marker, all before account tasks spawn.
     let core = Core::start(Paths::for_tests(tmp.path())).await.unwrap();
+    core.notify_ui_ready();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let (gone, marked) = core
+            .db
+            .read(|conn| {
+                Ok((
+                    repo::accounts::get(conn, 1)?.is_none(),
+                    !repo::accounts::removal_markers(conn)?.is_empty(),
+                ))
+            })
+            .await
+            .unwrap();
+        // Tombstone renames run between the commit and remove_account
+        // returning, so wait for the dirs to go too rather than racing them.
+        if gone && !marked && !mail_dir.exists() && !attach_dir.exists() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "deferred start-up must finish the resumed removal"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     core.db
         .read(|conn| {
             assert!(
