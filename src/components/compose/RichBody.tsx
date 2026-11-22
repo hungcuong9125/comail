@@ -9,9 +9,11 @@ import {
 import { useTranslation } from "react-i18next";
 import { captureOutsideSelection } from "../../lib/selection";
 import { stripFormatting, textToHtml } from "../../lib/richtext";
+import { EDITOR_IMAGE_TYPES, sanitizeEditorHtml } from "../../lib/signatures";
 import { activeMention } from "../../lib/mentions";
 import { addressName, IS_MAC } from "../../lib/format";
 import { call } from "../../ipc/commands";
+import { useUi } from "../../stores/ui";
 import type { Address } from "../../ipc/types";
 import { Button } from "../ui/Button";
 
@@ -23,6 +25,27 @@ export interface RichBodyHandle {
   insertText(text: string): void;
   /** Insert an HTML fragment at the caret (availability slots). */
   insertHtml(html: string): void;
+}
+
+/** Insert `html` at the current selection: execCommand where the engine
+ *  allows it (keeps ⌘Z), a manual Range insert otherwise. The fragment must
+ *  already be sanitized. */
+function insertFragmentAtSelection(sel: Selection, html: string) {
+  if (sel.rangeCount === 0) return;
+  if (!document.execCommand("insertHTML", false, html)) {
+    const range = sel.getRangeAt(0);
+    range.deleteContents();
+    const tpl = document.createElement("template");
+    tpl.innerHTML = html;
+    const last = tpl.content.lastChild;
+    range.insertNode(tpl.content);
+    const after = document.createRange();
+    if (last) after.setStartAfter(last);
+    else after.setStart(range.startContainer, range.startOffset);
+    after.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(after);
+  }
 }
 
 /** Replace `range` with `text` (newlines become <br>) and collapse the selection
@@ -85,12 +108,31 @@ export const RichBody = forwardRef<
   const { t } = useTranslation();
   const elRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const lastEmittedRef = useRef(value);
+  // The HTML the parent last heard from us (or what the DOM last synced to) -
+  // doubles as emit() dedup and the "this value is our own emission" check.
+  const lastEmittedRef = useRef("");
+  // The last external `value` prop the DOM was synced from. Sanitizing applies
+  // only to those external values; our own emissions are already clean and
+  // echoed back through `value`, which must not trigger another pass.
+  const consumedValueRef = useRef<string | null>(null);
+  // Composer hands down a fresh inline callback each render; a ref keeps the
+  // sync effect's deps stable without going stale.
+  const onChangeRef = useRef(onChange);
+  useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
   // Selection captured when a popover opens (inputs steal focus, so we restore
   // the editor's range before applying the command).
   const savedRangeRef = useRef<Range | null>(null);
   // Set by cmd/ctrl+shift+V so the paste that follows drops its formatting.
   const pastePlainRef = useRef(false);
+  // A drag that starts inside this editor is a native move, not incoming
+  // content: flag it so onDrop lets the browser relocate the source instead
+  // of sanitizing a duplicate in at the drop point.
+  const internalDragRef = useRef(false);
+  // One scheduled re-check of the DOM after an event the browser handled
+  // itself (native move, plain-text paste). See scheduleDomCheck.
+  const domCheckRef = useRef<number | null>(null);
   const [empty, setEmpty] = useState(true);
   const [active, setActive] = useState<Record<string, boolean>>({});
   const [linkOpen, setLinkOpen] = useState(false);
@@ -113,24 +155,106 @@ export const RichBody = forwardRef<
     setEmpty(el.textContent?.trim() === "" && !el.querySelector("img"));
   }, []);
 
-  // Sync external value -> DOM (only when it actually differs, so typing
-  // never fights the caret).
+  // Sync EXTERNAL value -> DOM: drafts, AI output, quick-reply inserts. A
+  // `value` that is our own last emission (echoed back through the parent) or
+  // the external value already synced in needs no pass at all - the DOM is
+  // the source for it, and every insertion path sanitizes on the way in, so
+  // the allowlist never sees self-produced content.
   useEffect(() => {
     const el = elRef.current;
-    if (el && el.innerHTML !== value) {
-      el.innerHTML = value;
-      lastEmittedRef.current = value;
-      refreshEmpty(el);
-    }
+    if (!el) return;
+    if (value === lastEmittedRef.current || value === consumedValueRef.current) return;
+    consumedValueRef.current = value;
+    const clean = sanitizeEditorHtml(value);
+    if (el.innerHTML === clean) return;
+    el.innerHTML = clean;
+    refreshEmpty(el);
+    // The sanitized DOM is the new baseline: emit() compares against it, and
+    // no onChange fires for the load-time normalization - the parent marking
+    // the composer dirty on a draft open must only come from a real edit.
+    lastEmittedRef.current = el.innerHTML;
   }, [value, refreshEmpty]);
 
   const emit = useCallback(() => {
     const el = elRef.current;
     if (!el || el.innerHTML === lastEmittedRef.current) return;
     lastEmittedRef.current = el.innerHTML;
+    consumedValueRef.current = el.innerHTML;
     refreshEmpty(el);
-    onChange(el.innerHTML);
-  }, [onChange, refreshEmpty]);
+    onChangeRef.current(el.innerHTML);
+  }, [refreshEmpty]);
+
+  // The internal-drag flag can stay set if dragend never reaches the editor
+  // (the dragged source node was removed mid-drag, or the drop left the
+  // window). Rather than trusting the flag alone: any drop or paste the
+  // browser performs natively is followed by a next-frame check that
+  // re-sanitizes the DOM and emits if the cleanup changed anything.
+  const scheduleDomCheck = useCallback(() => {
+    if (domCheckRef.current != null) return;
+    domCheckRef.current = window.setTimeout(() => {
+      domCheckRef.current = null;
+      const el = elRef.current;
+      if (!el) return;
+      const clean = sanitizeEditorHtml(el.innerHTML);
+      if (clean !== el.innerHTML) {
+        // Caret as (child-index path, offset) pairs from the editor root, so
+        // it survives the innerHTML rewrite as well as it can.
+        const sel = document.getSelection();
+        const r = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+        const pathOf = (node: Node, offset: number): number[] | null => {
+          const p = [offset];
+          let n: Node | null = node;
+          while (n && n !== el) {
+            const parent: Node | null = n.parentNode;
+            if (!parent) return null;
+            p.unshift(Array.prototype.indexOf.call(parent.childNodes, n));
+            n = parent;
+          }
+          return n === el ? p : null;
+        };
+        const start = r && el.contains(r.startContainer) ? pathOf(r.startContainer, r.startOffset) : null;
+        const end = r && el.contains(r.endContainer) ? pathOf(r.endContainer, r.endOffset) : null;
+        el.innerHTML = clean;
+        if (sel && start && end) {
+          const resolve = (p: number[]) => {
+            let node: Node = el;
+            for (let k = 0; k < p.length - 1; k += 1) {
+              const next = node.childNodes[p[k]];
+              if (!next) return null;
+              node = next;
+            }
+            const max =
+              node.nodeType === Node.TEXT_NODE
+                ? (node.textContent ?? "").length
+                : node.childNodes.length;
+            return { node, offset: Math.min(p[p.length - 1], max) };
+          };
+          const a = resolve(start);
+          const b = resolve(end);
+          if (a && b) sel.setBaseAndExtent(a.node, a.offset, b.node, b.offset);
+        }
+      }
+      emit();
+    }, 0);
+  }, [emit]);
+
+  // A stale internal-drag flag is also cleared directly when a new drag
+  // starts outside the editor or the window loses focus mid-drag.
+  useEffect(() => {
+    const onDocDragStart = (e: DragEvent) => {
+      const el = elRef.current;
+      if (!el || !el.contains(e.target as Node)) internalDragRef.current = false;
+    };
+    const onWindowBlur = () => {
+      internalDragRef.current = false;
+    };
+    document.addEventListener("dragstart", onDocDragStart, true);
+    window.addEventListener("blur", onWindowBlur);
+    return () => {
+      document.removeEventListener("dragstart", onDocDragStart, true);
+      window.removeEventListener("blur", onWindowBlur);
+    };
+  }, []);
 
   /**
    * "Convert to plain text": drop the formatting of the selection, or of the
@@ -379,7 +503,7 @@ export const RichBody = forwardRef<
       const range = sel.getRangeAt(0);
       range.deleteContents();
       const tpl = document.createElement("template");
-      tpl.innerHTML = html;
+      tpl.innerHTML = sanitizeEditorHtml(html);
       const last = tpl.content.lastChild;
       range.insertNode(tpl.content);
       const after = document.createRange();
@@ -583,7 +707,17 @@ export const RichBody = forwardRef<
     emit();
   };
 
-  const insertImageFile = (file: File) => {
+  const insertImageFile = (file: File): boolean => {
+    // Only the raster types the editor allowlist accepts as data: sources.
+    // An SVG/TIFF/HEIC insert would be stripped by the next sanitizing pass
+    // (reopened draft), so refuse it here instead of losing it silently.
+    if (!EDITOR_IMAGE_TYPES.has(file.type)) {
+      useUi.getState().pushToast({
+        kind: "error",
+        message: t("compose:couldntPickFiles", { error: file.name || file.type }),
+      });
+      return false;
+    }
     const reader = new FileReader();
     reader.onload = () => {
       const el = elRef.current;
@@ -593,6 +727,7 @@ export const RichBody = forwardRef<
       emit();
     };
     reader.readAsDataURL(file);
+    return true;
   };
 
   /** Snapshot the current editor selection before a popover steals focus. */
@@ -637,11 +772,25 @@ export const RichBody = forwardRef<
     const raw = linkUrl.trim();
     restoreSelection();
     if (raw) {
-      // Bare hostnames get https:// so they aren't treated as relative paths.
-      const href = /^(https?:|mailto:|tel:|#|\/)/i.test(raw) ? raw : `https://${raw}`;
+      // Only the schemes the link allowlist keeps: a relative "/path" or
+      // bare "#anchor" href is meaningless to a mail recipient (and would be
+      // stripped anyway), so anything else gets the https:// prefix as before.
+      const href = /^(https?:|mailto:|tel:)/i.test(raw) ? raw : `https://${raw}`;
       const sel = document.getSelection();
-      if (sel && sel.isCollapsed) {
-        document.execCommand("insertHTML", false, `<a href="${href.replace(/"/g, "&quot;")}">${href}</a>`);
+      if (sel && sel.isCollapsed && sel.rangeCount) {
+        // Build the anchor as a node: outerHTML serializes both the attribute
+        // and the text safely, so the URL can't break out of its quotes.
+        const a = document.createElement("a");
+        a.setAttribute("href", href);
+        a.textContent = href;
+        if (!document.execCommand("insertHTML", false, a.outerHTML)) {
+          const range = sel.getRangeAt(0);
+          range.insertNode(a);
+          range.setStartAfter(a);
+          range.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
       } else {
         document.execCommand("createLink", false, href);
       }
@@ -886,17 +1035,106 @@ export const RichBody = forwardRef<
             return;
           }
           pastePlainRef.current = false;
-          // Pasted images (screenshots) land inline.
+          // Pasted images (screenshots) land inline. A refused type (SVG,
+          // TIFF) doesn't consume the paste: fall through to the HTML/plain
+          // branches below rather than pasting nothing at all.
           const item = [...(e.clipboardData?.items ?? [])].find((i) =>
             i.type.startsWith("image/"),
           );
           if (item) {
             const file = item.getAsFile();
-            if (file) {
+            if (file && insertImageFile(file)) {
               e.preventDefault();
-              insertImageFile(file);
+              return;
             }
           }
+          // Clipboard HTML (web pages, Word, other mail clients) is arbitrary
+          // markup: run it through the editor allowlist before it reaches the
+          // DOM. Without this branch the browser would paste it unsanitized.
+          const html = e.clipboardData?.getData("text/html") ?? "";
+          if (html) {
+            e.preventDefault();
+            const clean = sanitizeEditorHtml(html);
+            const sel = document.getSelection();
+            if (!sel || sel.rangeCount === 0) return;
+            if (clean) {
+              insertFragmentAtSelection(sel, clean);
+            } else if (plain) {
+              // Nothing survived the allowlist; keep the plain text at least.
+              replaceRangeWithText(sel.getRangeAt(0), sel, plain);
+            }
+            emit();
+            return;
+          }
+          if (item && !plain) {
+            // The clipboard's only payload is an image type we refuse: if we
+            // let the paste through the browser inserts the raw image
+            // natively, allowlist or not.
+            e.preventDefault();
+            return;
+          }
+          // A native plain-text paste is let through; the scheduled check
+          // re-verifies the DOM afterwards.
+          scheduleDomCheck();
+        }}
+        onDragStart={() => {
+          internalDragRef.current = true;
+        }}
+        onDragEnd={() => {
+          internalDragRef.current = false;
+        }}
+        onDrop={(e) => {
+          // A drag that started inside this editor is a native "move": the
+          // browser relocates the (already sanitized) selection and removes
+          // the source. The next-frame check re-sanitizes regardless - it is
+          // the backstop for a stale flag letting external HTML look internal.
+          if (internalDragRef.current) {
+            internalDragRef.current = false;
+            scheduleDomCheck();
+            return;
+          }
+          // Dragged-in HTML enters the DOM raw unless the drop is intercepted
+          // just like paste is. File drops carry no text data and are left to
+          // the composer's attachment handling.
+          const dt = e.dataTransfer;
+          if (!dt) return;
+          const html = dt.getData("text/html");
+          const text = dt.getData("text/plain");
+          if (!html && !text) return;
+          e.preventDefault();
+          const el = elRef.current;
+          if (!el) return;
+          el.focus();
+          // Put the caret where the drop landed; fall back to the end when
+          // the point can't be resolved or lies outside the editor.
+          let range: Range | null = null;
+          if (document.caretRangeFromPoint) {
+            range = document.caretRangeFromPoint(e.clientX, e.clientY);
+          } else {
+            const pos = document.caretPositionFromPoint?.(e.clientX, e.clientY);
+            if (pos) {
+              range = document.createRange();
+              range.setStart(pos.offsetNode, pos.offset);
+              range.collapse(true);
+            }
+          }
+          if (!range || !el.contains(range.startContainer)) {
+            range = document.createRange();
+            range.selectNodeContents(el);
+            range.collapse(false);
+          }
+          const sel = document.getSelection();
+          if (!sel) return;
+          sel.removeAllRanges();
+          sel.addRange(range);
+          if (html) {
+            const clean = sanitizeEditorHtml(html);
+            if (clean) insertFragmentAtSelection(sel, clean);
+            else if (text) replaceRangeWithText(sel.getRangeAt(0), sel, text);
+          } else {
+            replaceRangeWithText(sel.getRangeAt(0), sel, text);
+          }
+          emit();
         }}
       />
 

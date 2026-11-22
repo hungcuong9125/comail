@@ -8,6 +8,12 @@ import { useThread } from "../../queries/hooks";
 import { useUi } from "../../stores/ui";
 
 import { relativeTime } from "../../lib/format";
+import {
+  emptyAutoMarkRead,
+  markReadDispatched,
+  observeThread,
+  type AutoMarkRead,
+} from "../../lib/markRead";
 import { useShortcutHint } from "../../keyboard/registry";
 import { latestUnsubscribeMessage, unsubscribeFromMessage } from "../../lib/unsubscribe";
 import { Composer } from "../compose/Composer";
@@ -165,13 +171,41 @@ export function ConversationScreen({ threadId }: { threadId: number }) {
     [data, hiddenDraftId],
   );
 
-  // Auto mark read shortly after opening.
+  // Auto mark-read: once when the thread opens with unread mail, again when
+  // genuinely new messages arrive - but only while the window is visible and
+  // focused (mail arriving while the app sits unfocused is marked when it
+  // comes back), and never after the user marked the open thread unread. The
+  // decision logic lives in lib/markRead (pure, tested).
+  const autoMarkReadRef = useRef<AutoMarkRead>(emptyAutoMarkRead);
   useEffect(() => {
-    if (!data || data.thread.unreadCount === 0) return;
-    const t = setTimeout(() => {
-      void performThreadAction("mark_read", [threadId]);
-    }, 500);
-    return () => clearTimeout(t);
+    if (!data) return;
+    const s = observeThread(autoMarkReadRef.current, {
+      threadId,
+      unreadCount: data.thread.unreadCount,
+      messageIds: data.messages.filter((m) => !m.isDraft).map((m) => m.id),
+    });
+    autoMarkReadRef.current = s;
+    if (!s.pending) return;
+    const winActive = () =>
+      document.visibilityState === "visible" && document.hasFocus();
+    let timer = 0;
+    const trySchedule = () => {
+      window.clearTimeout(timer);
+      if (!autoMarkReadRef.current.pending || !winActive()) return;
+      timer = window.setTimeout(() => {
+        if (!autoMarkReadRef.current.pending || !winActive()) return;
+        autoMarkReadRef.current = markReadDispatched(autoMarkReadRef.current);
+        void performThreadAction("mark_read", [threadId]);
+      }, 500);
+    };
+    trySchedule();
+    document.addEventListener("visibilitychange", trySchedule);
+    window.addEventListener("focus", trySchedule);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", trySchedule);
+      window.removeEventListener("focus", trySchedule);
+    };
   }, [data, threadId]);
 
   const position = visibleThreadIds.indexOf(threadId);

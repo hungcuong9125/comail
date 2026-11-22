@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { htmlToText, isHtmlEmpty, stripFormatting, textToHtml } from "./richtext";
+import { decodeEntities, htmlToText, isHtmlEmpty, stripFormatting, textToHtml } from "./richtext";
 
 describe("textToHtml", () => {
   it("escapes markup and keeps line breaks", () => {
@@ -7,6 +7,28 @@ describe("textToHtml", () => {
   });
   it("returns empty for empty", () => {
     expect(textToHtml("")).toBe("");
+  });
+});
+
+describe("decodeEntities", () => {
+  it("decodes named and numeric references", () => {
+    expect(decodeEntities("a &amp; b &lt;c&gt; &#128512; &#x1F600;")).toBe(
+      "a & b <c> 😀 😀",
+    );
+  });
+
+  it("decodes each reference once (no double-decoding)", () => {
+    // What innerHTML yields for the typed text "&#128512;" / "&lt;".
+    expect(decodeEntities("&amp;#128512;")).toBe("&#128512;");
+    expect(decodeEntities("&amp;lt;")).toBe("&lt;");
+    expect(decodeEntities("&amp;amp;")).toBe("&amp;");
+  });
+
+  it("leaves out-of-range and surrogate code points as literal text", () => {
+    expect(decodeEntities("&#99999999;")).toBe("&#99999999;");
+    expect(decodeEntities("&#x110000;")).toBe("&#x110000;");
+    expect(decodeEntities("&#xD800;")).toBe("&#xD800;");
+    expect(htmlToText("a &#99999999; b")).toBe("a &#99999999; b");
   });
 });
 
@@ -118,6 +140,21 @@ describe("stripFormatting", () => {
     ).toBe('<img src="cid:1" alt="chart">');
     const chip = '<span class="co-mention" contenteditable="false" data-email="a@b.c">@Ann</span>';
     expect(stripFormatting(`<b>${chip} hi</b>`)).toBe(`${chip} hi`);
+  });
+
+  it("rebuilds a mention chip with only its own attributes", () => {
+    const forged =
+      '<span class="co-mention other" id="x" onclick="alert(1)" style="color:red" ' +
+      'contenteditable="false" data-email=\'a"b\'><b>@Ann</b></span>';
+    expect(stripFormatting(forged)).toBe(
+      '<span class="co-mention" contenteditable="false" data-email="a&quot;b">@Ann</span>',
+    );
+    // Hostile text inside the chip is escaped, not kept verbatim.
+    expect(
+      stripFormatting(
+        '<span class="co-mention" data-email="a@b.c"><img src=x>@E</span>',
+      ),
+    ).toBe('<span class="co-mention" contenteditable="false" data-email="a@b.c">@E</span>');
   });
 
   it("escapes text that looks like markup", () => {
