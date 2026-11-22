@@ -886,13 +886,30 @@ impl Core {
         // back into the keyring and no cache entry resurrected for a removed
         // account (account ids are recycled).
         self.tokens.purge(account_id).await;
-        self.db
+        let staged_paths = self
+            .db
             .write(move |conn| {
                 // Unwind address-book names before the cascade drops the cards.
                 repo::carddav::delete_config(conn, account_id)?;
-                repo::accounts::delete(conn, account_id)
+                // The account cascade drops draft_attachments rows; collect
+                // their staged paths first so the files can go with them.
+                let staged: Vec<String> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT da.file_path FROM draft_attachments da
+                         JOIN messages m ON m.id = da.draft_id
+                         WHERE m.account_id = ?1",
+                    )?;
+                    stmt.query_map(rusqlite::params![account_id], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                repo::accounts::delete(conn, account_id)?;
+                Ok(staged)
             })
             .await?;
+        // Root-confined like every staged-path delete: rows pointing outside
+        // the staging root are ignored, and nothing is unlinked until the
+        // account delete has succeeded.
+        remove_staged_draft_files(&self.paths.draft_attachments_dir(), &staged_paths).await;
         let _ = tokio::fs::remove_dir_all(self.paths.mail_dir(account_id)).await;
         let _ = tokio::fs::remove_dir_all(self.paths.attachments_dir(account_id)).await;
         Ok(())
@@ -1842,7 +1859,13 @@ impl Core {
         let (thread_id, nudge_account, staged_paths) = self
             .db
             .write(move |conn| {
-                let row = conn
+                // One transaction: the send cancellation, attachment-row
+                // delete and message delete/move either all commit or none
+                // do. A mid-closure failure (no Trash folder, a payload that
+                // cannot be built) must not leave the draft half-deleted -
+                // its queued send cancelled and its attachment rows gone.
+                let tx = conn.transaction()?;
+                let row = tx
                     .query_row(
                         "SELECT m.account_id, m.thread_id, m.folder_id, m.uid, m.is_draft,
                                 COALESCE(f.role, '')
@@ -1876,7 +1899,7 @@ impl Core {
                 // already claimed is mid-flight, so the delete is refused
                 // rather than racing its attachment read.
                 let send_actions: Vec<(i64, String)> = {
-                    let mut stmt = conn.prepare(
+                    let mut stmt = tx.prepare(
                         "SELECT id, state FROM pending_actions
                          WHERE kind = 'send' AND message_id = ?1
                            AND state IN ('pending','inflight')",
@@ -1891,40 +1914,52 @@ impl Core {
                         "this draft is already being sent".into(),
                     ));
                 }
-                for (action_id, _) in send_actions {
-                    repo::actions::try_cancel(conn, action_id)?;
-                }
+
+                // Fail-fast reads BEFORE any mutation: a server draft needs
+                // a Trash folder and a buildable identity payload, and when
+                // either fails the draft must come out of this call
+                // untouched - not with its send cancelled and its rows gone.
+                let remote_plan = if row.3.is_some() && row.5 != roles::TRASH {
+                    // This draft exists on IMAP and will be moved to Trash.
+                    // Not a "draft is gone" NotFound - the draft is still
+                    // there; the delete itself cannot proceed without
+                    // somewhere to move it, so it is rejected like the other
+                    // un-deletable cases in trash.rs.
+                    let trash = repo::folders::by_role(&tx, row.0, roles::TRASH)?
+                        .ok_or_else(|| CoreError::DeleteRejected("no trash folder".into()))?;
+                    let payload = move_identity_payload(&tx, draft_id, row.2, row.3, trash.id)?;
+                    Some((trash.id, payload))
+                } else {
+                    None
+                };
 
                 // Staged attachment rows never outlive the draft: the local
                 // delete cascades them, but the IMAP-move branch keeps the
                 // message row (in Trash), so drop them explicitly either way.
                 // Their files are removed once the write succeeds.
                 let staged_paths: Vec<String> = {
-                    let mut stmt = conn
-                        .prepare("SELECT file_path FROM draft_attachments WHERE draft_id = ?1")?;
+                    let mut stmt =
+                        tx.prepare("SELECT file_path FROM draft_attachments WHERE draft_id = ?1")?;
                     stmt.query_map(rusqlite::params![draft_id], |r| r.get::<_, String>(0))?
                         .collect::<rusqlite::Result<Vec<_>>>()?
                 };
-                conn.execute(
+
+                for (action_id, _) in send_actions {
+                    repo::actions::try_cancel(&tx, action_id)?;
+                }
+                tx.execute(
                     "DELETE FROM draft_attachments WHERE draft_id = ?1",
                     rusqlite::params![draft_id],
                 )?;
 
                 let mut nudge_account = None;
-                if row.3.is_some() && row.5 != roles::TRASH {
-                    // This draft exists on IMAP. Move it optimistically and
-                    // queue the matching remote move so the next sync cannot
-                    // resurrect the local row in Drafts.
-                    // Not a "draft is gone" NotFound - the draft is still
-                    // there; the delete itself cannot proceed without
-                    // somewhere to move it, so it is rejected like the other
-                    // un-deletable cases in trash.rs.
-                    let trash = repo::folders::by_role(conn, row.0, roles::TRASH)?
-                        .ok_or_else(|| CoreError::DeleteRejected("no trash folder".into()))?;
-                    let payload = move_identity_payload(conn, draft_id, row.2, row.3, trash.id)?;
-                    repo::messages::set_uid_and_folder(conn, draft_id, trash.id, None)?;
+                if let Some((trash_id, payload)) = remote_plan {
+                    // Move it optimistically and queue the matching remote
+                    // move so the next sync cannot resurrect the local row
+                    // in Drafts.
+                    repo::messages::set_uid_and_folder(&tx, draft_id, trash_id, None)?;
                     repo::actions::enqueue(
-                        conn,
+                        &tx,
                         row.0,
                         "trash",
                         Some(draft_id),
@@ -1935,11 +1970,12 @@ impl Core {
                     nudge_account = Some(row.0);
                 } else {
                     // Purely local drafts have no remote copy to preserve.
-                    repo::messages::delete(conn, draft_id)?;
+                    repo::messages::delete(&tx, draft_id)?;
                 }
                 if let Some(tid) = row.1 {
-                    repo::threads::recompute(conn, tid)?;
+                    repo::threads::recompute(&tx, tid)?;
                 }
+                tx.commit()?;
                 Ok((row.1, nudge_account, staged_paths))
             })
             .await?;

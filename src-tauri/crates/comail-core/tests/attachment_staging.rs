@@ -469,3 +469,57 @@ async fn sweep_keeps_entries_with_future_or_unreadable_mtime() {
     assert_eq!(n, 0);
     assert!(future.exists(), "future-mtime entry was swept");
 }
+
+#[tokio::test]
+async fn remove_account_removes_its_staged_draft_attachments() {
+    // remove_account purges credentials, which otherwise hits the OS keyring
+    // and blocks on headless test machines; the insecure file backend is
+    // what the send e2e uses for the same reason.
+    let creds =
+        std::env::temp_dir().join(format!("comail-staging-creds-{}.json", std::process::id()));
+    // SAFETY: set before Core::start, matching the established test idiom.
+    unsafe { std::env::set_var("COMAIL_CREDENTIALS_INSECURE_FILE", &creds) };
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let paths = Paths::for_tests(&data_dir);
+    let core = Core::start(paths.clone()).await.unwrap();
+    core.db
+        .write(|conn| {
+            conn.execute_batch(
+                "INSERT INTO accounts
+                   (id,email,provider,auth_kind,username,imap_host,imap_port,smtp_host,smtp_port,created_at)
+                   VALUES (1,'a@example.com','imap','password','a','h',993,'h',465,0),
+                          (2,'b@example.com','imap','password','b','h',993,'h',465,0);
+                 INSERT INTO folders (id,account_id,imap_name,role)
+                   VALUES (1,1,'Drafts','drafts'), (2,2,'Drafts','drafts');",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let src = tmp.path().join("keep.bin");
+    std::fs::write(&src, b"payload").unwrap();
+    let draft_id = core
+        .save_draft(draft_args(
+            2,
+            vec![DraftAttachmentIn {
+                file_path: src.to_string_lossy().into_owned(),
+                filename: "keep.bin".into(),
+            }],
+        ))
+        .await
+        .unwrap();
+    let stored = stored_paths(&core, draft_id).await;
+    assert_eq!(stored.len(), 1);
+    let staged = std::path::PathBuf::from(&stored[0]);
+    assert!(staged.exists());
+
+    core.remove_account(2).await.unwrap();
+
+    // The account cascade dropped the row AND the staged file went with it;
+    // the per-file subdirectory is pruned too.
+    assert!(!staged.exists(), "staged file left: {staged:?}");
+    assert!(!staged.parent().unwrap().exists());
+}

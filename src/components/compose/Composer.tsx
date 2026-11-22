@@ -209,12 +209,14 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   const [bcc, setBcc] = useState<Address[]>(init.bcc);
   const [subject, setSubject] = useState(init.subject);
   /** rich HTML body (plain-text fallback is derived at save/send time).
-   *  Only editor-safe HTML enters state: the initial value and every
-   *  external setBody (draft load, signature swap, AI output, undo) are
-   *  sanitized at this boundary, so a save of an untouched composer never
-   *  emits raw markup. The editor's own emissions are already clean and
-   *  sanitizeEditorHtml is idempotent, so the extra pass cannot rewrite
-   *  the DOM, move the caret, or mark a pristine draft dirty. */
+   *  Sanitizing happens at the boundaries, not on the editor's own
+   *  emissions: the initial value and every NON-editor setBody (draft
+   *  load, signature swap, AI output, undo) are cleaned here, while the
+   *  editor's onChange stores its emission as-is (it already sanitized
+   *  on the way into the DOM - re-sanitizing would echo a different
+   *  string back into `value`, rewrite innerHTML and move the caret).
+   *  The save path sanitizes once more as the backstop, so save_draft
+   *  never sees raw markup even when nothing was typed. */
   const [body, setBodyState] = useState(() => sanitizeEditorHtml(init.bodyHtml));
   const setBody = useCallback(
     (html: string) => setBodyState(sanitizeEditorHtml(html)),
@@ -1292,7 +1294,11 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
             ref={bodyRef}
             value={body}
             onChange={(html) => {
-              setBody(html);
+              // The editor's own emission, stored verbatim: it is already
+              // DOM-clean, and echoing a re-sanitized string back through
+              // `value` would trigger the external-value sync and move the
+              // caret.
+              setBodyState(html);
               markDirty();
             }}
             placeholder={t("compose:bodyPlaceholder", { mod: MOD_LABEL })}
