@@ -10,6 +10,7 @@ import { useUi } from "../../stores/ui";
 import type { Address, AttachmentMeta, MessageDetail } from "../../ipc/types";
 import { addressName, formatSize, longTime, relativeTime } from "../../lib/format";
 import { adaptDocumentForDarkMode, fixInvisibleText } from "../../lib/emailDark";
+import { bodyLinkAction } from "../../lib/emailBodyLinks";
 import {
   splitQuotedHtml,
   splitQuotedTail,
@@ -580,7 +581,6 @@ function HtmlBody({ html: fullHtml, messageId }: { html: string; messageId: numb
     return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src ${imgSrc}${upgrade}">
 <meta name="referrer" content="no-referrer">
-<base target="_top">
 <style>
   :root { color-scheme: ${scheme}; }
   /* height:auto defeats emails whose layout is sized to height:100% - against
@@ -748,24 +748,27 @@ function HtmlBody({ html: fullHtml, messageId }: { html: string; messageId: numb
       dispatchKeyboardEvent(e);
     });
     // The sandboxed iframe runs no scripts, so links can't reach a browser on
-    // their own. Intercept clicks from out here and hand http(s)/mailto links to
-    // the OS (default browser / mail client). If this ever misses, the link's
-    // target="_top" escalates to a top navigation caught by the Rust
-    // on_navigation backstop.
-    doc.addEventListener(
-      "click",
-      (e) => {
-        const anchor = (e.target as HTMLElement | null)?.closest?.("a[href]") as
-          | HTMLAnchorElement
-          | null;
-        const href = anchor?.href;
-        if (href && /^(https?|mailto):/i.test(href)) {
-          e.preventDefault();
-          void openUrl(href).catch(() => {});
-        }
-      },
-      true,
-    );
+    // their own. Intercept EVERY activation of an anchored link from out here:
+    // http(s)/mailto go to the OS (default browser / mail client), #anchors
+    // keep their native in-document scroll, and anything else (data:, cid:,
+    // javascript:, relative paths) is swallowed so it can never navigate the
+    // iframe or the app window. Middle-click arrives as auxclick; keyboard
+    // activation arrives as a plain click, so both paths land here.
+    const onLinkActivation = (e: Event) => {
+      if (e.type === "auxclick" && (e as MouseEvent).button !== 1) return;
+      const anchor = (e.target as HTMLElement | null)?.closest?.("a[href]") as
+        | HTMLAnchorElement
+        | null;
+      if (!anchor) return;
+      const action = bodyLinkAction(anchor.getAttribute("href"));
+      if (action === "native") return;
+      e.preventDefault();
+      if (action === "external") {
+        void openUrl(anchor.href).catch(() => {});
+      }
+    };
+    doc.addEventListener("click", onLinkActivation, true);
+    doc.addEventListener("auxclick", onLinkActivation, true);
   };
 
   useEffect(() => () => observerRef.current?.disconnect(), []);
@@ -857,11 +860,10 @@ function HtmlBody({ html: fullHtml, messageId }: { html: string; messageId: numb
       <iframe
         ref={iframeRef}
         data-app-iframe
-        // allow-top-navigation-by-user-activation lets a clicked link (base
-        // target="_top") escalate to a top-level navigation, which the Rust
-        // on_navigation backstop intercepts and opens in the OS browser if the
-        // JS click handler below didn't already.
-        sandbox="allow-same-origin allow-top-navigation-by-user-activation"
+        // No allow-top-navigation: every link activation is handled by the
+        // click/auxclick interception in onLoad, so nothing inside the frame
+        // ever needs to navigate the app window.
+        sandbox="allow-same-origin"
         referrerPolicy="no-referrer"
         srcDoc={srcDoc}
         onLoad={onLoad}
