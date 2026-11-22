@@ -95,6 +95,80 @@ describe("updateSettings", () => {
     await expect(updateSettings({ theme: "snow" })).resolves.toBe(false);
     const cached = queryClient.getQueryData<Settings>(["settings"]);
     expect(cached?.theme).toBe("carbon");
-    expect(queryClient.getQueryState(["settings"])?.isInvalidated).toBe(true);
+    // The reconcile refetch is queued behind the write chain, so it lands
+    // after the job resolves.
+    await vi.waitFor(() =>
+      expect(queryClient.getQueryState(["settings"])?.isInvalidated).toBe(true),
+    );
+  });
+
+  it("applies the theme immediately and rolls it back when the write fails", async () => {
+    call.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(REAL);
+      if (cmd === "set_settings") return Promise.reject(new Error("save failed"));
+      return Promise.resolve(undefined);
+    });
+    useUi.setState({ theme: "carbon" });
+    const p = updateSettings({ theme: "snow" });
+    // The UI flips synchronously, before the queued write even starts.
+    expect(useUi.getState().theme).toBe("snow");
+    await expect(p).resolves.toBe(false);
+    expect(useUi.getState().theme).toBe("carbon");
+  });
+
+  it("rolls the theme back when settings cannot be loaded", async () => {
+    call.mockImplementation((cmd: string) =>
+      cmd === "get_settings" ? Promise.reject(new Error("ipc down")) : Promise.resolve(undefined),
+    );
+    useUi.setState({ theme: "carbon" });
+    await expect(updateSettings({ theme: "snow" })).resolves.toBe(false);
+    expect(useUi.getState().theme).toBe("carbon");
+    expect(savedSettings()).toHaveLength(0);
+  });
+
+  it("does not let a later theme patch be reverted by an earlier failure", async () => {
+    let first = true;
+    call.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(REAL);
+      if (cmd === "set_settings") {
+        const fail = first;
+        first = false;
+        return fail ? Promise.reject(new Error("save failed")) : Promise.resolve(undefined);
+      }
+      return Promise.resolve(undefined);
+    });
+    useUi.setState({ theme: "system" });
+    const p1 = updateSettings({ theme: "snow" });
+    const p2 = updateSettings({ theme: "carbon" });
+    await expect(p1).resolves.toBe(false);
+    await expect(p2).resolves.toBe(true);
+    // The second patch won and stays.
+    expect(useUi.getState().theme).toBe("carbon");
+  });
+
+  it("keeps a later write's patch after an earlier write fails", async () => {
+    let first = true;
+    call.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(REAL);
+      if (cmd === "set_settings") {
+        const fail = first;
+        first = false;
+        return fail ? Promise.reject(new Error("save failed")) : Promise.resolve(undefined);
+      }
+      return Promise.resolve(undefined);
+    });
+    const p1 = updateSettings({ aiModel: "m1" });
+    const p2 = updateSettings({ notificationsEnabled: false });
+    await expect(p1).resolves.toBe(false);
+    await expect(p2).resolves.toBe(true);
+    // Final cache and the persisted value are the base with only patch B -
+    // the failed patch is rolled back, not half-applied.
+    const [firstSaved, secondSaved] = savedSettings();
+    expect(firstSaved.aiModel).toBe("m1");
+    expect(secondSaved.notificationsEnabled).toBe(false);
+    expect(secondSaved.aiModel).toBe(REAL.aiModel);
+    const cached = queryClient.getQueryData<Settings>(["settings"]);
+    expect(cached?.aiModel).toBe(REAL.aiModel);
+    expect(cached?.notificationsEnabled).toBe(false);
   });
 });
