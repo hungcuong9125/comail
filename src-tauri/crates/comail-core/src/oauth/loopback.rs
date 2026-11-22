@@ -52,13 +52,27 @@ impl LoopbackServer {
         format!("http://localhost:{}/", self.port)
     }
 
-    /// Wait for the OAuth redirect carrying `?code=...&state=...` (or
-    /// `?error=...`). Each accepted connection runs on its own task under a
-    /// short read deadline: browsers routinely open speculative connections
+    /// Wait for the OAuth redirect carrying `?code=...&state=<expected_state>`
+    /// (or `?error=...`). Each accepted connection runs on its own task under
+    /// a short read deadline: browsers routinely open speculative connections
     /// that send nothing, and awaiting one inline would block the real
-    /// redirect until the outer timeout.
-    pub async fn wait_for_code(self, timeout: Duration) -> Result<AuthCode> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Option<AuthCode>>>(32);
+    /// redirect until the outer timeout. Outstanding handler tasks are
+    /// aborted when this returns — on success, error, or timeout.
+    ///
+    /// `expected_state` is the value sent to the provider: a request carrying
+    /// `code`/`error` whose state does not match is a stray or forged local
+    /// request — it gets a neutral rejection and the wait continues, so a
+    /// forged local request can neither end the sign-in early nor see the
+    /// "connected" page.
+    pub async fn wait_for_code(self, expected_state: &str, timeout: Duration) -> Result<AuthCode> {
+        /// Bound on concurrent connection handlers: past the cap a connection
+        /// is closed immediately — each handler costs little, but a flood of
+        /// localhost connections must not pile them up unboundedly.
+        const MAX_CONNS: usize = 16;
+        let expected: std::sync::Arc<str> = std::sync::Arc::from(expected_state);
+        // JoinSet aborts every outstanding task on drop — so returning (or
+        // the outer timeout dropping `fut`) cancels the handlers.
+        let mut tasks = tokio::task::JoinSet::new();
         let fut = async {
             loop {
                 tokio::select! {
@@ -72,18 +86,24 @@ impl LoopbackServer {
                         }
                     } => {
                         let (stream, _) = accept?;
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let _ = tx.send(handle_connection(stream).await).await;
-                        });
+                        if tasks.len() >= MAX_CONNS {
+                            drop(stream);
+                            continue;
+                        }
+                        let expected = expected.clone();
+                        tasks.spawn(async move { handle_connection(stream, &expected).await });
                     }
-                    msg = rx.recv() => match msg {
+                    msg = tasks.join_next(), if !tasks.is_empty() => match msg {
                         // The real redirect: done.
-                        Some(Ok(Some(code))) => return Ok(code),
-                        // OAuth error or unreadable request: abort sign-in.
-                        Some(Err(e)) => return Err(e),
-                        // A speculative/garbage connection was dropped; or the
-                        // channel drained (impossible — we hold `tx`).
+                        Some(Ok(Ok(Some(code)))) => return Ok(code),
+                        // OAuth error: abort sign-in.
+                        Some(Ok(Err(e))) => return Err(e),
+                        // A handler panicked: surface it rather than hanging.
+                        Some(Err(e)) if e.is_panic() => {
+                            return Err(CoreError::Other(format!("oauth loopback task: {e}")));
+                        }
+                        // A speculative/garbage/state-mismatched connection
+                        // was dropped; or a handler was cancelled.
                         _ => {}
                     },
                 }
@@ -151,10 +171,15 @@ async fn read_request_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
 }
 
 /// Handle one accepted connection. Returns `Ok(Some(code))` on a callback
-/// carrying a code, `Err` if the provider redirected back with an error, and
-/// `Ok(None)` for connections we should ignore (dropped/speculative/stray
-/// requests — browsers also fire `GET /favicon.ico` at localhost pages).
-async fn handle_connection(mut stream: TcpStream) -> Result<Option<AuthCode>> {
+/// carrying a code and the expected state, `Err` if the provider redirected
+/// back with an error (also state-checked), and `Ok(None)` for connections
+/// we should ignore (dropped/speculative/stray requests — browsers also fire
+/// `GET /favicon.ico` at localhost pages — or OAuth-looking requests whose
+/// state does not match).
+async fn handle_connection(
+    mut stream: TcpStream,
+    expected_state: &str,
+) -> Result<Option<AuthCode>> {
     let Some(req_bytes) = read_request_head(&mut stream).await else {
         return Ok(None);
     };
@@ -164,6 +189,23 @@ async fn handle_connection(mut stream: TcpStream) -> Result<Option<AuthCode>> {
     let path = first_line.split_whitespace().nth(1).unwrap_or("");
     let query = path.split_once('?').map(|x| x.1).unwrap_or("");
     let (code, state, error) = parse_callback_query(query);
+    // A request carrying an OAuth response must echo the exact `state` we
+    // sent. Anything else — a stray request that happens to have a `code`, or
+    // a forged local request — is rejected with a neutral 400 and the wait
+    // continues: it must neither end the sign-in early nor be shown the
+    // "connected" page.
+    if (code.is_some() || error.is_some()) && state.as_deref() != Some(expected_state) {
+        tracing::warn!("oauth: loopback callback with wrong state ignored");
+        let body = "<html><body><h2>Bad request.</h2></body></html>";
+        let resp = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.shutdown().await;
+        return Ok(None);
+    }
     let body = if code.is_some() {
         "<html><body style=\"font-family:sans-serif;padding:4rem;text-align:center\">\
          <h2>Comail is connected.</h2><p>You can close this tab.</p></body></html>"
@@ -193,15 +235,26 @@ async fn handle_connection(mut stream: TcpStream) -> Result<Option<AuthCode>> {
 mod tests {
     use super::*;
 
-    fn spawn_waiter(server: LoopbackServer) -> tokio::task::JoinHandle<Result<AuthCode>> {
-        tokio::spawn(async move { server.wait_for_code(Duration::from_secs(30)).await })
+    fn spawn_waiter(
+        server: LoopbackServer,
+        expected_state: &'static str,
+    ) -> tokio::task::JoinHandle<Result<AuthCode>> {
+        tokio::spawn(async move {
+            server
+                .wait_for_code(expected_state, Duration::from_secs(30))
+                .await
+        })
     }
 
-    async fn get(port: u16, target: &str) {
+    /// Send a request and return the response head (status line included).
+    async fn get(port: u16, target: &str) -> String {
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         s.write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
             .await
             .unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut buf)).await;
+        String::from_utf8_lossy(&buf).into_owned()
     }
 
     #[test]
@@ -237,12 +290,13 @@ mod tests {
     async fn silent_connection_does_not_block_the_real_redirect() {
         let server = LoopbackServer::bind().await.unwrap();
         let port = server.port;
-        let waiter = spawn_waiter(server);
+        let waiter = spawn_waiter(server, "xyz");
         // A speculative preconnect that never sends a request must not stall
         // acceptance of the real redirect (the old code awaited it inline).
         let _silent = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        get(port, "/?code=abc&state=xyz").await;
+        let resp = get(port, "/?code=abc&state=xyz").await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         let code = tokio::time::timeout(Duration::from_secs(3), waiter)
             .await
             .unwrap()
@@ -256,7 +310,7 @@ mod tests {
     async fn request_split_across_writes_is_reassembled() {
         let server = LoopbackServer::bind().await.unwrap();
         let port = server.port;
-        let waiter = spawn_waiter(server);
+        let waiter = spawn_waiter(server, "xy");
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         // The request line arrives in two TCP segments; a single `read`
         // (the old code) would truncate the query.
@@ -278,7 +332,7 @@ mod tests {
     async fn oauth_error_aborts_the_wait() {
         let server = LoopbackServer::bind().await.unwrap();
         let port = server.port;
-        let waiter = spawn_waiter(server);
+        let waiter = spawn_waiter(server, "s");
         get(port, "/?error=access_denied&state=s").await;
         let res = tokio::time::timeout(Duration::from_secs(3), waiter)
             .await
@@ -286,5 +340,68 @@ mod tests {
             .unwrap();
         let err = res.err().expect("oauth error should abort the wait");
         assert!(err.to_string().contains("access_denied"));
+    }
+
+    #[tokio::test]
+    async fn wrong_state_code_is_rejected_then_real_redirect_succeeds() {
+        // A forged local request with a `code` but the wrong state must not
+        // end the sign-in: it gets a neutral 400 and the wait continues.
+        let server = LoopbackServer::bind().await.unwrap();
+        let port = server.port;
+        let waiter = spawn_waiter(server, "good");
+        let resp = get(port, "/?code=forged&state=evil").await;
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(!waiter.is_finished(), "wrong-state callback ended the wait");
+        let resp = get(port, "/?code=real&state=good").await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let code = tokio::time::timeout(Duration::from_secs(3), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(code.code, "real");
+    }
+
+    #[tokio::test]
+    async fn wrong_state_error_does_not_end_the_wait() {
+        // Same for the error form: `?error=` carrying a wrong state is a
+        // stray/forged request, not the provider's answer.
+        let server = LoopbackServer::bind().await.unwrap();
+        let port = server.port;
+        let waiter = spawn_waiter(server, "good");
+        let resp = get(port, "/?error=access_denied&state=evil").await;
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(!waiter.is_finished(), "wrong-state error ended the wait");
+        get(port, "/?code=real&state=good").await;
+        let code = tokio::time::timeout(Duration::from_secs(3), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(code.code, "real");
+    }
+
+    #[tokio::test]
+    async fn connections_beyond_the_cap_are_closed_immediately() {
+        let server = LoopbackServer::bind().await.unwrap();
+        let port = server.port;
+        let waiter = spawn_waiter(server, "good");
+        // Fill every handler slot with silent connections.
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            held.push(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The next connection is refused promptly: closed without a response.
+        let mut extra = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut buf = [0u8; 64];
+        let res = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut buf)).await;
+        match res {
+            Ok(Ok(0)) => {}
+            other => panic!("expected immediate close, got {other:?}"),
+        }
+        drop(held);
+        drop(extra);
+        waiter.abort();
     }
 }

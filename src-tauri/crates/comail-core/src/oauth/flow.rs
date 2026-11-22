@@ -126,10 +126,12 @@ pub async fn authorize_with(
     open_url(auth_url);
 
     let code = server
-        .wait_for_code(std::time::Duration::from_secs(300))
+        .wait_for_code(&state, std::time::Duration::from_secs(300))
         .await
         .inspect_err(|e| tracing::warn!(?provider, error = %e, "oauth: no usable callback"))?;
     tracing::info!(?provider, "oauth: authorization code received");
+    // The listener already only completes on a matching state; keep the
+    // explicit check as a second line of defense.
     if code.state.as_deref() != Some(state.as_str()) {
         tracing::warn!(?provider, "oauth: state mismatch on callback");
         return Err(CoreError::Auth("oauth state mismatch".into()));
