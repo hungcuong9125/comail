@@ -282,8 +282,14 @@ pub struct ChatMessage {
 
 /// Non-streaming response cap. Chat completions are tens of KB at most;
 /// 16 MB is far beyond any real answer and stops a hostile endpoint from
-/// growing memory unboundedly.
+/// growing memory unboundedly. Streaming responses share the same cap on the
+/// total bytes assembled.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Cap on a single buffered SSE event — the bytes accumulated while waiting
+/// for a newline. Real `data:` events are KBs; a server sending an endless
+/// line must not grow memory unboundedly.
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 
 async fn read_all<S>(mut stream: S, req: &str, timeout_secs: u64) -> Result<Vec<u8>>
 where
@@ -859,6 +865,7 @@ pub async fn chat_tools_stream(
             // `index` is server-controlled and grows `calls` by slot; bound it
             // so a hostile or broken endpoint can't allocate absurd vectors.
             if i >= MAX_TOOL_CALLS {
+                tracing::warn!(index = i, "ai: ignoring out-of-range tool-call index");
                 continue;
             }
             while calls.len() <= i {
@@ -1041,6 +1048,7 @@ where
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut header_done = false;
+    let mut total_bytes: usize = 0;
 
     loop {
         let n = match tokio::time::timeout(idle, stream.read(&mut chunk)).await {
@@ -1061,7 +1069,17 @@ where
         if n == 0 {
             break;
         }
+        total_bytes += n;
+        if total_bytes > MAX_RESPONSE_BYTES {
+            return Err(CoreError::Other("ai stream too large".into()));
+        }
         buf.extend_from_slice(&chunk[..n]);
+        // `buf` below only holds the not-yet-newline-terminated remainder of
+        // one event (plus the header until it completes): bound it so a
+        // never-ending line can't grow memory.
+        if buf.len() > MAX_SSE_EVENT_BYTES {
+            return Err(CoreError::Other("ai stream event too large".into()));
+        }
 
         if !header_done {
             let Some(pos) = find_subslice(&buf, b"\r\n\r\n") else {
@@ -2600,5 +2618,61 @@ mod http_tests {
         };
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "search_inbox");
+    }
+
+    #[tokio::test]
+    async fn stream_sse_rejects_an_endless_event_line() {
+        use tokio::net::TcpStream;
+        // A single `data:` line beyond the 1 MiB event cap must error rather
+        // than buffer forever.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req).await;
+            s.write_all(b"HTTP/1.0 200 OK\r\n\r\ndata: ").await.unwrap();
+            let big = vec![b'x'; MAX_SSE_EVENT_BYTES + 4096];
+            let _ = s.write_all(&big).await; // no newline: one endless event
+            let _ = s.shutdown().await;
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut sink = |_: &serde_json::Value| {};
+        let err = stream_sse(stream, "GET / HTTP/1.0\r\n\r\n", &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("event too large"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stream_sse_caps_total_assembled_bytes() {
+        use tokio::net::TcpStream;
+        // Events each under the line cap but totalling over the 16 MiB total
+        // cap must error out mid-stream.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req).await;
+            s.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await.unwrap();
+            // 17 events of ~1 MiB each (newline-terminated, under the event
+            // cap) — 17 MiB total.
+            let mut line = b"data: ".to_vec();
+            line.resize(MAX_SSE_EVENT_BYTES - 8, b'x');
+            line.push(b'\n');
+            for _ in 0..17 {
+                if s.write_all(&line).await.is_err() {
+                    break; // client already errored and hung up
+                }
+            }
+            let _ = s.shutdown().await;
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut sink = |_: &serde_json::Value| {};
+        let err = stream_sse(stream, "GET / HTTP/1.0\r\n\r\n", &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
     }
 }
