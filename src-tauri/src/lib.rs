@@ -465,6 +465,7 @@ pub fn run() {
             commands::pick_draft_attachments,
             commands::claim_dropped_attachments,
             commands::prepare_forward_attachment,
+            commands::release_attachment_tokens,
             commands::save_draft,
             commands::get_draft,
             commands::delete_draft,

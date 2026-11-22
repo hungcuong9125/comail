@@ -556,6 +556,26 @@ impl AttachmentApprovals {
         }
     }
 
+    /// Drop approvals the caller will never save with - a removed chip, an
+    /// unticked forward set, or a composer closing without sending. Frees
+    /// their `pending_bytes` immediately instead of waiting out the TTL.
+    /// Tokens checked out by an in-flight save are left alone (the guard
+    /// settles them), and the nonce must match the approval's: one
+    /// composer cannot release another's tokens.
+    pub(crate) fn release(&self, tokens: &[String], nonce: &Option<String>) {
+        let mut inner = self.inner.lock().unwrap();
+        for t in tokens {
+            if inner.in_flight.contains(t) {
+                continue;
+            }
+            if let Some(a) = inner.approvals.get(t)
+                && &a.nonce == nonce
+            {
+                inner.approvals.remove(t);
+            }
+        }
+    }
+
     /// Total source bytes of approvals bound to `nonce` that a save has not
     /// consumed yet (live + in-flight). Bounds the in-flight queue of
     /// prepared forward attachments per composer session, so a
@@ -808,6 +828,46 @@ mod tests {
         assert_eq!(reg.pending_bytes(&nonce), 1);
         // ...and commit (consumed) frees the budget.
         reg.commit(std::slice::from_ref(&minted[0].token));
+        assert_eq!(reg.pending_bytes(&nonce), 0);
+    }
+
+    #[test]
+    fn release_frees_pending_budget_but_only_for_the_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AttachmentApprovals::default();
+        let f = tmp_file(tmp.path(), "f.txt"); // 1 byte
+        let nonce = Some("session-a".to_string());
+        let minted = reg.approve(vec![f], nonce.clone()).unwrap();
+        assert_eq!(reg.pending_bytes(&nonce), 1);
+        // A different nonce cannot release session-a's approval.
+        reg.release(
+            &minted.iter().map(|a| a.token.clone()).collect::<Vec<_>>(),
+            &Some("session-b".into()),
+        );
+        assert_eq!(reg.pending_bytes(&nonce), 1);
+        // The owning nonce frees the budget immediately.
+        reg.release(
+            &minted.iter().map(|a| a.token.clone()).collect::<Vec<_>>(),
+            &nonce,
+        );
+        assert_eq!(reg.pending_bytes(&nonce), 0);
+    }
+
+    #[test]
+    fn release_leaves_in_flight_tokens_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AttachmentApprovals::default();
+        let f = tmp_file(tmp.path(), "f.txt"); // 1 byte
+        let nonce = Some("session-a".to_string());
+        let minted = reg.approve(vec![f], nonce.clone()).unwrap();
+        let tokens: Vec<String> = minted.iter().map(|a| a.token.clone()).collect();
+        reg.checkout(&tokens[0], &nonce).unwrap(); // a save holds it now
+        reg.release(&tokens, &nonce);
+        // Still in flight: the save's guard settles it, not release.
+        assert_eq!(reg.pending_bytes(&nonce), 1);
+        reg.rollback(&tokens);
+        // Back to unconsumed - now release works.
+        reg.release(&tokens, &nonce);
         assert_eq!(reg.pending_bytes(&nonce), 0);
     }
 
