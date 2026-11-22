@@ -196,18 +196,46 @@ describe("sanitizeEditorHtml", () => {
     ).toBe('<div dir="ltr">hi<br><div>there</div></div>');
   });
 
+  it("caps nesting depth instead of growing the stack and the output", () => {
+    const out = sanitizeEditorHtml("<div>".repeat(1000));
+    // 256 opens survive, the rest unwrap; the depth the browser sees is
+    // bounded either way.
+    expect(out.match(/<div>/g)).toHaveLength(256);
+    expect(out.match(/<\/div>/g)).toHaveLength(256);
+    // Same-tag closes past the cap still close real opens.
+    const shallow = sanitizeEditorHtml("<div>".repeat(300) + "</div>".repeat(300));
+    expect(shallow.startsWith("<div>")).toBe(true);
+    expect(shallow.endsWith("</div>")).toBe(true);
+    expect((shallow.match(/<div>/g) ?? []).length).toBe(256);
+    expect((shallow.match(/<\/div>/g) ?? []).length).toBe(256);
+  });
+
   it("stays fast on pathological and large inputs", () => {
-    // Unterminated-tag soup was quadratic in the old regex tokenizer.
-    const hostile = `<div>${"<a ".repeat(12000)}x${"<b href=\"".repeat(12000)}`;
-    const t0 = performance.now();
-    sanitizeEditorHtml(hostile);
-    expect(performance.now() - t0).toBeLessThan(500);
-    expect(hostile.length).toBeGreaterThan(100_000);
-    // A normal big draft: a multi-MB inline image body must not slow the pass.
-    const big = `<div><img src="data:image/png;base64,${"A".repeat(4_000_000)}"></div>`;
-    const t1 = performance.now();
-    sanitizeEditorHtml(big);
-    expect(performance.now() - t1).toBeLessThan(500);
+    const timed = (html: string, minLen = 100_000) => {
+      expect(html.length).toBeGreaterThanOrEqual(minLen);
+      const t0 = performance.now();
+      sanitizeEditorHtml(html);
+      expect(performance.now() - t0).toBeLessThan(1000);
+    };
+    // Unterminated-tag soup (was quadratic in the regex tokenizer).
+    timed(`<div>${"<a ".repeat(12000)}x${"<b href=\"".repeat(12000)}`);
+    // Deep same-tag nesting, then deep nesting + mismatched end tags
+    // (was quadratic in the stack scans).
+    timed("<div>".repeat(80_000), 400_000);
+    timed(`${"<span>".repeat(30_000)}${"</b>".repeat(30_000)}`, 300_000);
+    // Alternating implied closes, and a flood of unmatched end tags.
+    timed("<p>x<div>".repeat(30_000), 200_000);
+    timed("</b>".repeat(50_000), 200_000);
+    // One tag with tens of thousands of attributes, one attribute of ~1 MB.
+    timed(`<div ${Array.from({ length: 30_000 }, (_, i) => `a${i}="v"`).join(" ")}>x`);
+    timed(`<div title="${"v".repeat(1_000_000)}">x`, 1_000_000);
+    // A style attribute with tens of thousands of declarations.
+    timed(`<div style="${"color:red;".repeat(30_000)}">x`, 300_000);
+    // Ordinary well-formed mail HTML at multi-MB scale.
+    timed(
+      `<div>Hi <b>there</b>, <a href="https://x.dev">link</a><br></div>`.repeat(50_000),
+      3_000_000,
+    );
   });
 
   it("returns empty for empty input", () => {

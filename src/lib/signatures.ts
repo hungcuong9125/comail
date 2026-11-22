@@ -183,6 +183,17 @@ const CLOSES_P = new Set([
 const TABLE_PARTS = new Set(["table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup"]);
 const CELL_SCOPE = new Set(["table", "td", "th", "caption"]);
 
+/** Deepest nesting the output keeps. Past it, open tags unwrap (children
+ *  stay as content) so adversarial markup can't grow the stack scan, the
+ *  emitted string, or the depth the browser's own parser has to handle. */
+const MAX_OPEN = 256;
+
+/** Pre-compiled end-tag finders for the raw-text elements, used with exec +
+ *  lastIndex so the tail is never copied per element. */
+const RAW_END_RE = new Map(
+  [...RAW_TEXT].map((tag) => [tag, new RegExp(`</${tag}[\\s/>]`, "gi")]),
+);
+
 /** A start or end tag, scanned manually (see scanTag). `attrs` is the raw
  *  text between the tag name and `>`; `raw` the whole `<...>` token. */
 interface TagToken {
@@ -474,35 +485,48 @@ function cleanAttrs(
 /** The shared tokenizer behind sanitizeSignatureHtml / sanitizeEditorHtml. */
 function sanitizeWith(profile: SanitizeProfile, html: string): string {
   const src = html.replace(/\0/g, "");
+  /** Open element tags, innermost last, plus per tag name the ascending stack
+   *  of indexes it occupies - the tail is its innermost occurrence, so
+   *  findOpen/closeNearest are O(1) and closeTo amortizes (each element is
+   *  pushed once and popped once over the whole pass). */
   const open: string[] = [];
-  let out = "";
+  const slots = new Map<string, number[]>();
+  const parts: string[] = [];
   let pos = 0;
   /** Inside a dropped element: its tag and nesting depth. */
   let skip: { tag: string; depth: number } | null = null;
 
   const text = (s: string) => {
-    if (!skip) out += s.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    if (!skip) parts.push(s.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+  };
+  /** Index of tag's innermost open element, or -1 when none is open. */
+  const topmost = (tag: string) => {
+    const list = slots.get(tag);
+    return list && list.length ? list[list.length - 1] : -1;
   };
   const closeTo = (i: number) => {
-    while (open.length > i) out += `</${open.pop()}>`;
-  };
-  /** Close the nearest open `targets` element unless a `stops` one comes first. */
-  const closeNearest = (targets: readonly string[], stops: readonly string[]) => {
-    for (let i = open.length - 1; i >= 0; i -= 1) {
-      if (targets.includes(open[i])) return closeTo(i);
-      if (stops.includes(open[i])) return;
+    while (open.length > i) {
+      const tag = open.pop()!;
+      slots.get(tag)!.pop();
+      parts.push(`</${tag}>`);
     }
+  };
+  /** Close the innermost open `targets` element unless a `stops` element sits
+   *  above it: the highest position among each decides, as a scan down the
+   *  stack did before. */
+  const closeNearest = (targets: readonly string[], stops: readonly string[]) => {
+    const t = Math.max(...targets.map(topmost));
+    const s = Math.max(-1, ...stops.map(topmost));
+    if (t > s) closeTo(t);
   };
   /** The open element an end tag closes, or -1 to ignore it. As in a browser,
-   *  an end tag doesn't reach out of the cell (table parts: the table) it is in. */
+   *  an end tag doesn't reach out of the cell (table parts: the table) it is
+   *  in - a boundary element above the candidate blocks the match. */
   const findOpen = (tag: string): number => {
-    for (let i = open.length - 1; i >= 0; i -= 1) {
-      if (open[i] === tag) return i;
-      if (tag !== "table" && (TABLE_PARTS.has(tag) ? open[i] === "table" : CELL_SCOPE.has(open[i]))) {
-        return -1;
-      }
-    }
-    return -1;
+    const i = topmost(tag);
+    if (i < 0 || tag === "table") return i;
+    if (TABLE_PARTS.has(tag)) return topmost("table") > i ? -1 : i;
+    return Math.max(...[...CELL_SCOPE].map(topmost)) > i ? -1 : i;
   };
 
   while (pos < src.length) {
@@ -555,8 +579,12 @@ function sanitizeWith(profile: SanitizeProfile, html: string): string {
       continue;
     }
     if (profile.rawText.has(tag)) {
-      const end = src.slice(pos).search(new RegExp(`</${tag}[\\s/>]`, "i"));
-      pos = end < 0 ? src.length : pos + end;
+      // Skip straight to the end tag: exec from lastIndex scans forward
+      // without copying the tail.
+      const re = RAW_END_RE.get(tag) ?? new RegExp(`</${tag}[\\s/>]`, "gi");
+      re.lastIndex = pos;
+      const m = re.exec(src);
+      pos = m ? m.index : src.length;
       continue;
     }
     if (profile.dropped.has(tag)) {
@@ -575,12 +603,20 @@ function sanitizeWith(profile: SanitizeProfile, html: string): string {
     else if (tag === "thead" || tag === "tbody" || tag === "tfoot") {
       closeNearest(["thead", "tbody", "tfoot"], ["table"]);
     }
-    out += `<${tag}${attrs}>`;
-    if (!VOID.has(tag)) open.push(tag);
+    // Over the depth cap the tag unwraps: its children keep flowing inside
+    // the current context, the element itself never opens.
+    if (!VOID.has(tag) && open.length >= MAX_OPEN) continue;
+    parts.push(`<${tag}${attrs}>`);
+    if (!VOID.has(tag)) {
+      open.push(tag);
+      let list = slots.get(tag);
+      if (!list) slots.set(tag, (list = []));
+      list.push(open.length - 1);
+    }
   }
   text(src.slice(pos));
   closeTo(0);
-  return out;
+  return parts.join("");
 }
 
 /**
