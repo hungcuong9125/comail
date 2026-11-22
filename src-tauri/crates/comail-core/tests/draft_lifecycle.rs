@@ -412,8 +412,38 @@ async fn delete_draft_refuses_while_its_send_is_in_flight() {
 
 #[tokio::test]
 async fn deleting_a_remote_draft_without_a_trash_folder_is_rejected_not_gone() {
-    let (_tmp, core) = setup().await;
-    let draft_id = core.save_draft(args(None)).await.unwrap();
+    let (tmp, core) = setup().await;
+    // A server draft with a staged attachment and a queued send: the rejected
+    // delete must leave ALL of it - the row, the attachment rows and files,
+    // and the pending send action - exactly as it was.
+    let src = tmp.path().join("keep.bin");
+    std::fs::write(&src, b"payload").unwrap();
+    let draft_id = core
+        .save_draft(args(Some(DraftAttachmentIn {
+            file_path: src.to_string_lossy().into_owned(),
+            filename: "keep.bin".into(),
+        })))
+        .await
+        .unwrap();
+    let send = core
+        .queue_send(QueueSendArgs {
+            draft_id,
+            send_at: Some(now_ms() + 3_600_000),
+        })
+        .await
+        .unwrap();
+    let staged_path: String = core
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT file_path FROM draft_attachments WHERE draft_id = ?1",
+                [draft_id],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
     core.db
         .write(move |conn| {
             conn.execute("UPDATE messages SET uid = 42 WHERE id = ?1", [draft_id])?;
@@ -431,17 +461,36 @@ async fn deleting_a_remote_draft_without_a_trash_folder_is_rejected_not_gone() {
         matches!(err, comail_core::error::CoreError::DeleteRejected(_)),
         "expected DeleteRejected, got {err:?}"
     );
-    let (is_draft, uid): (i64, Option<i64>) = core
+    let (is_draft, uid, att_rows, send_state): (i64, Option<i64>, i64, String) = core
         .db
         .read(move |conn| {
-            conn.query_row(
+            let (is_draft, uid) = conn.query_row(
                 "SELECT is_draft, uid FROM messages WHERE id = ?1",
                 [draft_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(Into::into)
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )?;
+            let att_rows = conn.query_row(
+                "SELECT COUNT(*) FROM draft_attachments WHERE draft_id = ?1",
+                [draft_id],
+                |row| row.get(0),
+            )?;
+            let send_state = conn.query_row(
+                "SELECT state FROM pending_actions WHERE id = ?1",
+                [send.action_id],
+                |row| row.get(0),
+            )?;
+            Ok((is_draft, uid, att_rows, send_state))
         })
         .await
         .unwrap();
     assert_eq!((is_draft, uid), (1, Some(42)), "draft must be untouched");
+    assert_eq!(
+        att_rows, 1,
+        "attachment rows must survive a rejected delete"
+    );
+    assert_eq!(send_state, "pending", "queued send must not be cancelled");
+    assert!(
+        std::path::Path::new(&staged_path).exists(),
+        "staged file must survive a rejected delete"
+    );
 }
