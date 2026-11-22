@@ -1295,7 +1295,7 @@ async fn send_action(
         .cloned()
         .collect();
     let account_id = config.id;
-    let thread_id = ctx
+    let (thread_id, staged_paths) = ctx
         .db
         .write(move |conn| {
             let tx = conn.transaction()?;
@@ -1313,6 +1313,21 @@ async fn send_action(
                 "DELETE FROM drafts_meta WHERE message_id = ?1",
                 rusqlite::params![draft_id],
             )?;
+            // The staged-attachment rows go with the draft, atomically with
+            // the is_draft flip: if this transaction fails the action retries
+            // and the retry re-reads rows and files exactly as at dispatch.
+            // The files themselves are removed only after commit, since a
+            // retry can no longer happen once it succeeds.
+            let staged_paths: Vec<String> = {
+                let mut stmt =
+                    tx.prepare("SELECT file_path FROM draft_attachments WHERE draft_id = ?1")?;
+                stmt.query_map(rusqlite::params![draft_id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            tx.execute(
+                "DELETE FROM draft_attachments WHERE draft_id = ?1",
+                rusqlite::params![draft_id],
+            )?;
             let tid: Option<i64> =
                 repo::messages::get_row(&tx, draft_id)?.and_then(|r| r.thread_id);
             if let Some(tid) = tid {
@@ -1320,9 +1335,13 @@ async fn send_action(
             }
             repo::search::index_message(&tx, draft_id)?;
             tx.commit()?;
-            Ok(tid)
+            Ok((tid, staged_paths))
         })
         .await?;
+    // Send is durably complete; the staged copies have no remaining reader.
+    // Removal is confined to the staging root and is best-effort - anything
+    // left behind is reclaimed by the startup sweep.
+    crate::remove_staged_draft_files(&ctx.paths.draft_attachments_dir(), &staged_paths).await;
 
     if let Some(tid) = thread_id {
         ctx.bus.emit(CoreEvent::MailUpdated {

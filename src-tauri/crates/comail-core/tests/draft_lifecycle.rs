@@ -198,3 +198,126 @@ async fn deleting_a_remote_draft_queues_trash_instead_of_allowing_resurrection()
             .is_empty()
     );
 }
+
+// -----------------------------------------------------------------------
+// is_draft-gated update: `save_draft` must refuse non-draft message ids.
+// The id of a sent or inbound message used to get its body, snippet and
+// attachment rows overwritten; the gated UPDATE now fails the save.
+// -----------------------------------------------------------------------
+
+fn update_args(draft_id: i64) -> SaveDraftArgs {
+    SaveDraftArgs {
+        draft_id: Some(draft_id),
+        ..args(None)
+    }
+}
+
+async fn seed_real_message(core: &Core, id: i64, outgoing: bool) {
+    core.db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO messages
+                   (id,account_id,thread_id,folder_id,uid,message_id,subject,date,is_read,
+                    is_draft,is_outgoing,has_attachments,snippet,body_state)
+                 VALUES (?1,1,NULL,2,?1,?2,'keep me',1000,1,0,?3,0,'orig snippet','cached')",
+                rusqlite::params![id, format!("<m{id}@x>"), outgoing as i64],
+            )?;
+            conn.execute(
+                "INSERT INTO message_bodies (message_id,text_body,html_body)
+                 VALUES (?1,'orig text','<p>orig</p>')",
+                [id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn assert_message_untouched(core: &Core, id: i64) {
+    core.db
+        .read(move |conn| {
+            let (subject, snippet, has_atts, body_state): (String, String, i64, String) = conn
+                .query_row(
+                    "SELECT subject, snippet, has_attachments, body_state FROM messages WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+            assert_eq!(subject, "keep me");
+            assert_eq!(snippet, "orig snippet");
+            assert_eq!(has_atts, 0);
+            assert_eq!(body_state, "cached");
+            let (text, html): (String, String) = conn.query_row(
+                "SELECT text_body, html_body FROM message_bodies WHERE message_id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(text, "orig text");
+            assert_eq!(html, "<p>orig</p>");
+            let att_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM draft_attachments WHERE draft_id = ?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(att_rows, 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn save_draft_refuses_sent_message_id() {
+    let (_tmp, core) = setup().await;
+    let sent_id = 910_i64;
+    seed_real_message(&core, sent_id, true).await;
+
+    let err = core.save_draft(update_args(sent_id)).await.unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::NotFound(_)),
+        "expected NotFound, got {err:?}"
+    );
+    assert_message_untouched(&core, sent_id).await;
+}
+
+#[tokio::test]
+async fn save_draft_refuses_inbound_message_id() {
+    let (_tmp, core) = setup().await;
+    let inbound_id = 911_i64;
+    seed_real_message(&core, inbound_id, false).await;
+
+    let err = core.save_draft(update_args(inbound_id)).await.unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::NotFound(_)),
+        "expected NotFound, got {err:?}"
+    );
+    assert_message_untouched(&core, inbound_id).await;
+}
+
+#[tokio::test]
+async fn rejected_save_removes_freshly_staged_attachment() {
+    let (tmp, core) = setup().await;
+    let sent_id = 912_i64;
+    seed_real_message(&core, sent_id, true).await;
+
+    let src = tmp.path().join("attach.bin");
+    std::fs::write(&src, b"payload").unwrap();
+    let mut a = update_args(sent_id);
+    a.attachments.push(DraftAttachmentIn {
+        file_path: src.to_string_lossy().into_owned(),
+        filename: "attach.bin".into(),
+    });
+    let err = core.save_draft(a).await.unwrap_err();
+    assert!(matches!(err, comail_core::error::CoreError::NotFound(_)));
+
+    // The staged copy was made before the transaction rejected the save; it
+    // must be gone now, along with its per-file subdirectory.
+    let root = comail_core::config::Paths::for_tests(tmp.path()).draft_attachments_dir();
+    let leftovers: Vec<_> = std::fs::read_dir(&root)
+        .map(|rd| rd.flatten().collect())
+        .unwrap_or_default();
+    assert!(
+        leftovers.is_empty(),
+        "staged files left behind: {leftovers:?}"
+    );
+    assert_message_untouched(&core, sent_id).await;
+}

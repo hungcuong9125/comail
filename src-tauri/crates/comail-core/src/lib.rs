@@ -290,6 +290,22 @@ impl Core {
             Ok(n) if n > 0 => tracing::info!("recovered {n} orphaned in-flight action(s)"),
             _ => {}
         }
+        // Reclaim staged draft attachments whose rows are gone (crashed saves,
+        // pre-fix deletes/sends). The one-hour grace keeps an in-flight save's
+        // not-yet-committed staging safe.
+        match sweep_draft_attachment_staging(
+            &core.db,
+            &core.paths.draft_attachments_dir(),
+            std::time::Duration::from_secs(60 * 60),
+        )
+        .await
+        {
+            Ok(n) if n > 0 => {
+                tracing::info!("swept {n} unreferenced draft-attachment dir(s)")
+            }
+            Err(error) => tracing::warn!(%error, "draft-attachment sweep failed"),
+            _ => {}
+        }
         match core
             .db
             .write(|conn| {
@@ -1507,15 +1523,28 @@ impl Core {
         let staging_root = self.paths.draft_attachments_dir();
         let mut staged: Vec<crate::models::DraftAttachmentIn> =
             Vec::with_capacity(args.attachments.len());
+        // Copies this call created; removed if the save is rejected (they are
+        // referenced by nothing until the transaction commits).
+        let mut fresh_paths: Vec<String> = Vec::new();
         for att in &args.attachments {
-            let file_path =
-                stage_draft_attachment(&staging_root, &att.file_path, &att.filename).await?;
-            staged.push(crate::models::DraftAttachmentIn {
-                file_path,
-                filename: att.filename.clone(),
-            });
+            match stage_draft_attachment(&staging_root, &att.file_path, &att.filename).await {
+                Ok(staged_file) => {
+                    if staged_file.fresh {
+                        fresh_paths.push(staged_file.path.clone());
+                    }
+                    staged.push(crate::models::DraftAttachmentIn {
+                        file_path: staged_file.path,
+                        filename: att.filename.clone(),
+                    });
+                }
+                Err(e) => {
+                    remove_staged_draft_files(&staging_root, &fresh_paths).await;
+                    return Err(e);
+                }
+            }
         }
-        let (draft_id, thread_id) = self
+        let new_paths: HashSet<String> = staged.iter().map(|a| a.file_path.clone()).collect();
+        let result = self
             .db
             .write(move |conn| {
                 let tx = conn.transaction()?;
@@ -1532,7 +1561,12 @@ impl Core {
 
                 let draft_id = match args.draft_id {
                     Some(id) => {
-                        tx.execute(
+                        // The is_draft predicate gates the whole update: a 0-row
+                        // write means the id is not (or no longer) a draft -
+                        // e.g. it was sent or arrived since the caller read it.
+                        // Fail now so the transaction rolls back instead of
+                        // overwriting a real message's body and attachments.
+                        let updated = tx.execute(
                             "UPDATE messages SET subject = ?2, to_json = ?3, cc_json = ?4,
                                     bcc_json = ?5, date = ?6 WHERE id = ?1 AND is_draft = 1",
                             rusqlite::params![
@@ -1544,6 +1578,9 @@ impl Core {
                                 now_ms(),
                             ],
                         )?;
+                        if updated == 0 {
+                            return Err(CoreError::NotFound("draft".into()));
+                        }
                         id
                     }
                     None => {
@@ -1611,7 +1648,16 @@ impl Core {
                     "UPDATE messages SET body_state = 'cached', snippet = ?2 WHERE id = ?1",
                     rusqlite::params![draft_id, crate::mime::make_snippet(&args.body_text)],
                 )?;
-                // Staged outgoing attachments: replace on every save.
+                // Staged outgoing attachments: replace on every save. Remember
+                // the previous staged paths so files this save orphans can be
+                // deleted once the transaction commits.
+                let old_paths: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT file_path FROM draft_attachments WHERE draft_id = ?1",
+                    )?;
+                    stmt.query_map(rusqlite::params![draft_id], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
                 tx.execute(
                     "DELETE FROM draft_attachments WHERE draft_id = ?1",
                     rusqlite::params![draft_id],
@@ -1632,9 +1678,25 @@ impl Core {
                     repo::threads::recompute(&tx, tid)?;
                 }
                 tx.commit()?;
-                Ok((draft_id, thread_id))
+                Ok((draft_id, thread_id, old_paths))
             })
-            .await?;
+            .await;
+        let (draft_id, thread_id, old_paths) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                // Rejected save: the freshly staged copies belong to no draft.
+                remove_staged_draft_files(&staging_root, &fresh_paths).await;
+                return Err(e);
+            }
+        };
+        // Committed: drop staged files the draft no longer references (e.g. an
+        // attachment removed between saves). Anything left behind is reclaimed
+        // by the startup sweep.
+        let orphaned: Vec<String> = old_paths
+            .into_iter()
+            .filter(|p| !new_paths.contains(p))
+            .collect();
+        remove_staged_draft_files(&staging_root, &orphaned).await;
         if let Some(thread_id) = thread_id {
             self.bus.emit(CoreEvent::MailUpdated {
                 thread_ids: vec![thread_id],
@@ -1707,7 +1769,7 @@ impl Core {
     }
 
     pub async fn delete_draft(&self, draft_id: i64) -> Result<()> {
-        let (thread_id, nudge_account) = self
+        let (thread_id, nudge_account, staged_paths) = self
             .db
             .write(move |conn| {
                 let row = conn
@@ -1733,6 +1795,21 @@ impl Core {
                 if !row.4 {
                     return Err(CoreError::NotFound("draft".into()));
                 }
+
+                // Staged attachment rows never outlive the draft: the local
+                // delete cascades them, but the IMAP-move branch keeps the
+                // message row (in Trash), so drop them explicitly either way.
+                // Their files are removed once the write succeeds.
+                let staged_paths: Vec<String> = {
+                    let mut stmt = conn
+                        .prepare("SELECT file_path FROM draft_attachments WHERE draft_id = ?1")?;
+                    stmt.query_map(rusqlite::params![draft_id], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                conn.execute(
+                    "DELETE FROM draft_attachments WHERE draft_id = ?1",
+                    rusqlite::params![draft_id],
+                )?;
 
                 let mut nudge_account = None;
                 if row.3.is_some() && row.5 != roles::TRASH {
@@ -1760,9 +1837,10 @@ impl Core {
                 if let Some(tid) = row.1 {
                     repo::threads::recompute(conn, tid)?;
                 }
-                Ok((row.1, nudge_account))
+                Ok((row.1, nudge_account, staged_paths))
             })
             .await?;
+        remove_staged_draft_files(&self.paths.draft_attachments_dir(), &staged_paths).await;
         if let Some(thread_id) = thread_id {
             self.bus.emit(CoreEvent::MailUpdated {
                 thread_ids: vec![thread_id],
@@ -5712,17 +5790,31 @@ fn safe_filename(name: &str) -> String {
     }
 }
 
+/// One file staged into the draft-attachment staging area.
+struct StagedAttachment {
+    /// Canonicalised absolute path of the staged copy.
+    path: String,
+    /// True when this call created the copy; false when the source was
+    /// already inside the staging root and nothing was written.
+    fresh: bool,
+}
+
 /// Copy a composer-picked file into the app-managed draft-attachment staging
 /// area and return the staged absolute path. A path already inside the staging
 /// root (a reloaded draft round-tripping its own staged path) is returned
-/// unchanged. This guarantees dispatch only ever reads files the app itself
-/// wrote, closing an arbitrary local-file read/exfiltration path through the
-/// `save_draft` IPC command.
+/// unchanged.
+///
+/// What this does and does not guarantee: dispatch only ever reads files
+/// under the staging root, so a `draft_attachments` row cannot point SMTP at
+/// an arbitrary path. But any *readable* path the frontend hands to
+/// `save_draft` is still copied into staging and mailed - picking files is a
+/// user gesture the renderer is trusted with, so this is not a boundary
+/// against a compromised renderer exfiltrating files it can read.
 async fn stage_draft_attachment(
     root: &std::path::Path,
     src: &str,
     filename: &str,
-) -> Result<String> {
+) -> Result<StagedAttachment> {
     tokio::fs::create_dir_all(root).await?;
     let root = tokio::fs::canonicalize(root).await?;
     let canon_src = tokio::fs::canonicalize(src)
@@ -5730,13 +5822,119 @@ async fn stage_draft_attachment(
         .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
     if canon_src.starts_with(&root) {
         // Already staged (e.g. re-saving a draft reloaded from the DB).
-        return Ok(canon_src.to_string_lossy().into_owned());
+        return Ok(StagedAttachment {
+            path: canon_src.to_string_lossy().into_owned(),
+            fresh: false,
+        });
     }
     let sub = root.join(crate::mime::rand_token());
     tokio::fs::create_dir_all(&sub).await?;
     let dst = sub.join(safe_filename(filename));
     tokio::fs::copy(&canon_src, &dst).await?;
-    Ok(dst.to_string_lossy().into_owned())
+    Ok(StagedAttachment {
+        path: dst.to_string_lossy().into_owned(),
+        fresh: true,
+    })
+}
+
+/// Delete staged attachment files, but only paths that canonicalise inside
+/// `root` - entries in `paths` come from the DB and are untrusted, so anything
+/// resolving outside the staging area is left alone. Each file lives in its
+/// own random subdirectory; the directory is removed too once it is empty.
+/// Deletion is best-effort: leftovers are reclaimed by the startup sweep.
+pub(crate) async fn remove_staged_draft_files(root: &std::path::Path, paths: &[String]) {
+    let Ok(root) = tokio::fs::canonicalize(root).await else {
+        return;
+    };
+    for path in paths {
+        let Ok(canon) = tokio::fs::canonicalize(path).await else {
+            continue;
+        };
+        if !canon.starts_with(&root) {
+            tracing::warn!(
+                path,
+                "refusing to remove attachment outside draft staging area"
+            );
+            continue;
+        }
+        if let Err(e) = tokio::fs::remove_file(&canon).await {
+            tracing::debug!(path, error = %e, "staged draft attachment already gone");
+        }
+        // The per-file subdirectory: drop it only when this was the last file.
+        if let Some(dir) = canon.parent()
+            && dir != root
+            && dir.starts_with(&root)
+        {
+            let _ = tokio::fs::remove_dir(dir).await;
+        }
+    }
+}
+
+/// Startup GC for the draft-attachment staging area. Staged files whose
+/// `draft_attachments` row is gone can never be read again - cleanup between a
+/// committing transaction and file removal is best-effort, and a crash leaves
+/// them behind. Removes top-level subdirectories that no row references,
+/// skipping anything modified within `min_age` so a save racing startup (it
+/// stages files before its transaction commits) is never undercut.
+/// All deletion is confined to canonicalised children of `root`; the root
+/// itself is never touched.
+pub async fn sweep_draft_attachment_staging(
+    db: &crate::db::Db,
+    root: &std::path::Path,
+    min_age: std::time::Duration,
+) -> Result<usize> {
+    let referenced: HashSet<std::path::PathBuf> = db
+        .read(|conn| {
+            let mut stmt = conn.prepare("SELECT file_path FROM draft_attachments")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Ok(rows)
+        })
+        .await?
+        .into_iter()
+        .filter_map(|p| std::path::PathBuf::from(p).canonicalize().ok())
+        .collect();
+
+    let Ok(root) = tokio::fs::canonicalize(root).await else {
+        return Ok(0);
+    };
+    let mut removed = 0usize;
+    let mut entries = tokio::fs::read_dir(&root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        // A recently-touched directory may belong to an in-flight save.
+        let fresh = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age < min_age);
+        if fresh {
+            continue;
+        }
+        let Ok(canon) = tokio::fs::canonicalize(&path).await else {
+            continue;
+        };
+        if !canon.starts_with(&root) {
+            continue;
+        }
+        if referenced.iter().any(|r| r.starts_with(&canon)) {
+            continue;
+        }
+        if meta.is_dir() {
+            tokio::fs::remove_dir_all(&canon).await?;
+        } else {
+            tokio::fs::remove_file(&canon).await?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// Plain-text body for an outgoing invite email (the ICS carries the real
