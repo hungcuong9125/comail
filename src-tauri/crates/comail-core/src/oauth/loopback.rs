@@ -65,9 +65,10 @@ impl LoopbackServer {
     /// forged local request can neither end the sign-in early nor see the
     /// "connected" page.
     pub async fn wait_for_code(self, expected_state: &str, timeout: Duration) -> Result<AuthCode> {
-        /// Bound on concurrent connection handlers: past the cap a connection
-        /// is closed immediately — each handler costs little, but a flood of
-        /// localhost connections must not pile them up unboundedly.
+        /// Bound on concurrent connection handlers. While `MAX_CONNS` are
+        /// active we simply stop accepting — new connections wait in the
+        /// kernel backlog until a handler finishes — so 16 idle local sockets
+        /// can't get the real browser redirect accepted-and-closed.
         const MAX_CONNS: usize = 16;
         let expected: std::sync::Arc<str> = std::sync::Arc::from(expected_state);
         // JoinSet aborts every outstanding task on drop — so returning (or
@@ -84,12 +85,8 @@ impl LoopbackServer {
                             },
                             None => self.v4.accept().await,
                         }
-                    } => {
+                    }, if tasks.len() < MAX_CONNS => {
                         let (stream, _) = accept?;
-                        if tasks.len() >= MAX_CONNS {
-                            drop(stream);
-                            continue;
-                        }
                         let expected = expected.clone();
                         tasks.spawn(async move { handle_connection(stream, &expected).await });
                     }
@@ -382,26 +379,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connections_beyond_the_cap_are_closed_immediately() {
+    async fn connections_beyond_the_cap_wait_in_the_backlog() {
+        // With every handler slot busy, further connections are simply not
+        // accepted — the real redirect must survive in the kernel backlog
+        // until a silent connection's deadline frees a slot.
         let server = LoopbackServer::bind().await.unwrap();
         let port = server.port;
         let waiter = spawn_waiter(server, "good");
-        // Fill every handler slot with silent connections.
         let mut held = Vec::new();
         for _ in 0..16 {
             held.push(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-        // The next connection is refused promptly: closed without a response.
-        let mut extra = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let mut buf = [0u8; 64];
-        let res = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut buf)).await;
-        match res {
-            Ok(Ok(0)) => {}
-            other => panic!("expected immediate close, got {other:?}"),
-        }
+        // The redirect's request is already buffered; it is answered as soon
+        // as a silent conn's CONN_DEADLINE frees a handler (not dropped like
+        // the old accept-and-close).
+        let mut real = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        real.write_all(b"GET /?code=real&state=good HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let code = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(code.code, "real");
         drop(held);
-        drop(extra);
-        waiter.abort();
     }
 }
