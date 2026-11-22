@@ -130,6 +130,9 @@ export const RichBody = forwardRef<
   // content: flag it so onDrop lets the browser relocate the source instead
   // of sanitizing a duplicate in at the drop point.
   const internalDragRef = useRef(false);
+  // One scheduled re-check of the DOM after an event the browser handled
+  // itself (native move, plain-text paste). See scheduleDomCheck.
+  const domCheckRef = useRef<number | null>(null);
   const [empty, setEmpty] = useState(true);
   const [active, setActive] = useState<Record<string, boolean>>({});
   const [linkOpen, setLinkOpen] = useState(false);
@@ -180,6 +183,78 @@ export const RichBody = forwardRef<
     refreshEmpty(el);
     onChangeRef.current(el.innerHTML);
   }, [refreshEmpty]);
+
+  // The internal-drag flag can stay set if dragend never reaches the editor
+  // (the dragged source node was removed mid-drag, or the drop left the
+  // window). Rather than trusting the flag alone: any drop or paste the
+  // browser performs natively is followed by a next-frame check that
+  // re-sanitizes the DOM and emits if the cleanup changed anything.
+  const scheduleDomCheck = useCallback(() => {
+    if (domCheckRef.current != null) return;
+    domCheckRef.current = window.setTimeout(() => {
+      domCheckRef.current = null;
+      const el = elRef.current;
+      if (!el) return;
+      const clean = sanitizeEditorHtml(el.innerHTML);
+      if (clean !== el.innerHTML) {
+        // Caret as (child-index path, offset) pairs from the editor root, so
+        // it survives the innerHTML rewrite as well as it can.
+        const sel = document.getSelection();
+        const r = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+        const pathOf = (node: Node, offset: number): number[] | null => {
+          const p = [offset];
+          let n: Node | null = node;
+          while (n && n !== el) {
+            const parent: Node | null = n.parentNode;
+            if (!parent) return null;
+            p.unshift(Array.prototype.indexOf.call(parent.childNodes, n));
+            n = parent;
+          }
+          return n === el ? p : null;
+        };
+        const start = r && el.contains(r.startContainer) ? pathOf(r.startContainer, r.startOffset) : null;
+        const end = r && el.contains(r.endContainer) ? pathOf(r.endContainer, r.endOffset) : null;
+        el.innerHTML = clean;
+        if (sel && start && end) {
+          const resolve = (p: number[]) => {
+            let node: Node = el;
+            for (let k = 0; k < p.length - 1; k += 1) {
+              const next = node.childNodes[p[k]];
+              if (!next) return null;
+              node = next;
+            }
+            const max =
+              node.nodeType === Node.TEXT_NODE
+                ? (node.textContent ?? "").length
+                : node.childNodes.length;
+            return { node, offset: Math.min(p[p.length - 1], max) };
+          };
+          const a = resolve(start);
+          const b = resolve(end);
+          if (a && b) sel.setBaseAndExtent(a.node, a.offset, b.node, b.offset);
+        }
+      }
+      emit();
+    }, 0);
+  }, [emit]);
+
+  // A stale internal-drag flag is also cleared directly when a new drag
+  // starts outside the editor or the window loses focus mid-drag.
+  useEffect(() => {
+    const onDocDragStart = (e: DragEvent) => {
+      const el = elRef.current;
+      if (!el || !el.contains(e.target as Node)) internalDragRef.current = false;
+    };
+    const onWindowBlur = () => {
+      internalDragRef.current = false;
+    };
+    document.addEventListener("dragstart", onDocDragStart, true);
+    window.addEventListener("blur", onWindowBlur);
+    return () => {
+      document.removeEventListener("dragstart", onDocDragStart, true);
+      window.removeEventListener("blur", onWindowBlur);
+    };
+  }, []);
 
   /**
    * "Convert to plain text": drop the formatting of the selection, or of the
@@ -989,7 +1064,18 @@ export const RichBody = forwardRef<
               replaceRangeWithText(sel.getRangeAt(0), sel, plain);
             }
             emit();
+            return;
           }
+          if (item && !plain) {
+            // The clipboard's only payload is an image type we refuse: if we
+            // let the paste through the browser inserts the raw image
+            // natively, allowlist or not.
+            e.preventDefault();
+            return;
+          }
+          // A native plain-text paste is let through; the scheduled check
+          // re-verifies the DOM afterwards.
+          scheduleDomCheck();
         }}
         onDragStart={() => {
           internalDragRef.current = true;
@@ -1000,9 +1086,11 @@ export const RichBody = forwardRef<
         onDrop={(e) => {
           // A drag that started inside this editor is a native "move": the
           // browser relocates the (already sanitized) selection and removes
-          // the source; the resulting input event emits on its own.
+          // the source. The next-frame check re-sanitizes regardless - it is
+          // the backstop for a stale flag letting external HTML look internal.
           if (internalDragRef.current) {
             internalDragRef.current = false;
+            scheduleDomCheck();
             return;
           }
           // Dragged-in HTML enters the DOM raw unless the drop is intercepted
