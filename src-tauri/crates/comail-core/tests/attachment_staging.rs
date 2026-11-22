@@ -376,3 +376,96 @@ async fn startup_sweep_removes_unreferenced_dirs_but_not_recent_or_referenced() 
     assert!(std::path::Path::new(&staged).exists());
     assert!(root.exists());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn staged_symlink_pointing_outside_is_never_followed_for_deletion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_paths, core) = setup_core(&tmp).await;
+    let outside = tmp.path().join("outside-secret.txt");
+    std::fs::write(&outside, b"keep me").unwrap();
+
+    // A crafted row: the stored path sits inside the staging root but is a
+    // symlink resolving outside it. Deleting "the file at the row's path"
+    // must not follow the link.
+    let draft_id = core.save_draft(draft_args(1, vec![])).await.unwrap();
+    let staging_root =
+        comail_core::config::Paths::for_tests(&tmp.path().join("data")).draft_attachments_dir();
+    let link_dir = staging_root.join("crafted");
+    std::fs::create_dir_all(&link_dir).unwrap();
+    let link = link_dir.join("evil.txt");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let link_str = link.to_string_lossy().into_owned();
+    core.db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO draft_attachments (draft_id,file_path,filename,mime_type)
+                 VALUES (?1,?2,'evil.txt','text/plain')",
+                rusqlite::params![draft_id, link_str],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    core.delete_draft(draft_id).await.unwrap();
+    assert!(
+        outside.exists(),
+        "deletion followed a staged symlink outside the root"
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"keep me");
+}
+
+#[tokio::test]
+async fn sweep_aborts_without_deleting_when_the_reference_query_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_paths, core) = setup_core(&tmp).await;
+    let root =
+        comail_core::config::Paths::for_tests(&tmp.path().join("data")).draft_attachments_dir();
+    let orphan = root.join("old_orphan");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("x.bin"), b"x").unwrap();
+
+    // Break the referenced-paths query: the sweep must surface the error and
+    // delete nothing rather than GC against a guessed-empty reference set.
+    core.db
+        .write(|conn| {
+            conn.execute_batch("DROP TABLE draft_attachments")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let result =
+        comail_core::sweep_draft_attachment_staging(&core.db, &root, std::time::Duration::ZERO)
+            .await;
+    assert!(result.is_err(), "sweep must fail when the query fails");
+    assert!(orphan.exists(), "sweep deleted despite the query error");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sweep_keeps_entries_with_future_or_unreadable_mtime() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_paths, core) = setup_core(&tmp).await;
+    let root =
+        comail_core::config::Paths::for_tests(&tmp.path().join("data")).draft_attachments_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let future = root.join("future_orphan");
+    std::fs::create_dir_all(&future).unwrap();
+    std::fs::write(future.join("x.bin"), b"x").unwrap();
+
+    // mtime in the future: elapsed() fails, so the entry must be treated as
+    // fresh (a racing save's staging), not GC'd.
+    let f = std::fs::File::open(&future).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(7200))
+        .unwrap();
+    let n = comail_core::sweep_draft_attachment_staging(
+        &core.db,
+        &root,
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 0);
+    assert!(future.exists(), "future-mtime entry was swept");
+}

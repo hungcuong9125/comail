@@ -1690,12 +1690,20 @@ impl Core {
             }
         };
         // Committed: drop staged files the draft no longer references (e.g. an
-        // attachment removed between saves). Anything left behind is reclaimed
-        // by the startup sweep.
-        let orphaned: Vec<String> = old_paths
-            .into_iter()
-            .filter(|p| !new_paths.contains(p))
-            .collect();
+        // attachment removed between saves). Old paths come from the DB and
+        // may not be canonical (staging canonicalises on the way in), so the
+        // comparison resolves both sides - a non-canonical alias of a kept
+        // file must not be "orphaned" out from under the new row.
+        let mut orphaned: Vec<String> = Vec::new();
+        for old in old_paths {
+            let canon = tokio::fs::canonicalize(&old)
+                .await
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| old.clone());
+            if !new_paths.contains(&canon) {
+                orphaned.push(old);
+            }
+        }
         remove_staged_draft_files(&staging_root, &orphaned).await;
         if let Some(thread_id) = thread_id {
             self.bus.emit(CoreEvent::MailUpdated {
@@ -1794,6 +1802,35 @@ impl Core {
                     .ok_or_else(|| CoreError::NotFound("draft".into()))?;
                 if !row.4 {
                     return Err(CoreError::NotFound("draft".into()));
+                }
+
+                // A queued send for this draft must not outlive the delete:
+                // the dispatch reads the draft_attachments rows dropped below
+                // and would deliver the message without its files (or, for a
+                // server draft moved to Trash, send at all). Pending sends
+                // are cancelled here - the same pending->cancelled
+                // transition undo-send uses - inside this write so the
+                // dispatcher's claim cannot slip between them. A send
+                // already claimed is mid-flight, so the delete is refused
+                // rather than racing its attachment read.
+                let send_actions: Vec<(i64, String)> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, state FROM pending_actions
+                         WHERE kind = 'send' AND message_id = ?1
+                           AND state IN ('pending','inflight')",
+                    )?;
+                    stmt.query_map(rusqlite::params![draft_id], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                if send_actions.iter().any(|(_, s)| s == "inflight") {
+                    return Err(CoreError::ActionRejected(
+                        "this draft is already being sent".into(),
+                    ));
+                }
+                for (action_id, _) in send_actions {
+                    repo::actions::try_cancel(conn, action_id)?;
                 }
 
                 // Staged attachment rows never outlive the draft: the local
@@ -5909,12 +5946,13 @@ pub async fn sweep_draft_attachment_staging(
         let Ok(meta) = entry.metadata().await else {
             continue;
         };
-        // A recently-touched directory may belong to an in-flight save.
-        let fresh = meta
-            .modified()
-            .ok()
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age < min_age);
+        // A recently-touched directory may belong to an in-flight save; one
+        // whose mtime is unreadable or lies in the future is kept too -
+        // assume fresh rather than risk deleting a save's staging.
+        let fresh = match meta.modified() {
+            Err(_) => true,
+            Ok(m) => m.elapsed().map_or(true, |age| age < min_age),
+        };
         if fresh {
             continue;
         }

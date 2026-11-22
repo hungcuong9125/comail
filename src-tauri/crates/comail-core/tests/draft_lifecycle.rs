@@ -1,7 +1,8 @@
 use comail_core::Core;
 use comail_core::config::Paths;
 use comail_core::models::{
-    ActionKind, Address, DraftAttachmentIn, PerformActionArgs, SaveDraftArgs, View,
+    ActionKind, Address, DraftAttachmentIn, PerformActionArgs, QueueSendArgs, SaveDraftArgs, View,
+    now_ms,
 };
 
 async fn setup() -> (tempfile::TempDir, Core) {
@@ -320,4 +321,91 @@ async fn rejected_save_removes_freshly_staged_attachment() {
         "staged files left behind: {leftovers:?}"
     );
     assert_message_untouched(&core, sent_id).await;
+}
+
+// -----------------------------------------------------------------------
+// delete_draft vs queued sends: a pending send must not outlive the
+// delete (it would dispatch without attachments); a send already in
+// flight refuses the delete instead of racing it.
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn delete_draft_cancels_its_pending_send() {
+    let (_tmp, core) = setup().await;
+    let draft_id = core.save_draft(args(None)).await.unwrap();
+    let send_at = now_ms() + 3_600_000; // far future: never dispatches here
+    let result = core
+        .queue_send(QueueSendArgs {
+            draft_id,
+            send_at: Some(send_at),
+        })
+        .await
+        .unwrap();
+
+    core.delete_draft(draft_id).await.unwrap();
+
+    let state: String = core
+        .db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT state FROM pending_actions WHERE id = ?1",
+                [result.action_id],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        state, "cancelled",
+        "pending send must not outlive the draft"
+    );
+}
+
+#[tokio::test]
+async fn delete_draft_refuses_while_its_send_is_in_flight() {
+    let (_tmp, core) = setup().await;
+    let draft_id = core.save_draft(args(None)).await.unwrap();
+    let result = core
+        .queue_send(QueueSendArgs {
+            draft_id,
+            send_at: Some(now_ms() + 3_600_000),
+        })
+        .await
+        .unwrap();
+    core.db
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE pending_actions SET state = 'inflight' WHERE id = ?1",
+                [result.action_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let err = core.delete_draft(draft_id).await.unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
+        "expected ActionRejected, got {err:?}"
+    );
+    // The draft and the in-flight action are both untouched.
+    let (is_draft, state): (i64, String) = core
+        .db
+        .read(move |conn| {
+            let is_draft = conn.query_row(
+                "SELECT is_draft FROM messages WHERE id = ?1",
+                [draft_id],
+                |r| r.get(0),
+            )?;
+            let state = conn.query_row(
+                "SELECT state FROM pending_actions WHERE id = ?1",
+                [result.action_id],
+                |r| r.get(0),
+            )?;
+            Ok((is_draft, state))
+        })
+        .await
+        .unwrap();
+    assert_eq!(is_draft, 1);
+    assert_eq!(state, "inflight");
 }
