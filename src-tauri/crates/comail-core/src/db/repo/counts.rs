@@ -160,15 +160,19 @@ pub fn unread_counts(
         splits_map.insert(sp.id.to_string(), n);
     }
 
-    // Auto-category tabs read the single resolved tab; manual labels stay a
-    // membership filter.
+    // Auto-category tabs read the single resolved tab and stay inbox-scoped.
+    // Manual labels are a cross-cutting filter shown against View::All, so
+    // their badge must count what that list shows: any thread with visible
+    // (non-trash/spam) mail carrying the label, archived or snoozed included.
     let mut labels_map = HashMap::new();
     for l in labels {
-        let q = Q::unread(account_id).inbox();
         let n = if l.is_auto {
-            q.routed_label(l.id).run(conn)?
+            Q::unread(account_id).inbox().routed_label(l.id).run(conn)?
         } else {
-            q.label(l.id).run(conn)?
+            Q::unread(account_id)
+                .clause(super::threads::HAS_VISIBLE_MAIL)
+                .label(l.id)
+                .run(conn)?
         };
         labels_map.insert(l.id.to_string(), n);
     }
@@ -235,11 +239,13 @@ pub fn tab_totals(
 
     let mut labels_map = HashMap::new();
     for l in labels {
-        let q = Q::any(account_id).inbox();
         let n = if l.is_auto {
-            q.routed_label(l.id).run(conn)?
+            Q::any(account_id).inbox().routed_label(l.id).run(conn)?
         } else {
-            q.label(l.id).run(conn)?
+            Q::any(account_id)
+                .clause(super::threads::HAS_VISIBLE_MAIL)
+                .label(l.id)
+                .run(conn)?
         };
         labels_map.insert(l.id.to_string(), n);
     }
@@ -526,5 +532,88 @@ mod tests {
         assert_eq!(none.inbox, 0);
         assert_eq!(none.important, 0);
         assert_eq!(none.splits["7"], 0);
+    }
+
+    /// Attach `label_id` to one message of each thread and register the label.
+    fn label_threads(conn: &Connection, label_id: i64, is_auto: bool, thread_ids: &[i64]) {
+        conn.execute(
+            "INSERT INTO labels (id, name, color, keyword, position, is_auto)
+             VALUES (?1, 'L' || ?1, '#fff', 'Kw', 0, ?2)",
+            params![label_id, is_auto as i64],
+        )
+        .unwrap();
+        for tid in thread_ids {
+            let msg_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM messages WHERE thread_id = ?1 LIMIT 1",
+                    params![tid],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO message_labels (message_id, label_id) VALUES (?1, ?2)",
+                params![msg_id, label_id],
+            )
+            .unwrap();
+        }
+    }
+
+    fn label(id: i64, is_auto: bool) -> Label {
+        Label {
+            id,
+            name: "L".into(),
+            color: "#fff".into(),
+            keyword: "Kw".into(),
+            position: 0,
+            is_auto,
+        }
+    }
+
+    #[test]
+    fn manual_label_badge_matches_the_all_view_scope() {
+        let conn = test_db();
+        conn.execute_batch(
+            "INSERT INTO folders (id, account_id, imap_name, role) VALUES
+             (2,1,'Archive','archive'),(3,1,'Trash','trash');",
+        )
+        .unwrap();
+        seed_thread(&conn, 1, 1, false); // unread, in the inbox
+        seed_thread(&conn, 2, 1, false); // unread, archived
+        seed_thread(&conn, 3, 1, false); // unread, snoozed
+        seed_thread(&conn, 4, 1, false); // unread, only in trash
+        conn.execute("UPDATE messages SET folder_id = 2 WHERE thread_id = 2", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO snoozes (thread_id, account_id, wake_at) VALUES (3, 1, 9999999999999)",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE messages SET folder_id = 3 WHERE thread_id = 4", [])
+            .unwrap();
+        // Threads 1 and 2 also route to auto label 9's tab.
+        conn.execute(
+            "UPDATE threads SET routed_tab = 'label:9' WHERE id IN (1, 2)",
+            [],
+        )
+        .unwrap();
+
+        label_threads(&conn, 5, false, &[1, 2, 3, 4]);
+        let manual = label(5, false);
+        let auto = label(9, true);
+        label_threads(&conn, 9, true, &[]);
+
+        let c = unread_counts(&conn, None, &[], &[manual.clone(), auto.clone()]).unwrap();
+        assert_eq!(
+            c.labels["5"], 3,
+            "inbox + archived + snoozed count; trash-only mail stays hidden"
+        );
+        assert_eq!(
+            c.labels["9"], 1,
+            "auto labels keep the inbox scope: only the inbox thread counts"
+        );
+
+        let t = tab_totals(&conn, None, &[], &[manual, auto]).unwrap();
+        assert_eq!(t.labels["5"], 3);
+        assert_eq!(t.labels["9"], 1);
     }
 }
