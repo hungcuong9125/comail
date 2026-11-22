@@ -95,6 +95,30 @@ impl VectorIndex {
         });
     }
 
+    /// Drop every vector whose message id fails `keep`. Used when an account
+    /// is deleted: its `message_embeddings` rows cascade in SQLite, but the
+    /// in-memory copy would otherwise linger until the next rebuild and keep
+    /// occupying top-k slots (and could be attributed to a recycled id).
+    /// Linear scan + compaction, same cost profile as a rebuild.
+    pub fn retain(&mut self, keep: impl Fn(i64) -> bool) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let mut entries = Vec::with_capacity(self.entries.len());
+        let mut data = Vec::with_capacity(self.data.len());
+        for (i, e) in self.entries.iter().enumerate() {
+            if keep(e.message_id) {
+                data.extend_from_slice(&self.data[i * self.dim..(i + 1) * self.dim]);
+                entries.push(Entry {
+                    message_id: e.message_id,
+                    chunk_index: e.chunk_index,
+                });
+            }
+        }
+        self.entries = entries;
+        self.data = data;
+    }
+
     /// Top-k messages by best matching chunk (max-sim). `query` must be
     /// normalized and of matching dimension. Returns (message_id, score),
     /// best first, deduplicated to one entry per message.
@@ -151,5 +175,21 @@ mod tests {
         assert_eq!(res[0].0, 1); // message 1 best chunk dot=1.0
         assert!((res[0].1 - 1.0).abs() < 1e-4);
         assert_eq!(res[1].0, 2);
+    }
+
+    #[test]
+    fn retain_evicts_only_rejected_messages() {
+        let mut idx = VectorIndex::new(2, "test");
+        idx.push(1, 0, &[1.0, 0.0]);
+        idx.push(1, 1, &[0.5, 0.5]);
+        idx.push(2, 0, &[0.0, 1.0]);
+        idx.retain(|mid| mid != 1);
+        assert_eq!(idx.len(), 1);
+        let res = idx.search(&[1.0, 0.0], 5);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].0, 2);
+        // The survivor's row still aligns with its vector (dot == 0 for the
+        // x-axis query against [0,1]).
+        assert!(res[0].1.abs() < 1e-4);
     }
 }
