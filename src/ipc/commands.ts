@@ -2,21 +2,27 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Commands } from "./types";
 import { MOCK_MODE } from "./mockMode";
 
-// The mock backend (~4k lines of fixtures) is only compiled into dev-server
-// and VITE_MOCK=1 builds. Both flags are compile-time constants, so a normal
-// release build folds MOCK_BUILT to false and drops the dynamic import -
-// and the mock chunk - from the output entirely.
-const MOCK_BUILT = import.meta.env.DEV || import.meta.env.VITE_MOCK === "1";
-
 type MockModule = typeof import("./mock");
 
 let mockModule: Promise<MockModule> | null = null;
 
 function loadMock(): Promise<MockModule> {
-  if (!MOCK_BUILT) {
+  // The flag is a compile-time constant (see vite.config.ts), so a normal
+  // release build folds this to a dead branch and drops the dynamic import -
+  // and the mock chunk - from the output entirely. It only stays reachable
+  // while MOCK_MODE holds at runtime.
+  if (import.meta.env.VITE_MOCK_BUILT !== "1") {
     return Promise.reject(new Error("mock backend is not included in this build"));
   }
-  return (mockModule ??= import("./mock"));
+  if (mockModule == null) {
+    mockModule = import("./mock");
+    // A failed chunk fetch must not poison the cache: clear it so the next
+    // call retries instead of replaying the same rejection forever.
+    mockModule.catch(() => {
+      mockModule = null;
+    });
+  }
+  return mockModule;
 }
 
 /**
