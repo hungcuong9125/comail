@@ -235,4 +235,69 @@ mod tests {
             "no second Content-Type was appended"
         );
     }
+
+    /// A real HTTP listener: capture what reqwest actually writes on the
+    /// wire, not what MockTransport mirrors of the intended logic.
+    #[tokio::test]
+    async fn http_transport_sends_exactly_one_content_type_on_the_wire() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(2);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = socket.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut head = String::new();
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        if line == "\r\n" {
+                            break;
+                        }
+                        head.push_str(&line);
+                        line.clear();
+                    }
+                    let _ = tx.send(head).await;
+                    let _ = writer
+                        .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+
+        let t = HttpTransport::new(DavAuth::Basic("u".into(), "p".into())).unwrap();
+        t.request(
+            "PUT",
+            &format!("http://127.0.0.1:{port}/c/e.ics"),
+            None,
+            &[("Content-Type", "text/calendar; charset=utf-8")],
+            Some("BEGIN:VCALENDAR".into()),
+        )
+        .await
+        .unwrap();
+        t.request(
+            "REPORT",
+            &format!("http://127.0.0.1:{port}/c/"),
+            Some("1"),
+            &[],
+            Some("<x/>".into()),
+        )
+        .await
+        .unwrap();
+
+        let put = rx.recv().await.unwrap().to_lowercase();
+        assert_eq!(
+            put.matches("content-type").count(),
+            1,
+            "exactly one Content-Type on the wire: {put}"
+        );
+        assert!(put.contains("content-type: text/calendar; charset=utf-8"));
+
+        let report = rx.recv().await.unwrap().to_lowercase();
+        assert_eq!(report.matches("content-type").count(), 1);
+        assert!(report.contains("content-type: application/xml; charset=utf-8"));
+    }
 }
