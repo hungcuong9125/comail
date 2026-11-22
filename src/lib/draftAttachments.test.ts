@@ -10,8 +10,11 @@ import {
   mapSavedRefs,
   removeChip,
   restoredChip,
+  toggleForwardChips,
   wireEntries,
   withoutForwardChips,
+  type ComposerAttachment,
+  type ForwardSource,
 } from "./draftAttachments";
 import type { ApprovedAttachment, DraftAttachment } from "../ipc/types";
 
@@ -74,6 +77,67 @@ describe("forward toggle", () => {
     const f1 = forwardChip(60, "a.pdf");
     const r = addChips([f1], [forwardChip(60, "a.pdf")]);
     expect(r.added).toHaveLength(0);
+  });
+
+  it("forward -> save -> untick -> save -> tick -> save: refs stay spendable", () => {
+    // The round-1 must-fix: the stash must hold identity, never wire refs.
+    // Mirrors Composer.tsx: sources stashed once, chips prepared outside
+    // save, saved refs zipped back by request order.
+    const sources: ForwardSource[] = [
+      { attachmentId: 60, displayName: "report.pdf", size: null },
+      { attachmentId: 61, displayName: "img.png", size: null },
+    ];
+
+    // Mount: fresh attaching chips, prepared to tokens.
+    let chips: ComposerAttachment[] = [];
+    const first = toggleForwardChips(chips, sources, true);
+    chips = first.chips;
+    chips = first.toPrepare.map((c, i) =>
+      chipResolved(c, approved(c.displayName, `fwd-src-${i}`, `tok-fwd-${i}`)),
+    );
+    expect(allReady(chips)).toBe(true);
+
+    // First save commits: refs become staged.
+    let snapshot = chips;
+    let saved = [staged("/st/1/report.pdf", "report.pdf"), staged("/st/1/img.png", "img.png")];
+    chips = applySavedRefs(chips, mapSavedRefs(snapshot, saved));
+    expect(wireEntries(chips)).toEqual(saved);
+
+    // Untick -> save: forward refs gone from the wire.
+    chips = toggleForwardChips(chips, sources, false).chips;
+    expect(wireEntries(chips)).toEqual([]);
+
+    // Tick again -> FRESH attaching chips, prepared to NEW tokens. The old
+    // refs (consumed tokens / orphaned staged paths) are never replayed.
+    const readd = toggleForwardChips(chips, sources, true);
+    chips = readd.chips;
+    expect(readd.toPrepare).toHaveLength(2);
+    expect(readd.toPrepare.every((c) => c.ref === null && c.status === "attaching")).toBe(true);
+    chips = readd.toPrepare.map((c, i) =>
+      chipResolved(c, approved(c.displayName, `fwd-src-${i}`, `tok-fwd2-${i}`)),
+    );
+    const wire = wireEntries(chips);
+    expect(wire).toEqual([
+      { kind: "token", token: "tok-fwd2-0" },
+      { kind: "token", token: "tok-fwd2-1" },
+    ]);
+
+    // Second save commits on those fresh tokens.
+    snapshot = chips;
+    saved = [staged("/st/2/report.pdf", "report.pdf"), staged("/st/2/img.png", "img.png")];
+    chips = applySavedRefs(chips, mapSavedRefs(snapshot, saved));
+    expect(wireEntries(chips)).toEqual(saved);
+    expect(allReady(chips)).toBe(true);
+  });
+
+  it("re-tick retries a previously failed chip automatically", () => {
+    const sources: ForwardSource[] = [{ attachmentId: 60, displayName: "a.pdf", size: null }];
+    let chips = toggleForwardChips([], sources, true).chips;
+    // It stayed in the list as an error chip; user unticked, re-ticked.
+    chips = toggleForwardChips(chips.map((c) => chipFailed(c, "offline")), sources, false).chips;
+    const readd = toggleForwardChips(chips, sources, true);
+    expect(readd.toPrepare).toHaveLength(1);
+    expect(readd.toPrepare[0].status).toBe("attaching");
   });
 });
 

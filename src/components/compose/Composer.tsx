@@ -18,9 +18,10 @@ import {
   mapSavedRefs,
   removeChip,
   restoredChip,
+  toggleForwardChips,
   wireEntries,
-  withoutForwardChips,
   type ComposerAttachment,
+  type ForwardSource,
 } from "../../lib/draftAttachments";
 import { RecipientField } from "./RecipientField";
 import { Checkbox } from "../ui/Field";
@@ -249,8 +250,9 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
    *  an undo-send reopen via `state.composerNonce`; minted fresh otherwise. */
   const [composerNonce] = useState(() => state.composerNonce ?? crypto.randomUUID());
   const [dragOver, setDragOver] = useState(false);
-  /** the original's attachments, kept so the toggle can re-add them */
-  const forwardFilesRef = useRef<ComposerAttachment[]>([]);
+  /** the original's attachments as identity only (row id + display data),
+   *  kept so the toggle can re-add FRESH chips - never stale wire refs */
+  const forwardSourcesRef = useRef<ForwardSource[]>([]);
   const [includeForwardFiles, setIncludeForwardFiles] = useState(true);
   const includeForwardFilesRef = useRef(true);
   const forwardFileCount = (state.replyTo?.attachments ?? []).filter((a) => !a.isInline).length;
@@ -469,17 +471,14 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   // Resolve one forward chip to an approval token OUTSIDE save_draft
   // (`prepare_forward_attachment` downloads/copies the bytes itself), so a
   // failing download marks just that chip and never blocks saving the
-  // draft's text. Updates the live list and the toggle's stash by stable id.
+  // draft's text. The chip list itself is the only state - the toggle
+  // stash holds identity, not refs.
   const prepareForwardChip = useCallback(
     (chip: ComposerAttachment) => {
       if (chip.origin.kind !== "forward") return;
       const attachmentId = chip.origin.attachmentId;
-      const apply = (fn: (c: ComposerAttachment) => ComposerAttachment) => {
-        forwardFilesRef.current = forwardFilesRef.current.map((c) =>
-          c.id === chip.id ? fn(c) : c,
-        );
+      const apply = (fn: (c: ComposerAttachment) => ComposerAttachment) =>
         setChips((cur) => cur.map((c) => (c.id === chip.id ? fn(c) : c)));
-      };
       void call("prepare_forward_attachment", { attachmentId, composerNonce })
         .then((a) => apply((c) => chipResolved(c, a)))
         .catch((err: unknown) => {
@@ -504,10 +503,13 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
     if (state.mode !== "forward" || state.initial || state.draftId) return;
     const files = (state.replyTo?.attachments ?? []).filter((a) => !a.isInline);
     if (files.length === 0) return;
-    const chips = files.map((a) =>
-      forwardChip(a.id, a.filename ?? t("thread:attachment.fallbackName")),
-    );
-    forwardFilesRef.current = chips;
+    const sources: ForwardSource[] = files.map((a) => ({
+      attachmentId: a.id,
+      displayName: a.filename ?? t("thread:attachment.fallbackName"),
+      size: a.size ?? null,
+    }));
+    forwardSourcesRef.current = sources;
+    const chips = sources.map((s) => forwardChip(s.attachmentId, s.displayName, s.size));
     if (includeForwardFilesRef.current) {
       setChips((cur) => addChips(cur, chips).chips);
       markDirty();
@@ -770,24 +772,21 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
 
   /** Forward with or without the original's files - keyed on the chips'
    *  forward ORIGIN, which survives the token → staged ref swap, so the
-   *  toggle works the same before and after the first autosave. */
+   *  toggle works the same before and after the first autosave. Re-adding
+   *  builds FRESH attaching chips from the identity stash and prepares
+   *  them again: the old refs (consumed tokens, orphaned staged paths)
+   *  are never replayed. */
   const toggleForwardFiles = () => {
     const next = !includeForwardFilesRef.current;
     includeForwardFilesRef.current = next;
     setIncludeForwardFiles(next);
-    if (next) {
-      // Chips that failed to download retry on re-enable.
-      const retry = forwardFilesRef.current.filter((c) => c.status === "error");
-      if (retry.length) {
-        forwardFilesRef.current = forwardFilesRef.current.map((c) =>
-          c.status === "error" ? { ...c, status: "attaching" as const, error: undefined } : c,
-        );
-      }
-      setChips((cur) => addChips(cur, forwardFilesRef.current).chips);
-      retry.forEach(prepareForwardChip);
-    } else {
-      setChips((cur) => withoutForwardChips(cur));
-    }
+    let toPrepare: ComposerAttachment[] = [];
+    setChips((cur) => {
+      const r = toggleForwardChips(cur, forwardSourcesRef.current, next);
+      toPrepare = r.toPrepare;
+      return r.chips;
+    });
+    toPrepare.forEach(prepareForwardChip);
     markDirty();
   };
 

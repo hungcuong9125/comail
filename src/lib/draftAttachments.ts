@@ -72,17 +72,28 @@ export function approvedChips(
   }));
 }
 
+/** The re-preparable identity of a forward source - everything a fresh
+ *  `forwardChip` needs. The "include originals" stash holds THESE, never
+ *  chips: a stashed chip would carry a `ref` (a consumed token, or a staged
+ *  path some later save already orphaned) the wire can no longer spend. */
+export interface ForwardSource {
+  attachmentId: number;
+  displayName: string;
+  size: number | null;
+}
+
 /** A chip for an attachment row of the message being forwarded. Starts
  *  `attaching`; `prepare_forward_attachment` resolves it to a token. */
 export function forwardChip(
   attachmentId: number,
   displayName: string,
+  size: number | null = null,
 ): ComposerAttachment {
   return {
     id: chipId(),
     origin: { kind: "forward", attachmentId },
     displayName,
-    size: null,
+    size,
     ref: null,
     status: "attaching",
   };
@@ -141,6 +152,25 @@ export function withoutForwardChips(
   chips: ComposerAttachment[],
 ): ComposerAttachment[] {
   return chips.filter((c) => c.origin.kind !== "forward");
+}
+
+/** The forward "include original attachments" toggle. Off removes every
+ *  forward-origin chip; on re-adds FRESH `attaching` chips built from
+ *  `sources` - never the old chips, whose refs are spent by then - and
+ *  returns the added ones in `toPrepare` for the caller to run through
+ *  `prepare_forward_attachment` again (a previously failed chip retries
+ *  automatically this way). */
+export function toggleForwardChips(
+  chips: ComposerAttachment[],
+  sources: ForwardSource[],
+  include: boolean,
+): { chips: ComposerAttachment[]; toPrepare: ComposerAttachment[] } {
+  if (!include) return { chips: withoutForwardChips(chips), toPrepare: [] };
+  const { chips: next, added } = addChips(
+    chips,
+    sources.map((s) => forwardChip(s.attachmentId, s.displayName, s.size)),
+  );
+  return { chips: next, toPrepare: added };
 }
 
 /** The wire entries for `save_draft`: every ready chip's ref, in chip
