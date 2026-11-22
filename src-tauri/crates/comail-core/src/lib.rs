@@ -862,14 +862,13 @@ impl Core {
         }
         self.cal_handles.write().await.remove(&account_id);
         self.contacts_handles.write().await.remove(&account_id);
-        // Delete the stored credentials BEFORE clearing the token caches: a
-        // grant queued on the account's refresh lock must find the refresh
-        // token already gone, and `forget` bumps the account's generation so
-        // a grant still in flight discards its result instead of writing a
-        // rotated refresh token back into the keyring or resurrecting the
-        // account's cache entry (account ids are recycled).
-        credentials::delete_all(account_id);
-        self.tokens.forget(account_id).await;
+        // Credential deletion and token-cache clearing happen atomically
+        // under the account's refresh lock: a grant still in flight completes
+        // first and its writes are erased by the purge, and a grant queued
+        // behind it finds no refresh token — no rotated token can be written
+        // back into the keyring and no cache entry resurrected for a removed
+        // account (account ids are recycled).
+        self.tokens.purge(account_id).await;
         self.db
             .write(move |conn| {
                 // Unwind address-book names before the cascade drops the cards.

@@ -25,29 +25,12 @@ use crate::models::Provider;
 use crate::oauth::providers::for_provider;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
 struct CachedToken {
     access_token: String,
     expires_at_ms: i64,
-}
-
-/// Per-account serialization state for refresh-token grants.
-struct AccountLock {
-    /// Serializes every refresh-token use for the account: the mail grant,
-    /// the extra-scope grants, `forget`, and `store_initial` all run under it.
-    mutex: Mutex<()>,
-    /// Bumped by `forget`/`store_initial` immediately — *before* waiting on
-    /// the mutex. A grant that started before the bump re-checks the
-    /// generation right after its network call and discards the result:
-    /// neither the rotated refresh token nor the access token of a
-    /// superseded grant is persisted. That is what stops a grant finishing
-    /// *after* account removal from writing the rotated refresh token back
-    /// into the keyring (account ids are recycled: `accounts.id` is
-    /// `INTEGER PRIMARY KEY` without AUTOINCREMENT).
-    generation: AtomicU64,
 }
 
 #[derive(Clone, Default)]
@@ -59,12 +42,15 @@ pub struct TokenProvider {
     /// own refresh, which both hammered the token endpoint and raced the
     /// primary grant for the rotating refresh token.
     scoped: Arc<Mutex<HashMap<(i64, String), CachedToken>>>,
-    /// The lock serializing all refresh-token grants for one account. Entries
-    /// are created lazily and kept for the life of the provider (bounded by
-    /// the number of accounts ever seen): dropping an entry while a grant is
-    /// in flight would give the next caller a *different* mutex and break the
-    /// serialization.
-    refresh_locks: Arc<Mutex<HashMap<i64, Arc<AccountLock>>>>,
+    /// The lock serializing all refresh-token work for one account — primary
+    /// and scoped grants, `store_initial`, and `purge` each run their ENTIRE
+    /// operation under it, so the stored refresh token can never be read,
+    /// rotated, replaced, or deleted between a grant's start and its writes.
+    /// Entries are created lazily and kept for the life of the provider
+    /// (bounded by the number of accounts ever seen): dropping an entry while
+    /// a grant is in flight would give the next caller a *different* mutex
+    /// and break the serialization.
+    refresh_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
 }
 
 impl TokenProvider {
@@ -73,17 +59,12 @@ impl TokenProvider {
     }
 
     /// The lock serializing refresh-token grants for `account_id`.
-    async fn refresh_lock(&self, account_id: i64) -> Arc<AccountLock> {
+    async fn refresh_lock(&self, account_id: i64) -> Arc<Mutex<()>> {
         self.refresh_locks
             .lock()
             .await
             .entry(account_id)
-            .or_insert_with(|| {
-                Arc::new(AccountLock {
-                    mutex: Mutex::new(()),
-                    generation: AtomicU64::new(0),
-                })
-            })
+            .or_default()
             .clone()
     }
 
@@ -110,9 +91,8 @@ impl TokenProvider {
             .map(|t| t.access_token.clone())
     }
 
-    /// Clear both caches for the account. Caller must hold the account lock;
-    /// `forget`/`store_initial` use this (calling `forget` itself would
-    /// self-deadlock on the held permit).
+    /// Clear both caches for the account. Caller must hold the account lock —
+    /// `purge` and `store_initial` use this.
     async fn clear_caches(&self, account_id: i64) {
         self.cache.lock().await.remove(&account_id);
         self.scoped
@@ -123,10 +103,12 @@ impl TokenProvider {
 
     /// Store initial tokens after the auth-code exchange.
     ///
-    /// The whole operation — superseding in-flight grants, persisting the new
-    /// refresh token, clearing the old caches, inserting the new token — runs
-    /// under the account lock so a grant finishing with the *old* token set
-    /// can't write its rotated refresh token back over the new credential.
+    /// The whole operation — persisting the new refresh token, clearing the
+    /// old caches, inserting the new token — runs under the account lock: a
+    /// grant still in flight for the *old* token set completes first (its
+    /// writes are superseded by the clear+insert below), and callers queued
+    /// behind this find the fresh cache entry on their re-check instead of
+    /// spending the already-consumed refresh token again.
     pub async fn store_initial(
         &self,
         account_id: i64,
@@ -135,11 +117,7 @@ impl TokenProvider {
         refresh_token: Option<String>,
     ) -> Result<()> {
         let lock = self.refresh_lock(account_id).await;
-        // Supersede in-flight grants of the previous token set *before*
-        // serializing: their rotated refresh token must never overwrite the
-        // credential stored below.
-        lock.generation.fetch_add(1, Ordering::SeqCst);
-        let _permit = lock.mutex.lock().await;
+        let _permit = lock.lock().await;
         if let Some(rt) = refresh_token {
             credentials::store_async(account_id, Slot::RefreshToken, rt).await?;
         }
@@ -159,19 +137,52 @@ impl TokenProvider {
         Ok(())
     }
 
-    /// Drop every cached token - primary and scoped - for the account. Bumps
-    /// the account's generation first so a grant still in flight discards its
-    /// result, then waits on the account's refresh lock so a just-finishing
-    /// grant can't insert a token *after* the clear and resurrect it.
-    pub async fn forget(&self, account_id: i64) {
+    /// Atomically delete the account's credentials and cached tokens under
+    /// the account's refresh lock — used on account removal. A grant in
+    /// flight completes first and its writes are then erased below; a grant
+    /// queued behind the purge finds no stored refresh token and fails with
+    /// `Auth("no stored credential")` before touching the network.
+    pub async fn purge(&self, account_id: i64) {
         let lock = self.refresh_lock(account_id).await;
-        lock.generation.fetch_add(1, Ordering::SeqCst);
-        let _permit = lock.mutex.lock().await;
+        let _permit = lock.lock().await;
+        // `delete_all` is a blocking keyring call — the same spawn_blocking
+        // pattern the crate uses for store_async/load_async. Holding the
+        // account lock across it is what makes delete+clear atomic wrt grants.
+        let _ = tokio::task::spawn_blocking(move || credentials::delete_all(account_id)).await;
         self.clear_caches(account_id).await;
     }
 
     /// A valid access token, refreshed if less than 5 minutes remain.
     pub async fn access_token(&self, account_id: i64, provider: Provider) -> Result<String> {
+        let cfg =
+            for_provider(provider).ok_or_else(|| CoreError::Auth("not an oauth account".into()))?;
+        self.access_token_inner(account_id, provider, cfg.token_url)
+            .await
+    }
+
+    /// `access_token` against a specific token endpoint — tests only; the
+    /// provider's `token_url` is a fixed constant in production.
+    #[cfg(test)]
+    async fn access_token_at(
+        &self,
+        account_id: i64,
+        provider: Provider,
+        token_url: &str,
+    ) -> Result<String> {
+        self.access_token_inner(account_id, provider, token_url)
+            .await
+    }
+
+    /// Fast path = a cache read without the account lock. Slow path = the
+    /// whole grant under the account's lock: cache re-check, refresh-token
+    /// load, POST, rotated-token persist, cache write. `token_url` is a
+    /// parameter only so tests can point it at a local listener.
+    async fn access_token_inner(
+        &self,
+        account_id: i64,
+        provider: Provider,
+        token_url: &str,
+    ) -> Result<String> {
         if let Some(tok) = self.cached(account_id).await {
             return Ok(tok);
         }
@@ -181,22 +192,11 @@ impl TokenProvider {
         // are only ever held for lookups; the network call below happens under
         // the per-account lock alone.
         let lock = self.refresh_lock(account_id).await;
-        let _permit = lock.mutex.lock().await;
+        let _permit = lock.lock().await;
         if let Some(tok) = self.cached(account_id).await {
             return Ok(tok);
         }
-        // Snapshot *after* acquiring the lock so a forget/store_initial that
-        // is already queued can't slip in between the check and the grant.
-        let generation = lock.generation.load(Ordering::SeqCst);
-        let Some(refreshed) = self
-            .refresh(account_id, provider, &lock, generation)
-            .await?
-        else {
-            // Superseded mid-grant: a forget/store_initial landed while the
-            // network call was in flight. Serve whatever the newer grant
-            // installed; if it left nothing, the account needs reauth.
-            return self.cached(account_id).await.ok_or(CoreError::NeedsReauth);
-        };
+        let refreshed = self.refresh(account_id, provider, token_url).await?;
         let token = refreshed.access_token.clone();
         self.cache.lock().await.insert(account_id, refreshed);
         Ok(token)
@@ -223,18 +223,45 @@ impl TokenProvider {
         provider: Provider,
         scope: &str,
     ) -> Result<String> {
+        let cfg =
+            for_provider(provider).ok_or_else(|| CoreError::Auth("not an oauth account".into()))?;
+        self.access_token_for_scope_inner(account_id, provider, scope, cfg.token_url)
+            .await
+    }
+
+    /// `access_token_for_scope` against a specific token endpoint — tests
+    /// only; the provider's `token_url` is a fixed constant in production.
+    #[cfg(test)]
+    async fn access_token_for_scope_at(
+        &self,
+        account_id: i64,
+        provider: Provider,
+        scope: &str,
+        token_url: &str,
+    ) -> Result<String> {
+        self.access_token_for_scope_inner(account_id, provider, scope, token_url)
+            .await
+    }
+
+    /// Same fast/slow split as `access_token_inner`: the whole scoped grant
+    /// runs under the account's lock, shared with the primary grant because
+    /// both consume (and rotate) the same refresh token.
+    async fn access_token_for_scope_inner(
+        &self,
+        account_id: i64,
+        provider: Provider,
+        scope: &str,
+        token_url: &str,
+    ) -> Result<String> {
         let key = (account_id, scope.to_string());
         if let Some(tok) = self.cached_scoped(&key).await {
             return Ok(tok);
         }
         let lock = self.refresh_lock(account_id).await;
-        let _permit = lock.mutex.lock().await;
+        let _permit = lock.lock().await;
         if let Some(tok) = self.cached_scoped(&key).await {
             return Ok(tok);
         }
-        let generation = lock.generation.load(Ordering::SeqCst);
-        let cfg =
-            for_provider(provider).ok_or_else(|| CoreError::Auth("not an oauth account".into()))?;
         let (client_id, client_secret) = crate::oauth::providers::resolve_credentials(provider)?;
         let refresh_token = credentials::load_async(account_id, Slot::RefreshToken).await?;
 
@@ -249,7 +276,7 @@ impl TokenProvider {
             form.push(("client_secret".to_string(), cs));
         }
 
-        let body = post_form(cfg.token_url, &form).await?;
+        let body = post_form(token_url, &form).await?;
         let tok: TokenResponse = serde_json::from_str(&body).map_err(|_| {
             // invalid_grant / consent_required => the scope was never granted.
             if body.contains("invalid_grant") || body.contains("AADSTS65001") {
@@ -261,14 +288,6 @@ impl TokenProvider {
                 ))
             }
         })?;
-
-        // A forget()/store_initial() that landed while the grant was in
-        // flight superseded it: discard everything. The rotated refresh token
-        // belongs to the abandoned grant and must not overwrite the newer
-        // credential.
-        if lock.generation.load(Ordering::SeqCst) != generation {
-            return self.cached_scoped(&key).await.ok_or(CoreError::NeedsReauth);
-        }
 
         // Do NOT overwrite Slot::AccessToken (that is the mail token, a
         // different audience). Only persist the rotated refresh token.
@@ -285,18 +304,13 @@ impl TokenProvider {
         Ok(token)
     }
 
-    /// Run the mail refresh-token grant. Returns `Ok(None)` when the grant
-    /// was superseded by a `forget`/`store_initial` while in flight — in
-    /// that case nothing (rotated refresh token, cache entry) is persisted.
+    /// Run the mail refresh-token grant. Caller holds the account lock.
     async fn refresh(
         &self,
         account_id: i64,
         provider: Provider,
-        lock: &AccountLock,
-        generation: u64,
-    ) -> Result<Option<CachedToken>> {
-        let cfg =
-            for_provider(provider).ok_or_else(|| CoreError::Auth("not an oauth account".into()))?;
+        token_url: &str,
+    ) -> Result<CachedToken> {
         let (client_id, client_secret) = crate::oauth::providers::resolve_credentials(provider)?;
         let refresh_token = credentials::load_async(account_id, Slot::RefreshToken).await?;
 
@@ -309,7 +323,7 @@ impl TokenProvider {
             form.push(("client_secret".to_string(), cs));
         }
 
-        let body = post_form(cfg.token_url, &form).await?;
+        let body = post_form(token_url, &form).await?;
         let tok: TokenResponse = serde_json::from_str(&body).map_err(|_| {
             if body.contains("invalid_grant") {
                 CoreError::NeedsReauth
@@ -318,22 +332,14 @@ impl TokenProvider {
             }
         })?;
 
-        // A forget()/store_initial() that landed while the grant was in
-        // flight superseded it: discard everything. The rotated refresh token
-        // belongs to the abandoned grant and must not overwrite the newer
-        // credential (or, after account removal, resurrect it in the keyring).
-        if lock.generation.load(Ordering::SeqCst) != generation {
-            return Ok(None);
-        }
-
         if let Some(rt) = tok.refresh_token {
             credentials::store_async(account_id, Slot::RefreshToken, rt).await?;
         }
-        Ok(Some(CachedToken {
+        Ok(CachedToken {
             access_token: tok.access_token,
             expires_at_ms: crate::models::now_ms()
                 + tok.expires_in.unwrap_or(3600).saturating_sub(60) * 1000,
-        }))
+        })
     }
 }
 
@@ -372,10 +378,10 @@ const POST_FORM_MAX_BODY: u64 = 256 * 1024;
 /// Form POST to an OAuth token endpoint. Returns the raw response body for
 /// 2xx and 4xx statuses — callers parse both success and OAuth-error JSON out
 /// of it (`invalid_grant` in a 4xx body is what maps to `NeedsReauth`).
-/// 5xx and 429 surface as `CoreError::Network` (provider-side trouble is
-/// transient, not an auth problem — flagging it `Auth` would mark healthy
-/// accounts needs-reauth during an outage), 3xx as `CoreError::Auth`, and
-/// transport failures as `CoreError::Network`.
+/// 5xx, 429, redirects, and transport failures surface as `CoreError::Network`
+/// — all are transient/network-level problems, not auth failures, and mapping
+/// them `Auth` would flag healthy accounts needs-reauth during an outage or a
+/// captive-portal redirect.
 ///
 /// Bounded by `POST_FORM_TIMEOUT`: it wraps the whole exchange, so a stalled
 /// connect, a server that never responds, and a server that accepts then goes
@@ -420,11 +426,12 @@ async fn post_form_inner(url: &str, form: &[(String, String)]) -> Result<String>
         .map_err(|e| CoreError::Network(format!("token POST {url}: {e}")))?;
     let status = resp.status();
     if status.is_redirection() {
-        // Redirects are disabled above, so the response reaches us as-is; a
-        // 3xx on a token endpoint is abnormal (misconfigured endpoint or a
-        // captive portal). Not an OAuth error, so not NeedsReauth.
+        // Redirects are disabled above, so the response reaches us as-is. A
+        // 3xx on a token endpoint means a captive portal, proxy interference,
+        // or a misconfigured endpoint — transient/network-level, NOT an auth
+        // failure: `Auth` would flag a healthy account needs-reauth.
         tracing::warn!(%url, %status, "oauth: token POST: unexpected redirect");
-        return Err(CoreError::Auth(format!(
+        return Err(CoreError::Network(format!(
             "token POST {url}: unexpected redirect (HTTP {status})"
         )));
     }
@@ -574,30 +581,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forget_drops_primary_and_scoped_tokens() {
+    async fn purge_drops_primary_and_scoped_tokens() {
+        let _creds = creds_env().await;
         let p = TokenProvider::new();
-        p.store_initial(1, "tok".to_string(), Some(3600), None)
+        p.store_initial(91_005, "tok".to_string(), Some(3600), None)
             .await
             .unwrap();
         p.scoped.lock().await.insert(
-            (1, "scope".into()),
+            (91_005, "scope".into()),
             CachedToken {
                 access_token: "scoped".into(),
                 expires_at_ms: i64::MAX,
             },
         );
         p.scoped.lock().await.insert(
-            (2, "scope".into()),
+            (91_006, "scope".into()),
             CachedToken {
                 access_token: "other".into(),
                 expires_at_ms: i64::MAX,
             },
         );
-        p.forget(1).await;
+        p.purge(91_005).await;
         assert!(p.cache.lock().await.is_empty());
         let scoped = p.scoped.lock().await;
         assert_eq!(scoped.len(), 1);
-        assert!(scoped.contains_key(&(2, "scope".into())));
+        assert!(scoped.contains_key(&(91_006, "scope".into())));
     }
 
     #[tokio::test]
@@ -609,7 +617,7 @@ mod tests {
         // Hold account 1's refresh lock (as an in-flight grant would): a
         // cached-token read for account 2 must still return immediately.
         let lock = p.refresh_lock(1).await;
-        let _held = lock.mutex.lock().await;
+        let _held = lock.lock().await;
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             p.access_token(2, Provider::Gmail),
@@ -623,7 +631,7 @@ mod tests {
         let p = TokenProvider::new();
         // Account 1's grant is "in flight".
         let lock = p.refresh_lock(1).await;
-        let held = lock.mutex.lock().await;
+        let held = lock.lock().await;
         let p2 = p.clone();
         let waiter = tokio::spawn(async move { p2.access_token(1, Provider::Gmail).await });
         tokio::task::yield_now().await;
@@ -721,8 +729,9 @@ mod tests {
         )
         .await;
         let err = post_form(&url, &form()).await.unwrap_err();
-        // Surfaces as an auth-endpoint anomaly, not NeedsReauth.
-        assert!(matches!(err, CoreError::Auth(_)), "{err:?}");
+        // A captive-portal/proxy redirect is transient, not an auth failure
+        // (`Auth` would flag the healthy account needs-reauth).
+        assert!(matches!(err, CoreError::Network(_)), "{err:?}");
         target.await.unwrap();
         assert!(
             !target_hit.load(std::sync::atomic::Ordering::SeqCst),
@@ -730,68 +739,222 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn forget_supersedes_a_grant_still_in_flight() {
-        let p = TokenProvider::new();
-        let lock = p.refresh_lock(1).await;
-        let gen0 = lock.generation.load(Ordering::SeqCst);
-        // Hold the permit like a grant whose network call is in flight.
-        let held = lock.mutex.lock().await;
-        let p2 = p.clone();
-        let forget = tokio::spawn(async move { p2.forget(1).await });
-        // The generation bump lands immediately, without waiting on the
-        // permit: the "grant" would now see a changed generation after its
-        // I/O and discard its result (no rotated rt, no cache write).
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-            if lock.generation.load(Ordering::SeqCst) != gen0 {
-                break;
+    /// Route credential storage to a per-process temp file and register OAuth
+    /// client creds, so grant paths run end-to-end in tests. Returns a guard
+    /// serializing every credential-touching test: the insecure-file backend
+    /// is a shared read-modify-write JSON file, so parallel tests would
+    /// otherwise clobber each other's stored refresh tokens. No other unit
+    /// test touches credentials; distinct account ids isolate the file.
+    async fn creds_env() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let guard = LOCK.lock().await;
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let path = std::env::temp_dir().join(format!(
+                "comail-tokens-test-creds-{}.json",
+                std::process::id()
+            ));
+            unsafe { std::env::set_var("COMAIL_CREDENTIALS_INSECURE_FILE", path) };
+        });
+        crate::oauth::providers::set_configured(Provider::Gmail, "test-client-id", "");
+        guard
+    }
+
+    /// A local token endpoint: accepts one POST per canned response,
+    /// returns it as JSON, and records every request body. Returns the
+    /// endpoint URL and a handle resolving to the captured bodies.
+    async fn grant_endpoint(
+        responses: Vec<String>,
+        delay: std::time::Duration,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for resp in responses {
+                let (mut s, _) = listener.accept().await.unwrap();
+                // Drain the request: headers and body can arrive in separate
+                // TCP segments, so read until the peer goes briefly idle.
+                let mut req = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        s.read(&mut chunk),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) | Err(_) => break,
+                        Ok(Ok(n)) => req.extend_from_slice(&chunk[..n]),
+                        Ok(Err(e)) => panic!("request read failed: {e}"),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req);
+                bodies.push(text.split("\r\n\r\n").nth(1).unwrap_or("").to_string());
+                tokio::time::sleep(delay).await;
+                let out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    resp.len(),
+                    resp
+                );
+                s.write_all(out.as_bytes()).await.unwrap();
+                s.shutdown().await.unwrap();
             }
-        }
-        assert_ne!(lock.generation.load(Ordering::SeqCst), gen0);
-        // Even if something still slips a stale token into the caches while
-        // forget waits, the serialized clear removes it.
-        p.cache.lock().await.insert(
-            1,
-            CachedToken {
-                access_token: "stale".into(),
-                expires_at_ms: i64::MAX,
-            },
-        );
-        p.scoped.lock().await.insert(
-            (1, "scope".into()),
-            CachedToken {
-                access_token: "stale".into(),
-                expires_at_ms: i64::MAX,
-            },
-        );
-        drop(held);
-        forget.await.unwrap();
-        assert!(p.cache.lock().await.is_empty());
-        assert!(p.scoped.lock().await.is_empty());
+            bodies
+        });
+        (format!("http://127.0.0.1:{port}/token"), task)
+    }
+
+    /// Form-decoded value of one field in a captured request body.
+    fn form_field(body: &str, name: &str) -> String {
+        url::form_urlencoded::parse(body.as_bytes())
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default()
     }
 
     #[tokio::test]
     async fn store_initial_supersedes_a_grant_still_in_flight() {
+        let _creds = creds_env().await;
+        let acct = 91_001;
+        credentials::store_async(acct, Slot::RefreshToken, "rt0".into())
+            .await
+            .unwrap();
+        // Slow endpoint: the grant is mid-POST when store_initial arrives.
+        let (url, server) = grant_endpoint(
+            vec![
+                "{\"access_token\":\"AT-old\",\"refresh_token\":\"rt1\",\"expires_in\":3600}"
+                    .into(),
+            ],
+            std::time::Duration::from_millis(300),
+        )
+        .await;
         let p = TokenProvider::new();
-        let lock = p.refresh_lock(1).await;
-        let gen0 = lock.generation.load(Ordering::SeqCst);
-        let held = lock.mutex.lock().await;
         let p2 = p.clone();
-        let store = tokio::spawn(async move {
-            p2.store_initial(1, "fresh".to_string(), Some(3600), None)
+        let url2 = url.clone();
+        let refresh =
+            tokio::spawn(async move { p2.access_token_at(acct, Provider::Gmail, &url2).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        p.store_initial(acct, "AT-new".into(), Some(3600), Some("rt-new".into()))
+            .await
+            .unwrap();
+        // The in-flight grant completed first and returned its own valid
+        // token; nobody saw NeedsReauth.
+        assert_eq!(refresh.await.unwrap().unwrap(), "AT-old");
+        // The stored refresh token and caches are the NEW grant's.
+        assert_eq!(
+            credentials::load_async(acct, Slot::RefreshToken)
                 .await
-        });
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-            if lock.generation.load(Ordering::SeqCst) != gen0 {
-                break;
-            }
-        }
-        // The supersede bump landed while the "grant" still held the permit.
-        assert_ne!(lock.generation.load(Ordering::SeqCst), gen0);
-        drop(held);
-        store.await.unwrap().unwrap();
-        assert_eq!(p.access_token(1, Provider::Gmail).await.unwrap(), "fresh");
+                .unwrap(),
+            "rt-new"
+        );
+        assert_eq!(p.cached(acct).await.as_deref(), Some("AT-new"));
+        assert!(p.scoped.lock().await.is_empty());
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn purge_erases_credentials_and_caches_after_an_in_flight_grant() {
+        let _creds = creds_env().await;
+        let acct = 91_002;
+        credentials::store_async(acct, Slot::RefreshToken, "rt0".into())
+            .await
+            .unwrap();
+        let (url, server) = grant_endpoint(
+            vec![
+                "{\"access_token\":\"AT-old\",\"refresh_token\":\"rt1\",\"expires_in\":3600}"
+                    .into(),
+            ],
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let p = TokenProvider::new();
+        let p2 = p.clone();
+        let url2 = url.clone();
+        let refresh =
+            tokio::spawn(async move { p2.access_token_at(acct, Provider::Gmail, &url2).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        p.purge(acct).await;
+        // The grant finished first and got its token; then everything was
+        // erased atomically under the same lock.
+        assert_eq!(refresh.await.unwrap().unwrap(), "AT-old");
+        assert!(p.cached(acct).await.is_none());
+        assert!(p.scoped.lock().await.is_empty());
+        assert!(
+            credentials::load_async(acct, Slot::RefreshToken)
+                .await
+                .is_err()
+        );
+        // A grant queued behind the purge finds no refresh token and fails
+        // before any network call.
+        let err = p
+            .access_token_at(acct, Provider::Gmail, &url)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Auth(_)), "{err:?}");
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn primary_and_scoped_grants_share_the_rotating_refresh_token() {
+        let _creds = creds_env().await;
+        let acct = 91_003;
+        credentials::store_async(acct, Slot::RefreshToken, "rt0".into())
+            .await
+            .unwrap();
+        let (url, server) = grant_endpoint(
+            vec![
+                "{\"access_token\":\"A1\",\"refresh_token\":\"rt1\",\"expires_in\":3600}".into(),
+                "{\"access_token\":\"A2\",\"refresh_token\":\"rt2\",\"expires_in\":3600}".into(),
+            ],
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let p = TokenProvider::new();
+        let (primary, scoped) = tokio::join!(
+            p.access_token_at(acct, Provider::Gmail, &url),
+            p.access_token_for_scope_at(acct, Provider::Gmail, "scope", &url),
+        );
+        primary.unwrap();
+        scoped.unwrap();
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies.len(), 2);
+        // Exactly sequential: the second grant submitted the refresh token
+        // rotated by the first — a parallel grant would have resubmitted rt0
+        // and been invalidated.
+        let rts: Vec<String> = bodies
+            .iter()
+            .map(|b| form_field(b, "refresh_token"))
+            .collect();
+        assert_eq!(rts, ["rt0", "rt1"]);
+        assert_eq!(
+            credentials::load_async(acct, Slot::RefreshToken)
+                .await
+                .unwrap(),
+            "rt2"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_primary_grants_post_once() {
+        let _creds = creds_env().await;
+        let acct = 91_004;
+        credentials::store_async(acct, Slot::RefreshToken, "rt0".into())
+            .await
+            .unwrap();
+        let (url, server) = grant_endpoint(
+            vec!["{\"access_token\":\"AT\",\"refresh_token\":\"rt1\",\"expires_in\":3600}".into()],
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let p = TokenProvider::new();
+        let (a, b) = tokio::join!(
+            p.access_token_at(acct, Provider::Gmail, &url),
+            p.access_token_at(acct, Provider::Gmail, &url),
+        );
+        assert_eq!(a.unwrap(), "AT");
+        // The queued caller re-checked the cache instead of posting again.
+        assert_eq!(b.unwrap(), "AT");
+        assert_eq!(server.await.unwrap().len(), 1);
     }
 }
