@@ -22,6 +22,10 @@ import type {
 import { automationRisk, automationRiskMessage } from "../../lib/automationRisk";
 import { syncNowAndRefresh, useManualSyncBusy } from "../../lib/syncNow";
 import { normalizeSyncStatus } from "../../lib/syncStatus";
+import {
+  withOAuthSecretFlag,
+  type OAuthSecretProvider,
+} from "../../lib/oauthSecrets";
 import { inboxTabOrder } from "../../lib/splitOrder";
 import { queryClient } from "../../queries/client";
 import { updateSettings } from "../../queries/settings";
@@ -111,9 +115,9 @@ const DEFAULT_SETTINGS: Settings = {
   aiTierSummarize: "instant",
   aiTierVoice: "cheap",
   googleClientId: "",
-  googleClientSecret: "",
+  hasGoogleClientSecret: false,
   msClientId: "",
-  msClientSecret: "",
+  hasMsClientSecret: false,
   embeddingBackend: "local",
   embeddingModel: "bge-small-en-v1.5",
   aiQuickReplies: true,
@@ -2751,15 +2755,12 @@ function OAuthField({
   label,
   hint,
   placeholder,
-  secret,
 }: {
   settings: Settings;
-  field:
-    "googleClientId" | "googleClientSecret" | "msClientId" | "msClientSecret";
+  field: "googleClientId" | "msClientId";
   label: string;
   hint?: string;
   placeholder: string;
-  secret?: boolean;
 }) {
   const [value, setValue] = useState(settings[field]);
   useEffect(() => setValue(settings[field]), [settings, field]);
@@ -2772,7 +2773,7 @@ function OAuthField({
   return (
     <SettingRow label={label} hint={hint}>
       <input
-        type={secret ? "password" : "text"}
+        type="text"
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onBlur={commit}
@@ -2784,6 +2785,79 @@ function OAuthField({
         spellCheck={false}
         className={`${inputCls} !w-[280px]`}
       />
+    </SettingRow>
+  );
+}
+
+/** Keychain-backed client secret: shows only whether one is stored (like the
+ *  AI key), replaces it via `set_oauth_client_secret`, and saves empty to
+ *  clear it. The value itself never crosses IPC. */
+function OAuthSecretField({
+  provider,
+  hasSecret,
+  label,
+  hint,
+  placeholder,
+}: {
+  provider: OAuthSecretProvider;
+  hasSecret: boolean;
+  label: string;
+  hint?: string;
+  placeholder: string;
+}) {
+  const { t } = useTranslation();
+  const pushToast = useUi((s) => s.pushToast);
+  const [value, setValue] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    if (saving) return;
+    setSaving(true);
+    const secret = value.trim();
+    try {
+      await call("set_oauth_client_secret", { provider, secret });
+      pushToast({
+        kind: "info",
+        message: secret
+          ? t("settings:oauth.secretSaved")
+          : t("settings:oauth.secretCleared"),
+        durationMs: 2500,
+      });
+      setValue("");
+      // Patch the cached flag the way get_settings will report it - a plain
+      // invalidate could land behind an in-flight whole-object write.
+      queryClient.setQueryData<Settings>(["settings"], (cur) =>
+        cur ? withOAuthSecretFlag(cur, provider, secret !== "") : cur,
+      );
+    } catch (err) {
+      pushToast({ kind: "error", message: errorMessage(err) });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <SettingRow
+      label={label}
+      hint={hasSecret ? t("settings:oauth.secretStored") : hint}
+    >
+      <div className="flex items-center gap-2">
+        <input
+          type="password"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void save();
+          }}
+          placeholder={hasSecret ? "••••••••" : placeholder}
+          autoComplete="off"
+          spellCheck={false}
+          className={`${inputCls} !w-[220px]`}
+        />
+        <Button variant="primary" busy={saving} onClick={() => void save()}>
+          {t("settings:ai.save")}
+        </Button>
+      </div>
     </SettingRow>
   );
 }
@@ -2874,13 +2948,12 @@ function OAuthSection({ settings }: { settings: Settings }) {
         label={t("settings:oauth.googleClientIdLabel")}
         placeholder={t("settings:oauth.googleClientIdPlaceholder")}
       />
-      <OAuthField
-        settings={settings}
-        field="googleClientSecret"
+      <OAuthSecretField
+        provider="google"
+        hasSecret={settings.hasGoogleClientSecret}
         label={t("settings:oauth.googleClientSecretLabel")}
         hint={t("settings:oauth.googleClientSecretHint")}
         placeholder={t("settings:oauth.googleClientSecretPlaceholder")}
-        secret
       />
       <OAuthField
         settings={settings}
@@ -2889,13 +2962,12 @@ function OAuthSection({ settings }: { settings: Settings }) {
         hint={t("settings:oauth.msClientIdHint")}
         placeholder={t("settings:oauth.msClientIdPlaceholder")}
       />
-      <OAuthField
-        settings={settings}
-        field="msClientSecret"
+      <OAuthSecretField
+        provider="microsoft"
+        hasSecret={settings.hasMsClientSecret}
         label={t("settings:oauth.msClientSecretLabel")}
         hint={t("settings:oauth.msClientSecretHint")}
         placeholder={t("settings:oauth.msClientSecretPlaceholder")}
-        secret
       />
     </SettingsGroup>
   );

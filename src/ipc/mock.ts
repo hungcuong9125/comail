@@ -1489,9 +1489,9 @@ const DEFAULT_MOCK_SETTINGS: Settings = {
   aiTierSummarize: "instant",
   aiTierVoice: "cheap",
   googleClientId: "",
-  googleClientSecret: "",
+  hasGoogleClientSecret: false,
   msClientId: "",
-  msClientSecret: "",
+  hasMsClientSecret: false,
   embeddingBackend: "local",
   embeddingModel: "bge-small-en-v1.5",
   aiQuickReplies: true,
@@ -3867,6 +3867,21 @@ export async function mockInvoke(
     case "set_ai_key":
     case "set_decision_key":
       return delay(undefined, 150);
+
+    case "set_oauth_client_secret": {
+      // The browser demo keeps no real secret: it only tracks the presence
+      // flag, like the app's settings row.
+      const secret = ((a.secret as string) ?? "").trim() !== "";
+      if (a.provider === "google") settings.hasGoogleClientSecret = secret;
+      else if (a.provider === "microsoft")
+        settings.hasMsClientSecret = secret;
+      try {
+        localStorage.setItem("comail:mock-settings", JSON.stringify(settings));
+      } catch {
+        /* ignore */
+      }
+      return delay(undefined, 150);
+    }
 
     case "test_decision_provider": {
       const chain = [

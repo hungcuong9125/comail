@@ -269,7 +269,7 @@
       "g2": "OAuth consent screen: choose External (Internal only if you have a Workspace org), fill in the app name and your email for the support + developer contact, then add your own Gmail address under Test users.",
       "g3": "Scopes: click Add or remove scopes, paste https://mail.google.com/ into the manual entry box and add it. That is the only scope Google accepts for IMAP/SMTP XOAUTH2; you do not need to enable the Gmail API.",
       "g4": "Credentials: Create credentials, OAuth client ID, application type Desktop app. Desktop clients accept the http://127.0.0.1 loopback automatically, so there is no redirect URI to configure.",
-      "g5": "Copy the Client ID (ends in .apps.googleusercontent.com) and the Client secret (starts GOCSPX-) into the fields below. They save on blur or Enter.",
+      "g5": "Copy the Client ID (ends in .apps.googleusercontent.com) and the Client secret (starts GOCSPX-) into the fields below. The client ID saves on blur or Enter; the secret saves with its Save button and is stored in the system keychain.",
       "g6": "Once sign-in works, return to the consent screen and click Publish app (Production). While in Testing, Google expires refresh tokens after 7 days and the account flips to needs-reauth weekly; publishing stops that.",
       "g7": "For calendar sync (Connect Google Calendar): in the same project enable the Google Calendar API (APIs & Services, Library, search Google Calendar API, Enable), and on the consent screen add the scope https://www.googleapis.com/auth/calendar. Without both, connecting fails with a calendar server error.",
       "msTitle": "Microsoft (Outlook / 365)",
@@ -283,7 +283,10 @@
       "msNote": "Personal Outlook.com / Hotmail / Live account? You still register the app here. Sign into the portal with your personal account (it is free, no Azure subscription needed) and pick the multitenant + personal option in step 2. The account you register with and the mailbox you connect can be different.",
       "docsHint": "Prefer the full walkthrough with screenshots and troubleshooting?",
       "viewDocs": "View full guide on GitHub"
-    }
+    },
+    "secretSaved": "Client secret saved",
+    "secretCleared": "Client secret cleared",
+    "secretStored": "Stored in the system keychain and never shown. Save empty to clear it."
   },
   "accounts": {
     "signedOut": "Signed out. Mail sync is paused until you sign in again.",
