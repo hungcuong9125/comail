@@ -37,29 +37,102 @@ export const SIGNATURE_CLASS = "co-signature";
 /** Blank lines between the body text and the signature block. */
 const SIGNATURE_SPACER = "<br><br>";
 
-const SIG_OPEN_RE = new RegExp(
-  `<div\\b[^>]*\\bclass\\s*=\\s*(["'])(?:(?!\\1).)*(?<=["'\\s])${SIGNATURE_CLASS}(?=["'\\s])(?:(?!\\1).)*\\1[^>]*>`,
-  "i",
-);
-
 /** Wrap signature HTML in the block the composer can later find and swap. */
 export function wrapSignature(sigHtml: string): string {
   return `<div class="${SIGNATURE_CLASS}">${sigHtml}</div>`;
 }
 
+/** [start, end) of a `<div` open tag whose class attribute lists
+ *  `co-signature` (as a whitespace-separated token), or -1. Manual scan: the
+ *  regex this replaced could backtrack quadratically on a `class="…` value
+ *  with no closing quote. Runs on a lowercase copy so indexOf positions map
+ *  straight back to the original. */
+function findSigOpen(html: string): [number, number] | null {
+  const lower = html.toLowerCase();
+  let pos = 0;
+  for (;;) {
+    const lt = lower.indexOf("<div", pos);
+    if (lt < 0) return null;
+    const boundary = lower[lt + 4];
+    if (boundary !== undefined && /[\s/>]/.test(boundary)) {
+      const gt = lower.indexOf(">", lt + 4);
+      if (gt < 0) return null;
+      // Attributes: name [= quoted-or-bare value] pairs within [lt+4, gt).
+      let i = lt + 4;
+      while (i < gt) {
+        while (i < gt && /[\s/]/.test(lower[i])) i += 1;
+        const nameStart = i;
+        while (i < gt && !/[\s/=>]/.test(lower[i])) i += 1;
+        const name = lower.slice(nameStart, i);
+        while (i < gt && /\s/.test(lower[i])) i += 1;
+        let value = "";
+        if (lower[i] === "=") {
+          i += 1;
+          while (i < gt && /\s/.test(lower[i])) i += 1;
+          const q = lower[i];
+          if (q === '"' || q === "'") {
+            const close = lower.indexOf(q, i + 1);
+            const vEnd = close < 0 || close > gt ? gt : close;
+            value = lower.slice(i + 1, vEnd);
+            i = vEnd + 1;
+          } else {
+            const vStart = i;
+            while (i < gt && !/[\s>]/.test(lower[i])) i += 1;
+            value = lower.slice(vStart, i);
+          }
+        }
+        if (name === "class" && value.split(/\s+/).includes(SIGNATURE_CLASS)) {
+          return [lt, gt + 1];
+        }
+      }
+      pos = gt + 1;
+    } else {
+      pos = lt + 4;
+    }
+  }
+}
+
 /** [start, end) of the first signature block, matching nested <div>s by depth. */
 function findSignatureBlock(html: string): [number, number] | null {
-  const open = SIG_OPEN_RE.exec(html);
+  const open = findSigOpen(html);
   if (!open) return null;
-  const tag = /<(\/?)div\b[^>]*>/gi;
-  tag.lastIndex = open.index + open[0].length;
+  const lower = html.toLowerCase();
   let depth = 1;
-  for (let m = tag.exec(html); m; m = tag.exec(html)) {
-    depth += m[1] ? -1 : 1;
-    if (depth === 0) return [open.index, m.index + m[0].length];
+  let pos = open[1];
+  for (;;) {
+    const lt = lower.indexOf("<", pos);
+    if (lt < 0) return [open[0], html.length];
+    const closing = lower[lt + 1] === "/";
+    const nameStart = lt + (closing ? 2 : 1);
+    const after = lower[nameStart + 3];
+    if (
+      lower.startsWith("div", nameStart) &&
+      (after === undefined || /[\s/>]/.test(after))
+    ) {
+      const gt = lower.indexOf(">", nameStart + 3);
+      if (gt < 0) return [open[0], html.length];
+      depth += closing ? -1 : 1;
+      if (depth === 0) return [open[0], gt + 1];
+      pos = gt + 1;
+    } else {
+      pos = lt + 1;
+    }
   }
-  // Unclosed (truncated markup): the block runs to the end.
-  return [open.index, html.length];
+}
+
+/** Index past the last `<br>`/whitespace run at the end of `s`, so callers can
+ *  trim the spacer lines that precede a signature block. The run is found by
+ *  tiling consecutive matches rather than a `(…)+$` regex, which was
+ *  quadratic on a long `<br>` run not at the end. */
+function trailingBrRun(s: string): number {
+  const re = /<br\s*\/?>\s*/gi;
+  let chainStart = -1;
+  let chainEnd = -1;
+  for (let m = re.exec(s); m; m = re.exec(s)) {
+    if (m.index !== chainEnd) chainStart = m.index;
+    chainEnd = m.index + m[0].length;
+  }
+  return chainEnd === s.length && chainStart >= 0 ? chainStart : s.length;
 }
 
 /** The body with its signature block removed, along with the blank lines that
@@ -67,8 +140,7 @@ function findSignatureBlock(html: string): [number, number] | null {
 export function stripSignature(bodyHtml: string): string {
   const block = findSignatureBlock(bodyHtml);
   if (!block) return bodyHtml;
-  const before = bodyHtml.slice(0, block[0]).replace(/(?:<br\s*\/?>\s*)+$/i, "");
-  return before + bodyHtml.slice(block[1]);
+  return bodyHtml.slice(0, trailingBrRun(bodyHtml.slice(0, block[0]))) + bodyHtml.slice(block[1]);
 }
 
 /** Put `sigHtml` in as the body's signature: swaps an existing block in place
@@ -187,6 +259,18 @@ const CELL_SCOPE = new Set(["table", "td", "th", "caption"]);
  *  stay as content) so adversarial markup can't grow the stack scan, the
  *  emitted string, or the depth the browser's own parser has to handle. */
 const MAX_OPEN = 256;
+
+/** Per-value ceilings, applied before any per-value processing so a single
+ *  giant attribute can't feed unbounded work downstream. They are far above
+ *  anything the editor or ordinary mail produces: the longest real styles are
+ *  signature/table declarations of a few hundred bytes, mail hrefs are well
+ *  under 1 KB even with tracking params, and title/alt/class text is short.
+ *  Image `src`/`background` are exempt - a base64 `data:` image is
+ *  legitimately megabytes and its check is a constant number of linear passes. */
+const MAX_STYLE_LEN = 8 * 1024;
+const MAX_DECL_LEN = 2 * 1024;
+const MAX_ATTR_LEN = 4 * 1024;
+const MAX_LINK_LEN = 4 * 1024;
 
 /** Pre-compiled end-tag finders for the raw-text elements, used with exec +
  *  lastIndex so the tail is never copied per element. */
@@ -356,7 +440,11 @@ function decodeCharRefs(s: string): string {
 
 function isSafeUrl(attr: string, raw: string, profile: SanitizeProfile): boolean {
   // As the URL parser reads it: references decoded, controls and spaces gone.
-  const url = decodeCharRefs(raw).replace(/[\x00-\x20\x7f-\x9f]/g, "").toLowerCase();
+  // Decoding is skipped when there is no "&" so a multi-MB base64 src pays
+  // only for the control-strip, lowercase and anchored test below - a
+  // constant number of linear passes either way.
+  const decoded = raw.includes("&") ? decodeCharRefs(raw) : raw;
+  const url = decoded.replace(/[\x00-\x20\x7f-\x9f]/g, "").toLowerCase();
   return (attr === "href" ? profile.linkRe : profile.imageRe).test(url);
 }
 
@@ -395,10 +483,58 @@ const SAFE_CSS_FUNCS = new Set([
   "repeating-linear-gradient", "repeating-radial-gradient", "repeating-conic-gradient",
 ]);
 
+/** True when a declaration value's functions are all allowlisted and every
+ *  url() points at an allowed image source. Single left-to-right scan: the
+ *  `matchAll(/url\(([^)]*)\)/)` + `split("url(")` + regex function scan this
+ *  replaces were quadratic on long identifiers and on unclosed `url(` runs
+ *  (`url(url(url(…`). Quoted strings are skipped entirely - parens in a font
+ *  name are string content, not calls. */
+function checkStyleValue(value: string, profile: SanitizeProfile): boolean {
+  if (/expression\s*\(|(?:java|vb)script:/.test(value)) return false;
+  let i = 0;
+  while (i < value.length) {
+    const c = value[i];
+    if (c === '"' || c === "'") {
+      const close = value.indexOf(c, i + 1);
+      i = close < 0 ? value.length : close + 1;
+      continue;
+    }
+    if (c >= "a" && c <= "z") {
+      const start = i;
+      while (i < value.length) {
+        const d = value.charCodeAt(i);
+        if (!(d === 45 || (d >= 48 && d <= 57) || (d >= 97 && d <= 122))) break;
+        i += 1;
+      }
+      const name = value.slice(start, i);
+      let j = i;
+      while (j < value.length && /\s/.test(value[j])) j += 1;
+      if (value[j] !== "(") continue;
+      if (name === "url") {
+        const close = value.indexOf(")", j + 1);
+        // An unclosed url( or one holding another url( rejects, as the old
+        // "every url( must be a match" count check did.
+        const nested = value.indexOf("url(", j + 1);
+        if (close < 0 || (nested >= 0 && nested < close)) return false;
+        const target = value.slice(j + 1, close).trim().replace(/^["']|["']$/g, "").trim();
+        if (!profile.imageRe.test(target)) return false;
+        i = close + 1;
+        continue;
+      }
+      if (!SAFE_CSS_FUNCS.has(name)) return false;
+      i = j + 1;
+      continue;
+    }
+    i += 1;
+  }
+  return true;
+}
+
 /** The style's declarations minus the unsafe ones (same text otherwise). */
 function cleanStyle(raw: string, profile: SanitizeProfile): string {
   return splitDeclarations(decodeCharRefs(raw))
     .filter((decl) => {
+      if (decl.length > MAX_DECL_LEN) return false;
       if (!decl.trim()) return true;
       const colon = decl.indexOf(":");
       if (colon < 0) return false;
@@ -413,23 +549,7 @@ function cleanStyle(raw: string, profile: SanitizeProfile): string {
         return false;
       // Escapes and comments can disguise tokens (u\72l(, u/**/rl()).
       if (value.includes("\\") || value.includes("/*")) return false;
-      if (/expression\s*\(|(?:java|vb)script:/.test(value)) return false;
-      // Every url() must parse and point at an image source we allow.
-      const urls = [...value.matchAll(/url\(([^)]*)\)/g)];
-      if (urls.length !== value.split("url(").length - 1) return false;
-      if (
-        !urls.every((u) =>
-          profile.imageRe.test(u[1].trim().replace(/^["']|["']$/g, "").trim()),
-        )
-      )
-        return false;
-      // Only allowlisted functions may appear in a value (quoted strings -
-      // a font name can contain parens - don't count).
-      const unquoted = value.replace(/"[^"]*"|'[^']*'/g, "");
-      for (const f of unquoted.matchAll(/([a-z][a-z0-9-]*)\s*\(/g)) {
-        if (!SAFE_CSS_FUNCS.has(f[1])) return false;
-      }
-      return true;
+      return checkStyleValue(value, profile);
     })
     .join(";");
 }
@@ -443,7 +563,7 @@ function cleanAttrs(
   profile: SanitizeProfile,
 ): { attrs: string; src: boolean } {
   const seen = new Set<string>();
-  let attrs = "";
+  const out: string[] = [];
   let src = false;
   for (const m of raw.matchAll(ATTR_RE)) {
     const name = m[1].toLowerCase();
@@ -451,35 +571,48 @@ function cleanAttrs(
     if (seen.has(name)) continue;
     seen.add(name);
     if (!profile.globalAttrs.has(name) && !extra.includes(name)) continue;
-    const value = m[2] ?? m[3] ?? m[4] ?? "";
+    let value = m[2] ?? m[3] ?? m[4] ?? "";
     if (name === "class") {
       const tokens = profile.classes.get(tag);
       if (!tokens) continue;
-      const kept = value
-        .split(/\s+/)
-        .filter((tok, i, all) => tokens.has(tok) && all.indexOf(tok) === i);
-      if (kept.length) attrs += ` class="${kept.join(" ")}"`;
+      if (value.length > MAX_ATTR_LEN) value = value.slice(0, MAX_ATTR_LEN);
+      const kept: string[] = [];
+      const dedup = new Set<string>();
+      for (const tok of value.split(/\s+/)) {
+        if (tokens.has(tok) && !dedup.has(tok)) {
+          dedup.add(tok);
+          kept.push(tok);
+        }
+      }
+      if (kept.length) out.push(` class="${kept.join(" ")}"`);
       continue;
     }
     if (name === "contenteditable") {
       // Only the atomic mention chip needs it, and only as "false".
-      if (value.trim().toLowerCase() === "false") attrs += ' contenteditable="false"';
+      if (value.trim().toLowerCase() === "false") out.push(' contenteditable="false"');
       continue;
     }
     if (name === "style") {
+      if (value.length > MAX_STYLE_LEN) continue;
       const css = cleanStyle(value, profile);
-      if (css.trim()) attrs += ` style="${escapeHtml(css)}"`;
+      if (css.trim()) out.push(` style="${escapeHtml(css)}"`);
       continue;
     }
-    if (
-      (name === "href" || name === "src" || name === "background") &&
+    // The caps apply to the escaped form: that is what a second pass reads
+    // back, so the output stays a fixed point.
+    const escaped = value.replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    if (name === "href") {
+      if (escaped.length > MAX_LINK_LEN || !isSafeUrl(name, value, profile)) continue;
+    } else if (
+      (name === "src" || name === "background") &&
       !isSafeUrl(name, value, profile)
-    )
+    ) {
       continue;
+    }
     if (name === "src") src = true;
-    attrs += ` ${name}="${value.replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}"`;
+    out.push(` ${name}="${escaped.slice(0, MAX_ATTR_LEN)}"`);
   }
-  return { attrs, src };
+  return { attrs: out.join(""), src };
 }
 
 /** The shared tokenizer behind sanitizeSignatureHtml / sanitizeEditorHtml. */
