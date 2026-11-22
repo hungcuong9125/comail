@@ -18,6 +18,7 @@
   "forwardIncludeFiles_other": "包含 {{count}} 个附件",
   "forwardAttachingCount_other": "正在附加 {{count}} 个文件…",
   "forwardAttaching": "仍在附加转发的文件…",
+  "attachmentFailed": "无法附加 {{names}}。请移除或重试。",
   "forwardAttachFailed": "无法附加 {{name}}：{{detail}}",
   "close": "关闭",
   "ccBcc": "抄送 / 密送",

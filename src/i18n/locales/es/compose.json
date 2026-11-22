@@ -20,6 +20,7 @@
   "forwardAttachingCount_one": "Adjuntando {{count}} archivo…",
   "forwardAttachingCount_other": "Adjuntando {{count}} archivos…",
   "forwardAttaching": "Aún se están adjuntando los archivos reenviados…",
+  "attachmentFailed": "No se pudieron adjuntar {{names}}. Elimínalos o inténtalo de nuevo.",
   "forwardAttachFailed": "No se pudo adjuntar {{name}}: {{detail}}",
   "close": "Cerrar",
   "ccBcc": "Cc / Cco",

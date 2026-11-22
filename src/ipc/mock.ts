@@ -3156,6 +3156,12 @@ export async function mockInvoke(
         mockApproved(mockAttachmentName(a.attachmentId as number)),
       );
 
+    case "release_attachment_tokens":
+      for (const t of (a.tokens as string[]) ?? []) {
+        mockAttachmentTokens.delete(t);
+      }
+      return delay(undefined);
+
     case "save_draft":
       return delay(saveDraft(a.args as SaveDraftArgs));
 
