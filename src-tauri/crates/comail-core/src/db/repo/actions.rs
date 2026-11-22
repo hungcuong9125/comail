@@ -149,13 +149,44 @@ pub fn set_state(conn: &Connection, id: i64, state: &str, error: Option<&str>) -
     Ok(())
 }
 
+/// `set_state` scoped to the action's owner: SQLite recycles
+/// `pending_actions.id`, so a worker that outlived its account's teardown
+/// must never stamp a state onto a DIFFERENT account's action that reused
+/// the id. A recycled row makes this a no-op.
+pub fn set_state_for_account(
+    conn: &Connection,
+    id: i64,
+    account_id: i64,
+    state: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_actions SET state = ?2, last_error = ?3,
+                finished_at = CASE WHEN ?2 IN ('done','failed','cancelled') THEN ?4 ELSE finished_at END
+         WHERE id = ?1 AND account_id = ?5",
+        params![id, state, error, now_ms(), account_id],
+    )?;
+    Ok(())
+}
+
+/// Whether the action row still exists and belongs to this account - the
+/// cheap ownership check guarding multi-statement outcome writes.
+pub fn is_owned_by(conn: &Connection, id: i64, account_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM pending_actions WHERE id = ?1 AND account_id = ?2",
+        params![id, account_id],
+        |r| r.get::<_, i64>(0),
+    )? > 0)
+}
+
 /// Atomically claim a pending action for execution. Returns false if it was
 /// cancelled (or otherwise transitioned) since being read - the executor must
-/// skip it in that case.
-pub fn try_claim(conn: &Connection, id: i64) -> Result<bool> {
+/// skip it in that case. Scoped to `account_id` for the same id-recycling
+/// reason as `set_state_for_account`.
+pub fn try_claim(conn: &Connection, id: i64, account_id: i64) -> Result<bool> {
     let n = conn.execute(
         "UPDATE pending_actions SET state = 'inflight'
-         WHERE id = ?1 AND state = 'pending'
+         WHERE id = ?1 AND account_id = ?2 AND state = 'pending'
            AND NOT EXISTS (
                SELECT 1 FROM pending_actions predecessor
                WHERE predecessor.account_id = pending_actions.account_id
@@ -164,7 +195,7 @@ pub fn try_claim(conn: &Connection, id: i64) -> Result<bool> {
                  AND predecessor.state IN ('pending', 'inflight')
                  AND predecessor.kind NOT LIKE 'cal!_%' ESCAPE '!'
            )",
-        params![id],
+        params![id, account_id],
     )?;
     Ok(n > 0)
 }
@@ -353,9 +384,9 @@ mod tests {
         let calendar = enqueue(&conn, 1, "cal_create", None, None, &payload, None).unwrap();
         let pending = enqueue(&conn, 1, "delete_permanently", None, None, &payload, None).unwrap();
         let done = enqueue(&conn, 1, "delete_permanently", None, None, &payload, None).unwrap();
-        for id in [stuck, other, calendar] {
-            assert!(try_claim(&conn, id).unwrap());
-        }
+        assert!(try_claim(&conn, stuck, 1).unwrap());
+        assert!(try_claim(&conn, other, 2).unwrap());
+        assert!(try_claim(&conn, calendar, 1).unwrap());
         bump_attempt(&conn, pending, 90_000, "retry later").unwrap();
         set_state(&conn, done, "done", None).unwrap();
         assert_eq!(recover_account_inflight(&conn, 1).unwrap(), 1);
@@ -411,17 +442,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![independent]
         );
-        assert!(!try_claim(&conn, second).unwrap());
-        assert!(try_claim(&conn, independent).unwrap());
-        assert!(!try_claim(&conn, independent).unwrap());
+        assert!(!try_claim(&conn, second, 1).unwrap());
+        assert!(try_claim(&conn, independent, 1).unwrap());
+        assert!(!try_claim(&conn, independent, 1).unwrap());
         set_state(&conn, independent, "done", None).unwrap();
         assert!(!has_due(&conn, 1, 10_000).unwrap());
-        assert!(try_claim(&conn, first).unwrap());
-        assert!(!try_claim(&conn, second).unwrap());
+        assert!(try_claim(&conn, first, 1).unwrap());
+        assert!(!try_claim(&conn, second, 1).unwrap());
         bump_attempt(&conn, first, 30_000, "uncertain move").unwrap();
-        assert!(!try_claim(&conn, second).unwrap());
+        assert!(!try_claim(&conn, second, 1).unwrap());
         set_state(&conn, first, "done", None).unwrap();
-        assert!(try_claim(&conn, second).unwrap());
+        assert!(try_claim(&conn, second, 1).unwrap());
     }
 
     #[test]
@@ -430,13 +461,13 @@ mod tests {
         testutil::seed_account(&conn);
         let id = enqueue(&conn, 1, "star", None, None, &serde_json::json!({}), None).unwrap();
         assert!(try_cancel(&conn, id).unwrap());
-        assert!(!try_claim(&conn, id).unwrap());
+        assert!(!try_claim(&conn, id, 1).unwrap());
         let id = enqueue(&conn, 1, "star", None, None, &serde_json::json!({}), None).unwrap();
-        assert!(try_claim(&conn, id).unwrap());
+        assert!(try_claim(&conn, id, 1).unwrap());
         assert!(!try_cancel(&conn, id).unwrap());
         assert_eq!(recover_inflight(&conn).unwrap(), 1);
-        assert!(try_claim(&conn, id).unwrap());
-        assert!(!try_claim(&conn, id).unwrap());
+        assert!(try_claim(&conn, id, 1).unwrap());
+        assert!(!try_claim(&conn, id, 1).unwrap());
     }
 
     #[test]

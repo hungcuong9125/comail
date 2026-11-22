@@ -369,7 +369,7 @@ mod mutation_worker_tests {
                     &serde_json::json!({"remoteAttempted": true}),
                     None,
                 )?;
-                assert!(repo::actions::try_claim(conn, id)?);
+                assert!(repo::actions::try_claim(conn, id, 1)?);
                 conn.execute_batch(
                     "CREATE TRIGGER fail_recovery BEFORE UPDATE OF state ON pending_actions
                  WHEN OLD.state = 'inflight' AND NEW.state = 'pending'
@@ -398,7 +398,7 @@ mod mutation_worker_tests {
         assert!(poll.has_due(&db, 1).await.unwrap());
         assert!(!poll.recovery_needed);
         db.write(move |conn| {
-            assert!(repo::actions::try_claim(conn, id)?);
+            assert!(repo::actions::try_claim(conn, id, 1)?);
             Ok(())
         })
         .await
@@ -4455,8 +4455,10 @@ mod content_batch_tests {
         );
     }
 
-    /// recv_cmd resolves promptly when the command channel closes - the
-    /// select hits the rx arm with None, no looping.
+    /// recv_cmd resolves promptly when either sender goes away or the stop
+    /// flag fires: a closed COMMAND channel yields None from rx.recv(), a
+    /// dropped STOP sender makes stop.changed() resolve Err immediately, and
+    /// a fired flag is observed at borrow_and_update. No arm can spin.
     #[tokio::test]
     async fn recv_cmd_returns_none_promptly_on_channel_close_and_stop() {
         let tasks = AccountTasks::new();
@@ -4468,11 +4470,46 @@ mod content_batch_tests {
         tasks.signal_stop();
         let (_tx, mut rx) = mpsc::unbounded_channel::<SyncCmd>();
         assert!(recv_cmd(&mut rx, &mut stop).await.is_none());
+        // And for the STOP SENDER being dropped (task set torn down): the
+        // receiver's changed() resolves immediately - bounded wait proves it.
+        let tasks = AccountTasks::new();
+        let mut stop = tasks.subscribe();
+        drop(tasks);
+        let (_tx, mut rx) = mpsc::unbounded_channel::<SyncCmd>();
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            recv_cmd(&mut rx, &mut stop),
+        )
+        .await;
+        assert!(matches!(resolved, Ok(None)), "task must exit, not spin");
     }
 
-    /// A command queued just before the stop flag is either processed or the
-    /// task exits - it never keeps running while pretending the command was
-    /// handled. Observable property: the task finishes promptly.
+    /// A command that reaches the channel before the stop flag is delivered
+    /// to the actor - recv_cmd hands it out; it is never silently dropped
+    /// while the actor keeps running.
+    #[tokio::test]
+    async fn recv_cmd_delivers_a_command_queued_before_stop() {
+        let tasks = AccountTasks::new();
+        let mut stop = tasks.subscribe();
+        let (tx, mut rx) = mpsc::unbounded_channel::<SyncCmd>();
+        tx.send(SyncCmd::RunActions).unwrap();
+        // Command pending, no stop yet: it must be handed to the actor.
+        assert!(matches!(
+            recv_cmd(&mut rx, &mut stop).await,
+            Some(SyncCmd::RunActions)
+        ));
+        // Once stopped, further calls end the loop - the fate of any command
+        // is "processed" or "the task is exiting", never "ignored while
+        // running".
+        tasks.signal_stop();
+        tx.send(SyncCmd::RunActions).unwrap();
+        assert!(recv_cmd(&mut rx, &mut stop).await.is_none());
+    }
+
+    /// A command queued while the stop flag fires is either processed or the
+    /// task exits - never silently lost while the task keeps running. The
+    /// observable fate here: the fetcher exits (stop is checked first at the
+    /// loop top, before the queued command is even read).
     #[tokio::test]
     async fn command_queued_with_stop_exits_instead_of_running_forever() {
         let (_root, ctx) = context().await;
@@ -4494,6 +4531,8 @@ mod content_batch_tests {
         tasks
             .stop_and_join(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
             .await;
+        // The command's fate is explicit: the task exited instead of
+        // consuming it - an exit, not a silent drop while still running.
         assert!(tasks.is_finished());
     }
 

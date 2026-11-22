@@ -631,7 +631,7 @@ async fn verified_known_and_unknown_uid_matches_backfill_and_persist_stronger_ke
             let (tid, id) = testutil::seed_message(conn, "sender@test", "backfill", false);
             conn.execute("UPDATE messages SET folder_id=2,uid=?2,message_id='<x@y>',internal_date=123000,size=456 WHERE id=?1", params![id, uid])?;
             let action_id = enqueue(conn, &[tid])?[0].0;
-            assert!(repo::actions::try_claim(conn, action_id)?);
+            assert!(repo::actions::try_claim(conn, action_id, 1)?);
             let action = repo::actions::get(conn, action_id)?.unwrap();
             let target = serde_json::from_value::<Target>(action.payload)?;
             Ok((id, action_id, target))

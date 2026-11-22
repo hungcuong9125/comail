@@ -34,7 +34,7 @@ fn post_move_retry_waits_for_grace_without_spending_the_attempt_budget() {
             None,
         )
         .unwrap();
-        assert!(repo::actions::try_claim(&conn, id).unwrap());
+        assert!(repo::actions::try_claim(&conn, id, 1).unwrap());
         let outcome = record_delete_failure(
             &mut conn,
             id,
@@ -87,7 +87,7 @@ fn repeated_auth_pauses_preserve_attempts_and_exclude_paused_age() {
     )
     .unwrap();
     for offset in [0, MAX_DELETE_AGE_MS, MAX_DELETE_AGE_MS * 3] {
-        assert!(repo::actions::try_claim(&conn, id).unwrap());
+        assert!(repo::actions::try_claim(&conn, id, 1).unwrap());
         let result =
             record_delete_auth_pause(&mut conn, id, start + offset, "authentication required")
                 .unwrap()
@@ -101,7 +101,7 @@ fn repeated_auth_pauses_preserve_attempts_and_exclude_paused_age() {
     }
     // The pause survives reload/restart and an elapsed wall-clock age >24h.
     let resumed_at = start + MAX_DELETE_AGE_MS * 4;
-    assert!(repo::actions::try_claim(&conn, id).unwrap());
+    assert!(repo::actions::try_claim(&conn, id, 1).unwrap());
     assert_eq!(
         resume_delete_budget(&conn, id, resumed_at).unwrap(),
         MAX_DELETE_AGE_MS * 4
@@ -120,7 +120,7 @@ fn repeated_auth_pauses_preserve_attempts_and_exclude_paused_age() {
     assert!(stored.payload["deleteAuthPausedAt"].is_null());
     assert_eq!(stored.payload["remoteAttempted"], true);
     // Active time still expires after resumption, despite excluded pause time.
-    assert!(repo::actions::try_claim(&conn, id).unwrap());
+    assert!(repo::actions::try_claim(&conn, id, 1).unwrap());
     let result = record_delete_failure(
         &mut conn,
         id,
@@ -154,7 +154,7 @@ fn auth_does_not_exhaust_an_already_aged_delete_or_increment_attempts() {
         rusqlite::params![id, MAX_ATTEMPTS, now - MAX_DELETE_AGE_MS * 2],
     )
     .unwrap();
-    assert!(repo::actions::try_claim(&conn, id).unwrap());
+    assert!(repo::actions::try_claim(&conn, id, 1).unwrap());
     assert_eq!(
         record_delete_auth_pause(&mut conn, id, now, "auth rejected")
             .unwrap()
@@ -213,7 +213,7 @@ async fn delete_errors_release_visibility_and_thread_lock_at_attempt_or_age_limi
                         &serde_json::json!({}),
                         None,
                     )?;
-                    assert!(repo::actions::try_claim(conn, id)?);
+                    assert!(repo::actions::try_claim(conn, id, 1)?);
                     Ok((id, thread_id, next_id))
                 })
                 .await
@@ -235,7 +235,9 @@ async fn delete_errors_release_visibility_and_thread_lock_at_attempt_or_age_limi
             } else {
                 CoreError::ActionDeferred("uncertain delete preflight".into())
             };
-            record_outcomes(&ctx, &[action], &Err(error)).await.unwrap();
+            record_outcomes(&ctx, &[action], &Err(error), 1)
+                .await
+                .unwrap();
             ctx.db.read(move |conn| {
                 let stored = repo::actions::get(conn, id)?.unwrap();
                 assert_eq!(stored.state, "failed");

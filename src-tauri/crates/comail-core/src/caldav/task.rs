@@ -131,7 +131,7 @@ async fn run_cycle(db: &Db, bus: &EventBus, tokens: &TokenProvider, account_id: 
             let due = repo::actions::due_calendar(conn, account_id, now, 50)?;
             let mut out = Vec::new();
             for a in due {
-                if repo::actions::try_claim(conn, a.id)? {
+                if repo::actions::try_claim(conn, a.id, account_id)? {
                     out.push((a.id, a.attempts));
                 }
             }
