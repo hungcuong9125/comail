@@ -535,7 +535,11 @@ impl Core {
 
     async fn spawn_actor(&self, cfg: AccountConfig) {
         let handle = spawn_account(self.sync_ctx(), cfg);
-        self.handles.write().await.insert(handle.account_id, handle);
+        // A respawn stops whatever the previous task set was still doing;
+        // Shutdown takes the same stop path account removal uses.
+        if let Some(old) = self.handles.write().await.insert(handle.account_id, handle) {
+            old.send(SyncCmd::Shutdown);
+        }
     }
 
     async fn spawn_cal_task(&self, account_id: i64) {
@@ -874,11 +878,34 @@ impl Core {
     }
 
     pub async fn remove_account(&self, account_id: i64) -> Result<()> {
-        if let Some(h) = self.handles.write().await.remove(&account_id) {
+        // Detach every per-account entry point first so nothing new can be
+        // scheduled for this id while teardown runs (SQLite recycles INTEGER
+        // PRIMARY KEY values, so nothing may outlive removal and later be
+        // attributed to a new account with the same id).
+        let handle = self.handles.write().await.remove(&account_id);
+        let cal = self.cal_handles.write().await.remove(&account_id);
+        let contacts = self.contacts_handles.write().await.remove(&account_id);
+        self.attachment_locks.lock().await.remove(&account_id);
+
+        // Ask the sync actor for a clean IMAP logout; Shutdown also fires the
+        // shared stop flag every other task observes at its await points.
+        // Then wait - bounded - and abort whatever is still parked in a
+        // network call. Only once no task can still write for this account
+        // do rows and directories go away.
+        if let Some(h) = &handle {
             h.send(SyncCmd::Shutdown);
         }
-        self.cal_handles.write().await.remove(&account_id);
-        self.contacts_handles.write().await.remove(&account_id);
+        let deadline = tokio::time::Instant::now() + REMOVE_ACCOUNT_STOP_TIMEOUT;
+        if let Some(h) = &handle {
+            h.stop_tasks(deadline).await;
+        }
+        if let Some(h) = &cal {
+            h.stop_tasks(deadline).await;
+        }
+        if let Some(h) = &contacts {
+            h.stop_tasks(deadline).await;
+        }
+
         // Credential deletion and token-cache clearing happen atomically
         // under the account's refresh lock: a grant still in flight completes
         // first and its writes are erased by the purge, and a grant queued
@@ -886,15 +913,22 @@ impl Core {
         // back into the keyring and no cache entry resurrected for a removed
         // account (account ids are recycled).
         self.tokens.purge(account_id).await;
-        let staged_paths = self
+        // Writer-thread barrier: a task aborted inside `db.write` may already
+        // have queued its closure. The writer runs jobs FIFO, so this no-op
+        // returning proves every straggler write landed - before the delete,
+        // where the cascade still erases it - and none can sneak in behind it
+        // to be attributed to a recycled account id.
+        self.db.write(|_| Ok(())).await?;
+        let removal = self
             .db
             .write(move |conn| {
+                let tx = conn.transaction()?;
                 // Unwind address-book names before the cascade drops the cards.
-                repo::carddav::delete_config(conn, account_id)?;
+                repo::carddav::delete_config(&tx, account_id)?;
                 // The account cascade drops draft_attachments rows; collect
                 // their staged paths first so the files can go with them.
                 let staged: Vec<String> = {
-                    let mut stmt = conn.prepare(
+                    let mut stmt = tx.prepare(
                         "SELECT da.file_path FROM draft_attachments da
                          JOIN messages m ON m.id = da.draft_id
                          WHERE m.account_id = ?1",
@@ -902,10 +936,44 @@ impl Core {
                     stmt.query_map(rusqlite::params![account_id], |r| r.get::<_, String>(0))?
                         .collect::<rusqlite::Result<Vec<_>>>()?
                 };
-                repo::accounts::delete(conn, account_id)?;
-                Ok(staged)
+                // The account's message ids, for evicting its vectors from
+                // the in-memory index after commit (it is not FK-covered).
+                let message_ids: Vec<i64> = {
+                    let mut stmt = tx.prepare("SELECT id FROM messages WHERE account_id = ?1")?;
+                    stmt.query_map(rusqlite::params![account_id], |r| r.get::<_, i64>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                repo::accounts::delete(&tx, account_id)?;
+                tx.commit()?;
+                Ok((staged, message_ids))
             })
-            .await?;
+            .await;
+        let (staged_paths, message_ids) = match removal {
+            Ok(out) => out,
+            Err(error) => {
+                // The transaction rolled back, so the account row and all of
+                // its data are still there. Put the actor back so the account
+                // keeps working and a retried removal sees a normal state.
+                if let Ok(Some(cfg)) = self
+                    .db
+                    .read(move |conn| repo::accounts::get_config(conn, account_id))
+                    .await
+                {
+                    self.spawn_actor(cfg).await;
+                }
+                return Err(error);
+            }
+        };
+        // The persisted vectors cascaded with the messages; evict the
+        // account's copies from the in-memory index too.
+        if !message_ids.is_empty() {
+            let removed: std::collections::HashSet<i64> = message_ids.into_iter().collect();
+            self.embed
+                .index
+                .write()
+                .await
+                .retain(|mid| !removed.contains(&mid));
+        }
         // Root-confined like every staged-path delete: rows pointing outside
         // the staging root are ignored, and nothing is unlinked until the
         // account delete has succeeded.
@@ -913,6 +981,20 @@ impl Core {
         let _ = tokio::fs::remove_dir_all(self.paths.mail_dir(account_id)).await;
         let _ = tokio::fs::remove_dir_all(self.paths.attachments_dir(account_id)).await;
         Ok(())
+    }
+
+    /// Account sync handle, if the account's tasks are running. Test hook for
+    /// asserting the shared task set is actually finished after removal.
+    #[doc(hidden)]
+    pub async fn debug_handle(&self, account_id: i64) -> Option<AccountHandle> {
+        self.handles.read().await.get(&account_id).cloned()
+    }
+
+    /// Shared embedding state; test hook so integration tests can push into
+    /// and inspect the live vector index without loading a model.
+    #[doc(hidden)]
+    pub fn embed_state(&self) -> Arc<embed::EmbedState> {
+        self.embed.clone()
     }
 
     pub async fn sync_now(&self, account_id: Option<i64>) -> Result<()> {
@@ -6264,6 +6346,12 @@ fn valid_automation_route(conn: &rusqlite::Connection, target: &str) -> Result<b
 
 /// Upper bound for one manual Inbox pass, shared by every account in the request.
 const SYNC_NOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+/// How long account removal waits for the account's tasks to unwind before
+/// aborting whatever is still running. Tasks observe the shared stop flag at
+/// their await points and exit in milliseconds; the bound only bites for a
+/// task parked in a network call (e.g. a connect to a dead server), which
+/// then cannot hold deletion hostage.
+const REMOVE_ACCOUNT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Wait for every account's foreground Inbox pass at once. The passes already
 /// run concurrently (one actor per account); this waits on them concurrently
