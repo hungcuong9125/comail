@@ -285,6 +285,44 @@ impl Core {
         let settings = core.db.read(|conn| repo::settings::get(conn)).await?;
         apply_oauth_settings(&settings);
 
+        // Resume account removals interrupted mid-flight (crash/kill between
+        // the durable marker and the delete commit, or a repair that failed
+        // and kept its marker) - before any account task is spawned, so a
+        // marked account never starts syncing again. On success remove_account
+        // rewrites and clears the marker itself; its failure path already ran
+        // the index repair, so here we only log and the marker survives for
+        // the next start.
+        for account_id in core
+            .db
+            .read(|conn| repo::accounts::removal_markers(conn))
+            .await
+            .unwrap_or_default()
+        {
+            let exists = core
+                .db
+                .read(move |conn| Ok(repo::accounts::get(conn, account_id)?.is_some()))
+                .await
+                .unwrap_or(false);
+            if !exists {
+                // Marker without an account row cannot happen (the marker is
+                // cleared in the same commit as the delete) - sweep it anyway.
+                let _ = core
+                    .db
+                    .write(move |conn| repo::accounts::unmark_removing(conn, account_id))
+                    .await;
+                continue;
+            }
+            match core.remove_account(account_id).await {
+                Ok(()) => tracing::info!(account_id, "resumed interrupted account removal"),
+                Err(error) => tracing::warn!(
+                    account_id,
+                    %error,
+                    "resumed account removal failed; account stays usable, marker kept"
+                ),
+            }
+        }
+        sweep_removal_tombstones(&core.paths).await;
+
         // Recover any actions orphaned mid-flight by a previous crash/kill, so a
         // send that was executing when the app died retries instead of sticking
         // on "Sending…" forever.
@@ -888,12 +926,6 @@ impl Core {
     }
 
     pub async fn remove_account(&self, account_id: i64) -> Result<()> {
-        // Serialise against account creation: SQLite recycles INTEGER PRIMARY
-        // KEY values, so an account added while this removal is still running
-        // must never land on the same id and then watch its fresh mail dir
-        // get deleted by the old one's post-commit cleanup.
-        let _lifecycle = self.account_lifecycle.lock().await;
-
         // Detach every per-account entry point first so nothing new can be
         // scheduled for this id while teardown runs. (attachment_locks is
         // keyed by attachment id, not account id - nothing to evict here.)
@@ -921,9 +953,20 @@ impl Core {
         }
 
         // Everything up to the delete commit is reversible: on any failure,
-        // put the task set back exactly the way startup would and leave the
-        // account usable - and the removal retryable.
+        // repair the index, put the task set back exactly the way startup
+        // would, and leave the account usable - and the removal retryable.
         let removal = async {
+            // Durable marker BEFORE the first destructive step. The FTS
+            // sweep commits per batch below, so without a marker a crash or
+            // a rollback would leave the account's search index silently
+            // half-destroyed. With it: a failed removal repairs the index
+            // before clearing the marker, and a killed one is resumed at
+            // start-up (Core::start reads removal_markers before spawning
+            // any account task). `list` hides marked accounts meanwhile.
+            self.db
+                .write(move |conn| repo::accounts::mark_removing(conn, account_id))
+                .await?;
+
             // Writer-thread barrier: a task aborted inside `db.write` may
             // already have queued its closure. The writer runs jobs FIFO, so
             // this no-op returning proves every straggler write landed -
@@ -935,10 +978,9 @@ impl Core {
             // transaction the batching buys nothing - the writer is held for
             // the whole delete either way (measured: 21 s for 100k messages
             // in a debug build). Split per batch, other writer jobs interleave
-            // between `db.write` calls and the UI stays responsive. Failure
-            // mid-sweep is still retryable: the account row is intact (its
-            // messages merely fall out of search results until re-indexed)
-            // and the restore path below restarts its tasks.
+            // between `db.write` calls and the UI stays responsive. The
+            // marker above is what makes committed batches safe: any failure
+            // from here on re-indexes what was swept.
             loop {
                 let swept = self
                     .db
@@ -949,7 +991,16 @@ impl Core {
                 }
             }
 
-            self.db
+            // The id-recycle window: SQLite hands a freed INTEGER PRIMARY
+            // KEY to the next inserted account, so from the commit until the
+            // account's directories are renamed aside, account creation must
+            // not run. Task teardown and the sweep stay outside the lock -
+            // while the account row still exists an added account simply
+            // gets a different id - which keeps the hold to the measured
+            // ~1.6 s cascade + a few renames instead of the whole teardown.
+            let _lifecycle = self.account_lifecycle.lock().await;
+            let (staged, message_ids) = self
+                .db
                 .write(move |conn| {
                     let tx = conn.transaction()?;
                     // Unwind address-book names before the cascade drops the cards.
@@ -974,6 +1025,10 @@ impl Core {
                             .collect::<rusqlite::Result<Vec<_>>>()?
                     };
                     repo::accounts::delete(&tx, account_id)?;
+                    // Marker clears in the same commit: it can never point
+                    // at a successfully deleted account, and a rolled-back
+                    // removal keeps it for the repair/resume paths.
+                    repo::accounts::unmark_removing(&tx, account_id)?;
                     #[cfg(test)]
                     if REMOVE_FAIL_TX.swap(false, std::sync::atomic::Ordering::SeqCst) {
                         return Err(CoreError::Other("injected delete failure".into()));
@@ -981,17 +1036,39 @@ impl Core {
                     tx.commit()?;
                     Ok((staged, message_ids))
                 })
-                .await
+                .await?;
+            // Rename the account's directories to unique tombstones while the
+            // lifecycle lock is still held - milliseconds of work - so the
+            // slow recursive deletes below can run AFTER the lock is released
+            // without a recycled account id ever seeing its fresh dirs
+            // deleted. Staged draft dirs get the same treatment because
+            // message ids (and with them `d{id}` staging dir names) recycle
+            // the same way. Leftover tombstones are swept at start-up.
+            let tombstones = self.tombstone_account_dirs(account_id, &staged).await;
+            Ok((tombstones, message_ids))
         }
         .await;
-        let (staged_paths, message_ids) = match removal {
+        let (tombstones, message_ids) = match removal {
             Ok(out) => out,
             Err(error) => {
                 // Pre-commit failure or a rolled-back transaction: the
                 // account row and all of its data are intact, and credentials
                 // have NOT been purged - that only happens past the commit.
-                // Restart the task set so the account keeps working and a
-                // retried removal sees a normal state.
+                // First rebuild every FTS row the sweep removed - a surviving
+                // account must never keep a silently broken search index -
+                // then restart the task set so the account keeps working and
+                // a retried removal sees a normal state. If repair itself
+                // fails the marker stays set: the account is still usable,
+                // and the next start-up resumes the removal the user asked
+                // for.
+                if let Err(repair_error) = self.repair_search_index(account_id).await {
+                    tracing::warn!(
+                        account_id,
+                        error = %repair_error,
+                        "rolled-back removal could not rebuild the search index; \
+                         marker kept so start-up finishes the removal"
+                    );
+                }
                 self.restore_account_tasks(account_id).await;
                 return Err(error);
             }
@@ -1008,20 +1085,100 @@ impl Core {
         // The persisted vectors cascaded with the messages; evict the
         // account's copies from the in-memory index too.
         if !message_ids.is_empty() {
-            let removed: std::collections::HashSet<i64> = message_ids.into_iter().collect();
+            let removed: std::collections::HashSet<i64> = message_ids.iter().copied().collect();
             self.embed
                 .index
                 .write()
                 .await
                 .retain(|mid| !removed.contains(&mid));
         }
-        // Root-confined like every staged-path delete: rows pointing outside
-        // the staging root are ignored, and nothing is unlinked until the
-        // account delete has succeeded.
-        remove_staged_draft_files(&self.paths.draft_attachments_dir(), &staged_paths).await;
-        let _ = tokio::fs::remove_dir_all(self.paths.mail_dir(account_id)).await;
-        let _ = tokio::fs::remove_dir_all(self.paths.attachments_dir(account_id)).await;
+        for dir in tombstones {
+            let _ = tokio::fs::remove_dir_all(dir).await;
+        }
         Ok(())
+    }
+
+    /// Rename every on-disk directory belonging to the account to a unique
+    /// sibling tombstone (`<name>.removing-<account>-<nanos>`) and return the
+    /// tombstone paths for deletion by the caller. Runs under the lifecycle
+    /// lock after the delete commit: renaming is O(1) per dir, so an added
+    /// account that recycles the id creates fresh dirs untouched by the slow
+    /// `remove_dir_all` of these tombstones afterwards.
+    async fn tombstone_account_dirs(
+        &self,
+        account_id: i64,
+        staged_paths: &[String],
+    ) -> Vec<std::path::PathBuf> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let token = format!("{account_id}-{nanos}");
+        let mut out = Vec::new();
+        for dir in [
+            self.paths.mail_dir(account_id),
+            self.paths.attachments_dir(account_id),
+        ] {
+            if let Some(t) = tombstone_dir(&dir, &token).await {
+                out.push(t);
+            }
+        }
+        // Staged draft attachments: confine to the staging root exactly like
+        // remove_staged_draft_files, then tombstone each per-draft directory
+        // (`d{id}`) - message ids recycle, so a later draft could own one.
+        let root = self.paths.draft_attachments_dir();
+        if let Ok(root) = tokio::fs::canonicalize(&root).await {
+            let mut dirs = std::collections::HashSet::new();
+            for path in staged_paths {
+                let Ok(canon) = tokio::fs::canonicalize(path).await else {
+                    continue;
+                };
+                if !canon.starts_with(&root) {
+                    tracing::warn!(
+                        path,
+                        "refusing to remove attachment outside draft staging area"
+                    );
+                    continue;
+                }
+                if let Some(dir) = canon.parent()
+                    && dir != root
+                    && dir.starts_with(&root)
+                {
+                    dirs.insert(dir.to_path_buf());
+                }
+            }
+            for dir in dirs {
+                if let Some(t) = tombstone_dir(&dir, &token).await {
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+
+    /// Rebuild every `messages_fts` row the pre-commit sweep removed - the
+    /// repair half of the durable removal marker. Batched like the sweep so
+    /// the writer stays responsive; on success the marker is cleared, on
+    /// failure it stays set for the start-up resume.
+    async fn repair_search_index(&self, account_id: i64) -> Result<()> {
+        loop {
+            let n = self
+                .db
+                .write(move |conn| {
+                    repo::search::reindex_missing_batch(
+                        conn,
+                        account_id,
+                        repo::accounts::FTS_DELETE_BATCH,
+                    )
+                })
+                .await?;
+            if n < repo::accounts::FTS_DELETE_BATCH as usize {
+                break;
+            }
+        }
+        self.db
+            .write(move |conn| repo::accounts::unmark_removing(conn, account_id))
+            .await
     }
 
     /// One no-op job on the single writer thread; see the barrier comment at
@@ -1052,7 +1209,7 @@ impl Core {
             .await
             .ok()
             .flatten()
-            .is_some()
+            .is_some_and(|cfg| cfg.enabled)
         {
             self.spawn_cal_task(account_id).await;
         }
@@ -1062,7 +1219,7 @@ impl Core {
             .await
             .ok()
             .flatten()
-            .is_some()
+            .is_some_and(|cfg| cfg.enabled)
         {
             self.spawn_contacts_task(account_id).await;
         }
@@ -2335,6 +2492,22 @@ impl Core {
         // final file without the flag.
         quarantine::mark(&partial)?;
         tokio::fs::rename(&partial, &path).await?;
+        // The remote fetch can outlive the account: the pre-write existence
+        // check above narrows the window but cannot close it (removal is not
+        // atomic with this untracked task). Re-check once more and clean up
+        // what was just created so a removed account's directories do not
+        // resurrect on disk.
+        let account_gone = !self
+            .db
+            .read(move |conn| Ok(repo::accounts::get(conn, row.account_id)?.is_some()))
+            .await?;
+        if account_gone {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            // `remove_dir` (not _all) only succeeds when this account dir is
+            // otherwise empty - never touches a live account's contents.
+            let _ = tokio::fs::remove_dir(self.paths.attachments_dir(row.account_id)).await;
+            return Err(CoreError::NotFound("account".into()));
+        }
 
         let path_str = path.to_string_lossy().to_string();
         let p = path_str.clone();
@@ -6267,6 +6440,50 @@ async fn stage_draft_attachment(
     })
 }
 
+/// Rename `dir` to a sibling `<name>.removing-<token>` and return the new
+/// path; `None` when it does not exist. A fallback `remove_dir_all` covers
+/// exotic rename failures so the caller never leaves a live directory in
+/// place that a recycled id could inherit.
+async fn tombstone_dir(dir: &std::path::Path, token: &str) -> Option<std::path::PathBuf> {
+    let target = dir.parent()?.join(format!(
+        "{}.removing-{token}",
+        dir.file_name()?.to_string_lossy()
+    ));
+    match tokio::fs::rename(dir, &target).await {
+        Ok(()) => Some(target),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "tombstone rename failed; deleting in place");
+            let _ = tokio::fs::remove_dir_all(dir).await;
+            None
+        }
+    }
+}
+
+/// Delete leftover `*.removing-*` directories under the mail, attachments and
+/// draft-staging roots - the tail of a removal killed between commit and
+/// post-commit cleanup.
+async fn sweep_removal_tombstones(paths: &Paths) {
+    for parent in [
+        paths.mail_dir(0).parent().map(|p| p.to_path_buf()),
+        paths.attachments_dir(0).parent().map(|p| p.to_path_buf()),
+        Some(paths.draft_attachments_dir()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mut entries = match tokio::fs::read_dir(&parent).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_name().to_string_lossy().contains(".removing-") {
+                let _ = tokio::fs::remove_dir_all(entry.path()).await;
+            }
+        }
+    }
+}
+
 /// Delete staged attachment files, but only paths that canonicalise inside
 /// `root` - entries in `paths` come from the DB and are untrusted, so anything
 /// resolving outside the staging area is left alone. Each file lives in its
@@ -7355,6 +7572,18 @@ mod remove_account_failpoint_tests {
         core.db
             .write(|conn| {
                 testutil::seed_account(conn);
+                // Indexed messages spanning more than one sweep batch, plus
+                // one message with a cached body indexed through the real
+                // `index_message` path (its body text is what repair must
+                // reproduce identically).
+                testutil::seed_bulk_messages(conn, 1, 6_001, "bulkterm");
+                let (_t, m) = testutil::seed_message(conn, "s@t.dev", "hdrterm", false);
+                conn.execute(
+                    "INSERT INTO message_bodies (message_id, text_body)
+                     VALUES (?1, 'bodyonlyterm rest of the body')",
+                    [m],
+                )?;
+                repo::search::index_message(conn, m)?;
                 repo::caldav::upsert_config(
                     conn,
                     &repo::caldav::CaldavConfig {
@@ -7426,6 +7655,44 @@ mod remove_account_failpoint_tests {
             "pass",
             "credentials must survive a rolled-back removal"
         );
+        // The repair path must leave the search index COMPLETE, not merely
+        // present: every swept row re-indexed, body-only terms matching the
+        // cached body again (same content index_message wrote), the negative
+        // predicate search relies on correct, and the marker cleared.
+        core.db
+            .read(|conn| {
+                let fts: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM messages_fts fts
+                     WHERE fts.rowid IN (SELECT id FROM messages WHERE account_id = 1)",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(fts, 6_002, "every swept FTS row must be re-indexed");
+                let hits: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'bodyonlyterm'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(hits, 1, "body-only term must match the cached body again");
+                let not_indexed: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM messages m
+                     WHERE m.account_id = 1
+                       AND m.id NOT IN (SELECT rowid FROM messages_fts)",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(
+                    not_indexed, 0,
+                    "search's NOT-IN predicate must exclude nothing"
+                );
+                assert!(
+                    repo::accounts::removal_markers(conn)?.is_empty(),
+                    "marker must be cleared after a repaired rollback"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     /// A failing writer-thread barrier is a pre-commit failure: teardown is
@@ -7452,11 +7719,11 @@ mod remove_account_failpoint_tests {
         assert_fully_usable(&core).await;
     }
 
-    /// Removal holds the lifecycle lock for its whole duration - including
-    /// the post-commit file deletion - so an add can never interleave a
-    /// recycled id into the teardown.
+    /// The lifecycle lock excludes account creation from the id-recycle
+    /// window: while it is held a removal can run everything up to the
+    /// delete commit but cannot finish. Releasing it lets it complete.
     #[tokio::test]
-    async fn removal_holds_the_lifecycle_lock_for_its_full_duration() {
+    async fn removal_cannot_finish_while_the_lifecycle_lock_is_held() {
         let _guard = failpoint_lock().await;
         let (core, _root) = test_core().await;
         // Stop the tasks first so the removal does not burn the test window
@@ -7464,25 +7731,17 @@ mod remove_account_failpoint_tests {
         let handle = core.handles.read().await.get(&1).cloned().unwrap();
         handle.send(SyncCmd::Shutdown);
 
+        let lifecycle = core.account_lifecycle.lock().await;
         let spawned = {
             let core = core.clone();
             tokio::spawn(async move { core.remove_account(1).await })
         };
-        // While the removal runs, the lock must be held.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if core.account_lifecycle.try_lock().is_err() {
-                break; // removal in flight and holding the lock
-            }
-            if spawned.is_finished() {
-                panic!("remove_account finished without ever holding the lifecycle lock");
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "remove_account never acquired the lifecycle lock"
-            );
-            tokio::task::yield_now().await;
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !spawned.is_finished(),
+            "remove_account finished while the lifecycle lock was held"
+        );
+        drop(lifecycle);
         spawned.await.unwrap().unwrap();
         assert!(core.account_lifecycle.try_lock().is_ok());
     }

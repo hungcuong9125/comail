@@ -210,4 +210,32 @@ pub(crate) mod testutil {
         let msg_id = c.last_insert_rowid();
         (thread_id, msg_id)
     }
+
+    /// `n` messages under one thread plus their FTS rows, in two statements -
+    /// bulk seed for sweep/repair tests that need thousands of indexed rows.
+    pub fn seed_bulk_messages(c: &Connection, account_id: i64, n: i64, body_token: &str) {
+        c.execute(
+            "INSERT INTO threads (account_id, subject_norm) VALUES (?1, 'bulk')",
+            params![account_id],
+        )
+        .unwrap();
+        let tid = c.last_insert_rowid();
+        c.execute(
+            "WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < ?1)
+             INSERT INTO messages (thread_id, account_id, folder_id, uid, message_id,
+                                   subject, from_addr, date, is_read, is_automated,
+                                   is_draft, is_outgoing)
+             SELECT ?2, ?3, 1, 100000000 + i, 'mid-' || i, 'subject ' || i, 'a@b.c',
+                    1000, 0, 0, 0, 0
+             FROM seq",
+            params![n, tid, account_id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO messages_fts (rowid, subject, from_text, to_text, body)
+             SELECT id, subject, 'a@b.c', 'x', ?2 FROM messages WHERE account_id = ?1",
+            params![account_id, body_token],
+        )
+        .unwrap();
+    }
 }

@@ -28,8 +28,46 @@ fn config_from_row(row: &Row) -> rusqlite::Result<AccountConfig> {
     })
 }
 
+/// Durable "removal in flight" marker (migration 039). Written before the
+/// first destructive step of `remove_account`; the batched FTS sweep commits
+/// per batch, so without a marker a crash or rollback would leave the
+/// account's search index silently half-destroyed. While the marker exists
+/// the account is hidden from `list` (the UI account list), start-up resumes
+/// the removal, and a failed removal repairs the index before clearing it.
+pub fn mark_removing(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO removing_accounts (account_id, marked_at)
+         VALUES (?1, ?2)",
+        params![id, now_ms()],
+    )?;
+    Ok(())
+}
+
+pub fn unmark_removing(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM removing_accounts WHERE account_id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// Account ids with a removal marker still set - read at start-up to resume
+/// interrupted removals before any account task is spawned.
+pub fn removal_markers(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT account_id FROM removing_accounts")?;
+    Ok(stmt
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 pub fn list(conn: &Connection) -> Result<Vec<Account>> {
-    let mut stmt = conn.prepare("SELECT * FROM accounts ORDER BY id")?;
+    // Accounts mid-removal are not offered as normal accounts: their tasks
+    // are stopped and their index may be partway through the sweep.
+    let mut stmt = conn.prepare(
+        "SELECT * FROM accounts
+         WHERE id NOT IN (SELECT account_id FROM removing_accounts)
+         ORDER BY id",
+    )?;
     let rows = stmt
         .query_map([], account_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;

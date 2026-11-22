@@ -473,3 +473,85 @@ async fn writer_hold_for_delete_measured_on_100k_messages() {
         .unwrap();
     assert_eq!(remaining, 0, "batched FTS delete must not leak rows");
 }
+
+/// A removal interrupted mid-sweep (durable marker committed, some sweep
+/// batches committed, process dies) is RESUMED by Core::start - before any
+/// account task spawns - and finishes the removal the user asked for.
+#[tokio::test]
+async fn killed_mid_sweep_resumes_removal_at_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::for_tests(tmp.path());
+    paths.ensure().unwrap();
+    let creds = tmp.path().join("creds.json");
+    unsafe { std::env::set_var("COMAIL_CREDENTIALS_INSECURE_FILE", &creds) };
+
+    let db = Db::open(&paths.db_file()).unwrap();
+    db.write(move |conn| {
+        let acc = insert_account(conn, "doomed@test.dev");
+        assert_eq!(acc, 1);
+        seed_message(conn, acc, TOKEN_A);
+        seed_message(conn, acc, TOKEN_B);
+        let mut stmt = conn
+            .prepare("SELECT id FROM messages WHERE account_id = 1")
+            .unwrap();
+        let ids: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for id in ids {
+            repo::search::index_message(conn, id).unwrap();
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    credentials::store_async(1, Slot::Password, "pass".into())
+        .await
+        .unwrap();
+    let mail_dir = paths.mail_dir(1);
+    let attach_dir = paths.attachments_dir(1);
+    std::fs::create_dir_all(&mail_dir).unwrap();
+    std::fs::write(mail_dir.join("1.eml"), b"raw").unwrap();
+    std::fs::create_dir_all(&attach_dir).unwrap();
+    std::fs::write(attach_dir.join("a"), b"raw").unwrap();
+
+    // Kill mid-sweep: the marker is committed and one sweep batch has
+    // committed (both of account 1's FTS rows are now gone) - then the
+    // process "dies": the Db is dropped without Core::start having run.
+    db.write(move |conn| {
+        repo::accounts::mark_removing(conn, 1)?;
+        let swept = repo::accounts::sweep_fts_batch(conn, 1)?;
+        assert_eq!(swept, 2);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    drop(db);
+
+    // Start-up must resume: the account is fully removed (row, FTS, creds,
+    // dirs) and the marker is cleared - all before account tasks could spawn.
+    let core = Core::start(Paths::for_tests(tmp.path())).await.unwrap();
+    core.db
+        .read(|conn| {
+            assert!(
+                repo::accounts::get(conn, 1)?.is_none(),
+                "resumed removal must delete the account"
+            );
+            assert!(
+                repo::accounts::removal_markers(conn)?.is_empty(),
+                "marker must be cleared by the resumed removal"
+            );
+            let fts: i64 = conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))?;
+            assert_eq!(fts, 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(credentials::load_async(1, Slot::Password).await.is_err());
+    assert!(!mail_dir.exists(), "mail dir must be removed by the resume");
+    assert!(!attach_dir.exists());
+    // The account must never be offered in the UI as a normal account -
+    // neither while marked nor after removal.
+    assert!(core.list_accounts().await.unwrap().is_empty());
+}
