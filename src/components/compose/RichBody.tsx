@@ -126,6 +126,10 @@ export const RichBody = forwardRef<
   const savedRangeRef = useRef<Range | null>(null);
   // Set by cmd/ctrl+shift+V so the paste that follows drops its formatting.
   const pastePlainRef = useRef(false);
+  // A drag that starts inside this editor is a native move, not incoming
+  // content: flag it so onDrop lets the browser relocate the source instead
+  // of sanitizing a duplicate in at the drop point.
+  const internalDragRef = useRef(false);
   const [empty, setEmpty] = useState(true);
   const [active, setActive] = useState<Record<string, boolean>>({});
   const [linkOpen, setLinkOpen] = useState(false);
@@ -628,16 +632,16 @@ export const RichBody = forwardRef<
     emit();
   };
 
-  const insertImageFile = (file: File) => {
+  const insertImageFile = (file: File): boolean => {
     // Only the raster types the editor allowlist accepts as data: sources.
     // An SVG/TIFF/HEIC insert would be stripped by the next sanitizing pass
     // (reopened draft), so refuse it here instead of losing it silently.
     if (!EDITOR_IMAGE_TYPES.has(file.type)) {
       useUi.getState().pushToast({
         kind: "error",
-        message: t("compose:couldntPickFiles", { error: file.type || file.name }),
+        message: t("compose:couldntPickFiles", { error: file.name || file.type }),
       });
-      return;
+      return false;
     }
     const reader = new FileReader();
     reader.onload = () => {
@@ -648,6 +652,7 @@ export const RichBody = forwardRef<
       emit();
     };
     reader.readAsDataURL(file);
+    return true;
   };
 
   /** Snapshot the current editor selection before a popover steals focus. */
@@ -955,15 +960,16 @@ export const RichBody = forwardRef<
             return;
           }
           pastePlainRef.current = false;
-          // Pasted images (screenshots) land inline.
+          // Pasted images (screenshots) land inline. A refused type (SVG,
+          // TIFF) doesn't consume the paste: fall through to the HTML/plain
+          // branches below rather than pasting nothing at all.
           const item = [...(e.clipboardData?.items ?? [])].find((i) =>
             i.type.startsWith("image/"),
           );
           if (item) {
             const file = item.getAsFile();
-            if (file) {
+            if (file && insertImageFile(file)) {
               e.preventDefault();
-              insertImageFile(file);
               return;
             }
           }
@@ -985,7 +991,20 @@ export const RichBody = forwardRef<
             emit();
           }
         }}
+        onDragStart={() => {
+          internalDragRef.current = true;
+        }}
+        onDragEnd={() => {
+          internalDragRef.current = false;
+        }}
         onDrop={(e) => {
+          // A drag that started inside this editor is a native "move": the
+          // browser relocates the (already sanitized) selection and removes
+          // the source; the resulting input event emits on its own.
+          if (internalDragRef.current) {
+            internalDragRef.current = false;
+            return;
+          }
           // Dragged-in HTML enters the DOM raw unless the drop is intercepted
           // just like paste is. File drops carry no text data and are left to
           // the composer's attachment handling.
