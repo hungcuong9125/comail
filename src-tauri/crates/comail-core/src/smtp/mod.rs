@@ -94,18 +94,25 @@ pub async fn send_raw(
     Ok(())
 }
 
-/// SMTP reply codes that genuinely mean the authentication step failed.
-/// 454 is the transient auth failure (RFC 4954), 534/535 credential and
-/// mechanism rejections. 530 is deliberately absent: it can also mean
-/// "STARTTLS first", so its text is checked instead.
-const AUTH_REPLY_CODES: &[u16] = &[454, 534, 535];
+/// SMTP reply codes that genuinely mean the AUTH step failed (RFC 4954):
+/// 432 password transition needed, 454 temporary authentication failure,
+/// 534 credentials/mechanism too weak, 535 authentication failed, 538
+/// encryption required for the mechanism. Every one is only issued in
+/// response to AUTH. 530 is deliberately absent: it can also mean "STARTTLS
+/// first", so its text is checked instead.
+const AUTH_REPLY_CODES: &[u16] = &[432, 454, 534, 535, 538];
 
-/// Enhanced status codes (RFC 5248) that mean the credentials themselves are
-/// the problem. Policy and delivery rejections share the x.7.x space - 5.7.1
-/// "not authorized", 5.7.20+ DKIM/SPF/DMARC failures - and must stay plain
-/// SMTP errors so a poisoned send can fail terminally instead of pausing the
-/// queue for re-auth forever.
-const AUTH_ENHANCED_CODES: &[&str] = &["4.7.0", "5.7.8", "5.7.9", "5.7.11", "5.7.12"];
+/// Enhanced status codes (RFC 3463/5248) that mean the credentials
+/// themselves: 5.7.8 credentials invalid, 5.7.9 mechanism too weak, 5.7.11
+/// authentication required, 5.7.12 password transition needed. They are only
+/// honoured on 5xx replies - on 4xx the x.7.x space means rate limiting and
+/// greylisting (421 4.7.0 "try again later" at Gmail/Yahoo, 4.7.1 greylist),
+/// not bad credentials. Excluded from the list entirely: 5.7.1 policy /
+/// "not authorized" / relay denied, 5.7.13 account disabled (retrying the
+/// password cannot help), and 5.7.20+ SPF/DKIM/DMARC failures - all of which
+/// must stay plain SMTP errors so the queue can fail them terminally instead
+/// of pausing for re-auth forever.
+const AUTH_ENHANCED_CODES: &[&str] = &["5.7.8", "5.7.9", "5.7.11", "5.7.12"];
 
 /// `msg` contains `code` as a standalone x.y.z token (not a substring of a
 /// longer number like "5.7.80").
@@ -127,9 +134,13 @@ fn is_auth_failure(status: Option<u16>, msg: &str, client_side: bool) -> bool {
         if code == 530 {
             return msg.to_lowercase().contains("auth");
         }
-        return AUTH_ENHANCED_CODES
-            .iter()
-            .any(|c| contains_enhanced_code(msg, c));
+        // Credential-class enhanced codes are only honoured on permanent
+        // (5xx) rejections; a 4xx transient with an x.7.x code is rate
+        // limiting or greylisting, which is retried, not re-authed.
+        return code >= 500
+            && AUTH_ENHANCED_CODES
+                .iter()
+                .any(|c| contains_enhanced_code(msg, c));
     }
     client_side && {
         let msg = msg.to_lowercase();
@@ -186,6 +197,8 @@ mod tests {
     fn genuine_auth_failures_are_auth() {
         // (reply code, lettre Display text, client-side flag)
         let cases: &[(Option<u16>, &str, bool)] = &[
+            // 535 is the generic AUTH rejection; the enhanced code varies by
+            // provider but the reply code already decides.
             (
                 Some(535),
                 "permanent error (535): 5.7.8 Username and Password not accepted",
@@ -196,16 +209,50 @@ mod tests {
                 "permanent error (535): authentication failed",
                 false,
             ),
+            // Exchange "Authentication unsuccessful".
+            (
+                Some(535),
+                "permanent error (535): 5.7.3 Authentication unsuccessful",
+                false,
+            ),
+            // Outlook "basic auth is disabled" - still an AUTH rejection.
+            (
+                Some(535),
+                "permanent error (535): 5.7.139 Authentication unsuccessful, basic authentication is disabled",
+                false,
+            ),
+            // 534: RFC 4954 mechanism-too-weak / credentials refused.
             (
                 Some(534),
                 "permanent error (534): 5.7.9 mechanism too weak",
                 false,
             ),
+            // Gmail "please log in via your web browser": needs interactive
+            // re-auth, delivered under 534.
+            (
+                Some(534),
+                "permanent error (534): 5.7.14 Please log in via your web browser and then try again",
+                false,
+            ),
+            // 454: RFC 4954 transient authentication failure.
             (
                 Some(454),
                 "transient error (454): 4.7.0 Temporary authentication failure",
                 false,
             ),
+            // 432/538 are RFC 4954 AUTH replies (password transition needed,
+            // encryption required for the mechanism).
+            (
+                Some(432),
+                "transient error (432): 4.7.12 A password transition is needed",
+                false,
+            ),
+            (
+                Some(538),
+                "permanent error (538): 5.7.11 Encryption required for requested authentication mechanism",
+                false,
+            ),
+            // 530 "Authentication required" - text confirms it means AUTH.
             (
                 Some(530),
                 "permanent error (530): 5.7.0 Authentication Required",
@@ -216,10 +263,16 @@ mod tests {
                 "permanent error (530): SMTP authentication is required",
                 false,
             ),
-            // Enhanced code overrides an unusual reply code.
+            // Credential-class enhanced code on a 5xx reject decides even
+            // when the reply code is not an AUTH code.
             (
                 Some(550),
                 "permanent error (550): 5.7.8 Authentication credentials invalid",
+                false,
+            ),
+            (
+                Some(554),
+                "permanent error (554): 5.7.9 authentication mechanism too weak",
                 false,
             ),
             // Client-side auth step errors (XOAUTH2 failure, no mechanism).
@@ -246,7 +299,35 @@ mod tests {
     #[test]
     fn rejections_and_network_errors_stay_smtp() {
         let cases: &[(Option<u16>, &str, bool)] = &[
-            // The false positives the old substring check produced.
+            // Rate limiting / greylisting on 4xx: the x.7.x enhanced code is
+            // NOT credential-class on a transient reply - this is the F1
+            // false positive.
+            (
+                Some(421),
+                "transient error (421): 4.7.0 Try again later",
+                false,
+            ),
+            (
+                Some(421),
+                "transient error (421): 4.3.2 service not available",
+                false,
+            ),
+            (
+                Some(450),
+                "transient error (450): 4.7.1 Greylisted, try again later",
+                false,
+            ),
+            (
+                Some(451),
+                "transient error (451): 4.7.1 Greylisting in action",
+                false,
+            ),
+            (
+                Some(452),
+                "transient error (452): 4.5.3 too many recipients",
+                false,
+            ),
+            // Policy/relay/DMARC rejections share x.7.x but are not auth.
             (
                 Some(550),
                 "permanent error (550): 5.7.1 ... not authorized",
@@ -267,13 +348,17 @@ mod tests {
                 "permanent error (550): 5.7.1 Message rejected due to auth policy",
                 false,
             ),
-            // 530 demanding STARTTLS, not credentials.
             (
-                Some(530),
-                "permanent error (530): 5.7.0 Must issue a STARTTLS command first",
+                Some(554),
+                "permanent error (554): 5.7.1 delivery not authorized, message refused",
                 false,
             ),
-            // Other 5xx and transient non-auth replies.
+            // Other 5xx delivery failures.
+            (
+                Some(552),
+                "permanent error (552): 5.3.4 Message exceeds fixed size limit",
+                false,
+            ),
             (
                 Some(553),
                 "permanent error (553): 5.1.3 bad recipient address",
@@ -282,6 +367,12 @@ mod tests {
             (
                 Some(554),
                 "permanent error (554): transaction failed",
+                false,
+            ),
+            // 530 demanding STARTTLS, not credentials.
+            (
+                Some(530),
+                "permanent error (530): 5.7.0 Must issue a STARTTLS command first",
                 false,
             ),
             (Some(421), "transient error (421): try again later", false),
