@@ -3,11 +3,12 @@
 //! timeout, and not report "sync actor stopped" because the waiter was
 //! dropped in a retry wait.
 //!
-//! No live server needed: a refused localhost port stands in for "offline",
-//! and an account with no stored credential exercises the auth-failure arm.
-//! One test covers both arms back to back (the actor reloads credentials on
-//! every connect attempt), keeping the process-global credentials-file env
-//! var free of cross-test races.
+//! No live server needed: a listener that accepts and immediately drops the
+//! connection kills the TLS handshake just like a refused port (without the
+//! bind-then-drop reuse race), and an account with no stored credential
+//! exercises the auth-failure arm. One test covers both arms back to back
+//! (the actor reloads credentials on every connect attempt), keeping the
+//! process-global credentials-file env var free of cross-test races.
 
 use comail_core::Core;
 use comail_core::accounts::credentials::{self, Slot};
@@ -16,15 +17,8 @@ use comail_core::db::Db;
 use comail_core::db::repo;
 use comail_core::error::CoreError;
 use comail_core::models::*;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
-
-/// A localhost port with nothing listening: connections are refused instantly.
-fn dead_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
 
 /// `sync_now` errors with NotFound until the account's actor has spawned
 /// (actors start asynchronously after notify_ui_ready); retry through that
@@ -45,18 +39,22 @@ async fn sync_now_when_up(core: &Core, account_id: i64) -> Result<(), CoreError>
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn sync_now_reports_the_real_cause_immediately() {
-    let creds =
-        std::env::temp_dir().join(format!("comail-syncnow-creds-{}.json", std::process::id()));
-    // SAFETY: single-threaded test setup, before any threads read the env.
-    unsafe { std::env::set_var("COMAIL_CREDENTIALS_INSECURE_FILE", &creds) };
+async fn run(creds: PathBuf) {
+    // Accept every connection and drop it at once: the TLS handshake dies
+    // immediately, exercising the same connect-failure arm as a refused
+    // port while keeping the port bound for the whole test.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            drop(socket);
+        }
+    });
 
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths::for_tests(tmp.path());
     paths.ensure().unwrap();
     let db = Db::open(&paths.db_file()).unwrap();
-    let port = dead_port();
     let account_id = db
         .write(move |conn| {
             repo::accounts::insert(
@@ -94,7 +92,8 @@ async fn sync_now_reports_the_real_cause_immediately() {
     );
 
     // Arm 2: with a credential stored the same Sync Now nudge retries the
-    // connect, which the dead port refuses - the waiter gets that error.
+    // connect, which the accept-then-drop listener kills - the waiter gets
+    // that error.
     credentials::store_async(account_id, Slot::Password, "pass".into())
         .await
         .unwrap();
@@ -111,4 +110,19 @@ async fn sync_now_reports_the_real_cause_immediately() {
     );
 
     let _ = std::fs::remove_file(&creds);
+}
+
+#[test]
+fn sync_now_reports_the_real_cause_immediately() {
+    let creds =
+        std::env::temp_dir().join(format!("comail-syncnow-creds-{}.json", std::process::id()));
+    // Mutating process env is only safe before the runtime exists and its
+    // worker threads can read it - hence a manual runtime inside a plain
+    // test instead of #[tokio::test(flavor = "multi_thread")].
+    unsafe { std::env::set_var("COMAIL_CREDENTIALS_INSECURE_FILE", &creds) };
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(run(creds));
 }

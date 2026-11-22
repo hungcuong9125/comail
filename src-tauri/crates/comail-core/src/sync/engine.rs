@@ -1677,49 +1677,37 @@ async fn discover_folders(
         .await
 }
 
-/// The forward-scan plan for one folder pass: the UID set to FETCH, how far
-/// the scan watermark may move afterwards, and whether more forward work
-/// remains this cycle.
+/// The forward-fetch plan for one folder pass: the UID set to FETCH, the
+/// highest UID the pass covers (which `last_seen` may always advance to,
+/// since the whole set was covered or ledgered), and whether more forward
+/// work remains after it.
 struct ForwardScan {
     set: String,
-    watermark: ForwardWatermark,
+    hi: u32,
     remaining: bool,
 }
 
-#[derive(Clone, Copy)]
-enum ForwardWatermark {
-    /// The whole bounded `lo:hi` range was covered by the FETCH, so the
-    /// watermark advances to `hi` even when no message matched. Only sound
-    /// when the server reported UIDNEXT, since `hi <= UIDNEXT - 1`.
-    Range(u32),
-    /// Only UIDs the response actually carried were covered; advance to the
-    /// highest one above `last_seen`. Used when the server omits UIDNEXT:
-    /// the `n:*` probe has no upper bound to credit, and IMAP still answers
-    /// it with the mailbox tail (a UID <= last_seen) when nothing is new.
-    HighestSeen,
+/// The first step toward a [`ForwardScan`].
+enum ForwardPlan {
+    /// Server reported UIDNEXT: fetch the bounded `lo:hi` range directly.
+    Fetch(ForwardScan),
+    /// Server omits UIDNEXT: there is no high-water to bound a FETCH range
+    /// against, so `UID SEARCH` this open range for the real UID list first
+    /// and turn it into a bounded fetch via [`forward_search_batch`]. The
+    /// reply is bare numbers - even a 200k-message folder answers in about a
+    /// megabyte, far less than one header per message - so a single unbounded
+    /// `n:*` FETCH is never issued.
+    Search { set: String },
 }
 
-impl ForwardWatermark {
-    /// Where `last_seen` may advance after the pass. `covered_hi` is the
-    /// highest UID the response carried (including ledgered failures).
-    fn advance_to(self, covered_hi: Option<u32>, last_seen: u32) -> Option<i64> {
-        match self {
-            Self::Range(end) => Some(i64::from(end)),
-            Self::HighestSeen => covered_hi.filter(|uid| *uid > last_seen).map(i64::from),
-        }
-    }
-}
-
-/// Plan the next forward scan. `None` when the server says nothing is new
-/// (`last_seen + 1 >= UIDNEXT`). When the server omits UIDNEXT there is no
-/// high-water to compare against, so the plan is a single `n:*` probe -
-/// bounded to one round trip, never looping.
-fn forward_scan(last_seen: u32, uid_next: Option<i64>) -> Option<ForwardScan> {
+/// Plan the next forward pass. `None` when the server says nothing is new
+/// (`last_seen + 1 >= UIDNEXT`).
+fn forward_scan(last_seen: u32, uid_next: Option<i64>) -> Option<ForwardPlan> {
     let Some(uid_next) = uid_next else {
-        return Some(ForwardScan {
-            set: format!("{}:*", last_seen + 1),
-            watermark: ForwardWatermark::HighestSeen,
-            remaining: false,
+        // `last_seen + 1` overflowing means no newer UID can exist.
+        let lo = last_seen.checked_add(1)?;
+        return Some(ForwardPlan::Search {
+            set: format!("{lo}:*"),
         });
     };
     if (last_seen as i64) + 1 >= uid_next {
@@ -1727,10 +1715,32 @@ fn forward_scan(last_seen: u32, uid_next: Option<i64>) -> Option<ForwardScan> {
     }
     let range_end =
         ((last_seen as u64) + HEADER_CHUNK as u64).min((uid_next - 1).max(0) as u64) as u32;
-    Some(ForwardScan {
+    Some(ForwardPlan::Fetch(ForwardScan {
         set: format!("{}:{range_end}", last_seen + 1),
-        watermark: ForwardWatermark::Range(range_end),
+        hi: range_end,
         remaining: (range_end as i64) < uid_next.saturating_sub(1),
+    }))
+}
+
+/// Turn a no-UIDNEXT `UID SEARCH` result into this pass's fetch: the first
+/// `HEADER_CHUNK` UIDs above `last_seen`. The open `n:*` search still
+/// answers the mailbox tail when nothing is newer - a UID <= last_seen - so
+/// those are dropped first. With none left there is nothing to fetch, which
+/// also means a tail message the ledger marked unreadable is never refetched
+/// by this probe.
+fn forward_search_batch(found: &[u32], last_seen: u32) -> Option<ForwardScan> {
+    let mut new: Vec<u32> = found
+        .iter()
+        .copied()
+        .filter(|uid| *uid > last_seen)
+        .collect();
+    new.sort_unstable();
+    let chunk = &new[..new.len().min(HEADER_CHUNK)];
+    let &hi = chunk.last()?;
+    Some(ForwardScan {
+        set: imap::uid_set(chunk),
+        hi,
+        remaining: new.len() > chunk.len(),
     })
 }
 
@@ -1741,18 +1751,24 @@ mod forward_scan_tests {
     #[test]
     fn bounded_scan_chunks_at_header_chunk_and_reports_remaining() {
         // uid_next 302: UIDs 101..=301 are new; one pass covers 101..=300.
-        let scan = forward_scan(100, Some(302)).unwrap();
+        let Some(ForwardPlan::Fetch(scan)) = forward_scan(100, Some(302)) else {
+            panic!("expected a fetch plan");
+        };
         assert_eq!(scan.set, "101:300");
+        assert_eq!(scan.hi, 300);
         assert!(scan.remaining, "UID 301 still ahead");
-        assert!(matches!(scan.watermark, ForwardWatermark::Range(300)));
 
         // uid_next 301: the chunk ends exactly at the last new UID.
-        let scan = forward_scan(100, Some(301)).unwrap();
+        let Some(ForwardPlan::Fetch(scan)) = forward_scan(100, Some(301)) else {
+            panic!("expected a fetch plan");
+        };
         assert_eq!(scan.set, "101:300");
         assert!(!scan.remaining);
 
         // A gap smaller than the chunk is one pass.
-        let scan = forward_scan(100, Some(102)).unwrap();
+        let Some(ForwardPlan::Fetch(scan)) = forward_scan(100, Some(102)) else {
+            panic!("expected a fetch plan");
+        };
         assert_eq!(scan.set, "101:101");
         assert!(!scan.remaining);
     }
@@ -1765,42 +1781,64 @@ mod forward_scan_tests {
     }
 
     #[test]
-    fn missing_uid_next_is_one_open_ended_pass() {
-        let scan = forward_scan(100, None).unwrap();
-        assert_eq!(scan.set, "101:*");
-        assert!(
-            !scan.remaining,
-            "the n:* probe covers everything above last_seen in one pass"
-        );
-        assert!(matches!(scan.watermark, ForwardWatermark::HighestSeen));
+    fn missing_uid_next_searches_then_fetches_bounded_batches() {
+        // No UIDNEXT: the pass starts with a UID SEARCH over the open range.
+        let Some(ForwardPlan::Search { set }) = forward_scan(100, None) else {
+            panic!("expected a search plan");
+        };
+        assert_eq!(set, "101:*");
 
-        // last_seen 0 (first sync recorded no high-water): still a single
-        // probe, not an i64::MAX-bounded infinite loop.
-        let scan = forward_scan(0, None).unwrap();
-        assert_eq!(scan.set, "1:*");
+        // First sync: last_seen 0, more new UIDs than one chunk. Each pass
+        // fetches one bounded batch of real UIDs, the watermark moves
+        // monotonically, and the loop terminates once caught up.
+        let Some(ForwardPlan::Search { set }) = forward_scan(0, None) else {
+            panic!("expected a search plan");
+        };
+        assert_eq!(set, "1:*");
+        let found: Vec<u32> = (1..=450).collect();
+        let mut last_seen = 0;
+        let mut passes = 0;
+        while let Some(scan) = forward_search_batch(&found, last_seen) {
+            passes += 1;
+            assert!(scan.hi > last_seen, "watermark must advance");
+            assert!(scan.hi <= last_seen + HEADER_CHUNK as u32, "one chunk/pass");
+            last_seen = scan.hi;
+            assert!(passes <= 3, "must terminate");
+            if !scan.remaining {
+                break;
+            }
+        }
+        assert_eq!(passes, 3, "200 + 200 + 50");
+        assert_eq!(last_seen, 450);
+
+        // The fetch set is an explicit UID list, never an open range.
+        let scan = forward_search_batch(&found, 0).unwrap();
+        assert_eq!(scan.set, "1:200");
+        assert_eq!(scan.hi, 200);
+        assert!(scan.remaining);
+    }
+
+    #[test]
+    fn search_batch_terminates_on_empty_or_tail_echo() {
+        assert!(forward_search_batch(&[], 100).is_none(), "empty result");
+        assert!(
+            forward_search_batch(&[100, 99, 50], 100).is_none(),
+            "n:* tail echo only (incl. a ledgered-unreadable tail)"
+        );
+        // A tail echo mixed with real new UIDs fetches only the new ones.
+        let scan = forward_search_batch(&[100, 105, 101], 100).unwrap();
+        assert_eq!(scan.set, "101,105");
+        assert_eq!(scan.hi, 105);
         assert!(!scan.remaining);
     }
 
     #[test]
-    fn watermark_advances_only_over_covered_uids() {
-        // Bounded range: the whole range was scanned, advance regardless.
-        let w = ForwardWatermark::Range(300);
-        assert_eq!(w.advance_to(None, 100), Some(300));
-        assert_eq!(w.advance_to(Some(150), 100), Some(300));
-
-        // Open-ended: only UIDs actually returned move the watermark.
-        let w = ForwardWatermark::HighestSeen;
-        assert_eq!(w.advance_to(Some(500), 100), Some(500));
-        assert_eq!(
-            w.advance_to(None, 100),
-            None,
-            "empty response: nothing covered, watermark stays"
+    fn last_seen_at_u32_max_is_caught_up() {
+        assert!(
+            forward_scan(u32::MAX, None).is_none(),
+            "checked_add overflow"
         );
-        assert_eq!(
-            w.advance_to(Some(100), 100),
-            None,
-            "n:* tail echo (uid <= last_seen): watermark stays"
-        );
+        assert!(forward_scan(u32::MAX, Some(i64::from(u32::MAX))).is_none());
     }
 }
 
@@ -1893,24 +1931,30 @@ async fn sync_folder(
     } else {
         // New mail since last seen UID.
         let last_seen = fresh_folder.last_seen_uid.max(0) as u32;
-        if let Some(scan) = forward_scan(last_seen, selected.uid_next) {
-            let hi_bound = match scan.watermark {
-                ForwardWatermark::Range(end) => end,
-                ForwardWatermark::HighestSeen => u32::MAX,
-            };
+        let scan = match forward_scan(last_seen, selected.uid_next) {
+            Some(ForwardPlan::Fetch(scan)) => Some(scan),
+            // The server omitted UIDNEXT: SEARCH the open range for the real
+            // UID list, then fetch one bounded batch of it per pass.
+            Some(ForwardPlan::Search { set }) => {
+                let found = imap::uid_search_in(session, &set).await?;
+                forward_search_batch(&found, last_seen)
+            }
+            None => None,
+        };
+        if let Some(scan) = scan {
             forward_remaining = scan.remaining;
             let notify_min_uid = if is_inbox {
                 inbox_baseline.as_ref().map(|b| b.first_live_uid)
             } else {
                 None
             };
-            let (thread_ids, fresh, count, covered_hi) = fetch_and_store_headers(
+            let (thread_ids, fresh, count) = fetch_and_store_headers(
                 ctx,
                 config,
                 session,
                 &fresh_folder,
                 &scan.set,
-                |h| h.uid > last_seen && h.uid <= hi_bound,
+                |h| h.uid > last_seen && h.uid <= scan.hi,
                 notify_min_uid,
             )
             .await?;
@@ -1939,17 +1983,15 @@ async fn sync_folder(
                     });
                 }
             }
-            // The command successfully scanned the bounded range, or - with
-            // no UIDNEXT - everything above last_seen that exists. Move the
-            // scan watermark only across UIDs the fetch actually covered: the
-            // whole range when the server bounded it, the highest returned
-            // UID otherwise. Parse failures are persisted separately for retry.
-            if let Some(new_seen) = scan.watermark.advance_to(covered_hi, last_seen) {
-                let fid = fresh_folder.id;
-                ctx.db
-                    .write(move |conn| repo::folders::set_last_seen_uid(conn, fid, new_seen))
-                    .await?;
-            }
+            // The FETCH covered the whole set - a range the server bounded,
+            // or UIDs the SEARCH just proved exist - and unreadable ones sit
+            // in the failure ledger for their own retry, so the watermark
+            // always advances to the set's high end.
+            let new_seen = i64::from(scan.hi);
+            let fid = fresh_folder.id;
+            ctx.db
+                .write(move |conn| repo::folders::set_last_seen_uid(conn, fid, new_seen))
+                .await?;
         }
         if heavy {
             reconcile_flags(ctx, session, &fresh_folder).await?;
@@ -2480,7 +2522,7 @@ async fn initial_backfill(
         if set.is_empty() {
             continue;
         }
-        let (thread_ids, _, count, _) =
+        let (thread_ids, _, count) =
             fetch_and_store_headers(ctx, config, session, folder, &set, |_| true, None).await?;
         done += count as u64;
         if !thread_ids.is_empty() {
@@ -2907,10 +2949,8 @@ async fn ledger_unreadable_headers(ctx: &SyncCtx, folder_id: i64, uids: Vec<u32>
 }
 
 /// Fetch and store headers for `set` in `folder`, putting unreadable messages
-/// in the failure ledger. Returns the stored threads, fresh arrivals (as
-/// [`store_headers`] does), the count, and the highest UID the response
-/// covered - including ledgered unreadable ones, which a scan watermark may
-/// still move past since the failure ledger retries them on its own.
+/// in the failure ledger. Returns the stored threads and fresh arrivals, as
+/// [`store_headers`] does, plus the count.
 async fn fetch_and_store_headers(
     ctx: &SyncCtx,
     config: &AccountConfig,
@@ -2919,22 +2959,16 @@ async fn fetch_and_store_headers(
     set: &str,
     keep: impl Fn(&FetchedHeader) -> bool,
     notify_min_uid: Option<u32>,
-) -> Result<(Vec<i64>, Vec<i64>, usize, Option<u32>)> {
+) -> Result<(Vec<i64>, Vec<i64>, usize)> {
     let fetched = fetch_headers_tolerant(ctx, config, session, folder, set).await?;
-    let covered_hi = fetched
-        .headers
-        .iter()
-        .map(|h| h.uid)
-        .chain(fetched.unreadable.iter().copied())
-        .max();
     ledger_unreadable_headers(ctx, folder.id, fetched.unreadable).await?;
     let headers: Vec<FetchedHeader> = fetched.headers.into_iter().filter(keep).collect();
     let count = headers.len();
     if headers.is_empty() {
-        return Ok((Vec::new(), Vec::new(), 0, covered_hi));
+        return Ok((Vec::new(), Vec::new(), 0));
     }
     let (thread_ids, fresh) = store_headers(ctx, config, folder, headers, notify_min_uid).await?;
-    Ok((thread_ids, fresh, count, covered_hi))
+    Ok((thread_ids, fresh, count))
 }
 
 async fn extend_history(
@@ -2956,7 +2990,7 @@ async fn extend_history(
     let hi = (cursor - 1).max(1) as u32;
     let lo = hi.saturating_sub(HISTORY_CHUNK - 1).max(1);
     let set = format!("{lo}:{hi}");
-    let (thread_ids, _, _, _) =
+    let (thread_ids, _, _) =
         fetch_and_store_headers(ctx, config, session, folder, &set, |_| true, None).await?;
     if !thread_ids.is_empty() {
         ctx.bus.emit(CoreEvent::MailUpdated { thread_ids });
