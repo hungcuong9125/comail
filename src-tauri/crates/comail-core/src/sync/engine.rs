@@ -1118,6 +1118,11 @@ async fn run_actor(
                         "imap connect rejected at auth; marking needs_reauth"
                     );
                     set_state(&ctx, account_id, "needs_reauth").await;
+                    // Waiting Sync Now callers get the real cause now rather
+                    // than hanging until their own timeout.
+                    for waiter in sync_waiters.drain(..) {
+                        let _ = waiter.send(Err("authentication required".into()));
+                    }
                     // Wait for an external nudge before retrying auth.
                     match rx.recv().await {
                         None | Some(SyncCmd::Shutdown) => return,
@@ -1134,6 +1139,12 @@ async fn run_actor(
                     tracing::warn!(account_id, "imap connect failed: {e}");
                     ctx.bus.emit(CoreEvent::NetworkState { online: false });
                     set_state(&ctx, account_id, "offline").await;
+                    // Waiting Sync Now callers get the real cause now rather
+                    // than hanging until their own timeout.
+                    let message = e.to_string();
+                    for waiter in sync_waiters.drain(..) {
+                        let _ = waiter.send(Err(message.clone()));
+                    }
                     // Backoff, but wake early on commands.
                     let wait = std::time::Duration::from_secs(backoff_secs);
                     backoff_secs = (backoff_secs * 2).min(300);
@@ -1362,6 +1373,19 @@ async fn run_actor(
                                 imap::logout(s).await;
                             }
                             return;
+                        }
+                        // Keep the waiter: the cycle that follows completes it.
+                        Ok(Some(SyncCmd::SyncNow {
+                            complete: Some(complete),
+                        })) => {
+                            sync_waiters.push(complete);
+                        }
+                        Ok(Some(SyncCmd::FetchBody { message_id })) => {
+                            if let Some(ref mut s) = session
+                                && let Err(e) = fetch_one_body(&ctx, &config, s, message_id).await
+                            {
+                                tracing::warn!("priority body fetch failed: {e}");
+                            }
                         }
                         _ => {}
                     }
@@ -1653,6 +1677,133 @@ async fn discover_folders(
         .await
 }
 
+/// The forward-scan plan for one folder pass: the UID set to FETCH, how far
+/// the scan watermark may move afterwards, and whether more forward work
+/// remains this cycle.
+struct ForwardScan {
+    set: String,
+    watermark: ForwardWatermark,
+    remaining: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ForwardWatermark {
+    /// The whole bounded `lo:hi` range was covered by the FETCH, so the
+    /// watermark advances to `hi` even when no message matched. Only sound
+    /// when the server reported UIDNEXT, since `hi <= UIDNEXT - 1`.
+    Range(u32),
+    /// Only UIDs the response actually carried were covered; advance to the
+    /// highest one above `last_seen`. Used when the server omits UIDNEXT:
+    /// the `n:*` probe has no upper bound to credit, and IMAP still answers
+    /// it with the mailbox tail (a UID <= last_seen) when nothing is new.
+    HighestSeen,
+}
+
+impl ForwardWatermark {
+    /// Where `last_seen` may advance after the pass. `covered_hi` is the
+    /// highest UID the response carried (including ledgered failures).
+    fn advance_to(self, covered_hi: Option<u32>, last_seen: u32) -> Option<i64> {
+        match self {
+            Self::Range(end) => Some(i64::from(end)),
+            Self::HighestSeen => covered_hi.filter(|uid| *uid > last_seen).map(i64::from),
+        }
+    }
+}
+
+/// Plan the next forward scan. `None` when the server says nothing is new
+/// (`last_seen + 1 >= UIDNEXT`). When the server omits UIDNEXT there is no
+/// high-water to compare against, so the plan is a single `n:*` probe -
+/// bounded to one round trip, never looping.
+fn forward_scan(last_seen: u32, uid_next: Option<i64>) -> Option<ForwardScan> {
+    let Some(uid_next) = uid_next else {
+        return Some(ForwardScan {
+            set: format!("{}:*", last_seen + 1),
+            watermark: ForwardWatermark::HighestSeen,
+            remaining: false,
+        });
+    };
+    if (last_seen as i64) + 1 >= uid_next {
+        return None;
+    }
+    let range_end =
+        ((last_seen as u64) + HEADER_CHUNK as u64).min((uid_next - 1).max(0) as u64) as u32;
+    Some(ForwardScan {
+        set: format!("{}:{range_end}", last_seen + 1),
+        watermark: ForwardWatermark::Range(range_end),
+        remaining: (range_end as i64) < uid_next.saturating_sub(1),
+    })
+}
+
+#[cfg(test)]
+mod forward_scan_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_scan_chunks_at_header_chunk_and_reports_remaining() {
+        // uid_next 302: UIDs 101..=301 are new; one pass covers 101..=300.
+        let scan = forward_scan(100, Some(302)).unwrap();
+        assert_eq!(scan.set, "101:300");
+        assert!(scan.remaining, "UID 301 still ahead");
+        assert!(matches!(scan.watermark, ForwardWatermark::Range(300)));
+
+        // uid_next 301: the chunk ends exactly at the last new UID.
+        let scan = forward_scan(100, Some(301)).unwrap();
+        assert_eq!(scan.set, "101:300");
+        assert!(!scan.remaining);
+
+        // A gap smaller than the chunk is one pass.
+        let scan = forward_scan(100, Some(102)).unwrap();
+        assert_eq!(scan.set, "101:101");
+        assert!(!scan.remaining);
+    }
+
+    #[test]
+    fn bounded_scan_is_none_when_caught_up() {
+        assert!(forward_scan(100, Some(101)).is_none());
+        assert!(forward_scan(100, Some(50)).is_none());
+        assert!(forward_scan(0, Some(1)).is_none(), "empty mailbox");
+    }
+
+    #[test]
+    fn missing_uid_next_is_one_open_ended_pass() {
+        let scan = forward_scan(100, None).unwrap();
+        assert_eq!(scan.set, "101:*");
+        assert!(
+            !scan.remaining,
+            "the n:* probe covers everything above last_seen in one pass"
+        );
+        assert!(matches!(scan.watermark, ForwardWatermark::HighestSeen));
+
+        // last_seen 0 (first sync recorded no high-water): still a single
+        // probe, not an i64::MAX-bounded infinite loop.
+        let scan = forward_scan(0, None).unwrap();
+        assert_eq!(scan.set, "1:*");
+        assert!(!scan.remaining);
+    }
+
+    #[test]
+    fn watermark_advances_only_over_covered_uids() {
+        // Bounded range: the whole range was scanned, advance regardless.
+        let w = ForwardWatermark::Range(300);
+        assert_eq!(w.advance_to(None, 100), Some(300));
+        assert_eq!(w.advance_to(Some(150), 100), Some(300));
+
+        // Open-ended: only UIDs actually returned move the watermark.
+        let w = ForwardWatermark::HighestSeen;
+        assert_eq!(w.advance_to(Some(500), 100), Some(500));
+        assert_eq!(
+            w.advance_to(None, 100),
+            None,
+            "empty response: nothing covered, watermark stays"
+        );
+        assert_eq!(
+            w.advance_to(Some(100), 100),
+            None,
+            "n:* tail echo (uid <= last_seen): watermark stays"
+        );
+    }
+}
+
 async fn sync_folder(
     ctx: &SyncCtx,
     config: &AccountConfig,
@@ -1742,24 +1893,24 @@ async fn sync_folder(
     } else {
         // New mail since last seen UID.
         let last_seen = fresh_folder.last_seen_uid.max(0) as u32;
-        let uid_next = selected.uid_next.unwrap_or(i64::MAX);
-        if (last_seen as i64) + 1 < uid_next {
-            let range_end =
-                ((last_seen as u64) + HEADER_CHUNK as u64).min((uid_next - 1).max(0) as u64) as u32;
-            forward_remaining = (range_end as i64) < uid_next.saturating_sub(1);
-            let set = format!("{}:{range_end}", last_seen + 1);
+        if let Some(scan) = forward_scan(last_seen, selected.uid_next) {
+            let hi_bound = match scan.watermark {
+                ForwardWatermark::Range(end) => end,
+                ForwardWatermark::HighestSeen => u32::MAX,
+            };
+            forward_remaining = scan.remaining;
             let notify_min_uid = if is_inbox {
                 inbox_baseline.as_ref().map(|b| b.first_live_uid)
             } else {
                 None
             };
-            let (thread_ids, fresh, count) = fetch_and_store_headers(
+            let (thread_ids, fresh, count, covered_hi) = fetch_and_store_headers(
                 ctx,
                 config,
                 session,
                 &fresh_folder,
-                &set,
-                |h| h.uid > last_seen && h.uid <= range_end,
+                &scan.set,
+                |h| h.uid > last_seen && h.uid <= hi_bound,
                 notify_min_uid,
             )
             .await?;
@@ -1788,13 +1939,17 @@ async fn sync_folder(
                     });
                 }
             }
-            // The command successfully scanned the whole bounded range. Move
-            // the scan watermark even when UIDs are sparse or every row was a
-            // duplicate; parse failures are persisted separately for retry.
-            let fid = fresh_folder.id;
-            ctx.db
-                .write(move |conn| repo::folders::set_last_seen_uid(conn, fid, range_end as i64))
-                .await?;
+            // The command successfully scanned the bounded range, or - with
+            // no UIDNEXT - everything above last_seen that exists. Move the
+            // scan watermark only across UIDs the fetch actually covered: the
+            // whole range when the server bounded it, the highest returned
+            // UID otherwise. Parse failures are persisted separately for retry.
+            if let Some(new_seen) = scan.watermark.advance_to(covered_hi, last_seen) {
+                let fid = fresh_folder.id;
+                ctx.db
+                    .write(move |conn| repo::folders::set_last_seen_uid(conn, fid, new_seen))
+                    .await?;
+            }
         }
         if heavy {
             reconcile_flags(ctx, session, &fresh_folder).await?;
@@ -2325,7 +2480,7 @@ async fn initial_backfill(
         if set.is_empty() {
             continue;
         }
-        let (thread_ids, _, count) =
+        let (thread_ids, _, count, _) =
             fetch_and_store_headers(ctx, config, session, folder, &set, |_| true, None).await?;
         done += count as u64;
         if !thread_ids.is_empty() {
@@ -2752,8 +2907,10 @@ async fn ledger_unreadable_headers(ctx: &SyncCtx, folder_id: i64, uids: Vec<u32>
 }
 
 /// Fetch and store headers for `set` in `folder`, putting unreadable messages
-/// in the failure ledger. Returns the stored threads and fresh arrivals, as
-/// [`store_headers`] does.
+/// in the failure ledger. Returns the stored threads, fresh arrivals (as
+/// [`store_headers`] does), the count, and the highest UID the response
+/// covered - including ledgered unreadable ones, which a scan watermark may
+/// still move past since the failure ledger retries them on its own.
 async fn fetch_and_store_headers(
     ctx: &SyncCtx,
     config: &AccountConfig,
@@ -2762,16 +2919,22 @@ async fn fetch_and_store_headers(
     set: &str,
     keep: impl Fn(&FetchedHeader) -> bool,
     notify_min_uid: Option<u32>,
-) -> Result<(Vec<i64>, Vec<i64>, usize)> {
+) -> Result<(Vec<i64>, Vec<i64>, usize, Option<u32>)> {
     let fetched = fetch_headers_tolerant(ctx, config, session, folder, set).await?;
+    let covered_hi = fetched
+        .headers
+        .iter()
+        .map(|h| h.uid)
+        .chain(fetched.unreadable.iter().copied())
+        .max();
     ledger_unreadable_headers(ctx, folder.id, fetched.unreadable).await?;
     let headers: Vec<FetchedHeader> = fetched.headers.into_iter().filter(keep).collect();
     let count = headers.len();
     if headers.is_empty() {
-        return Ok((Vec::new(), Vec::new(), 0));
+        return Ok((Vec::new(), Vec::new(), 0, covered_hi));
     }
     let (thread_ids, fresh) = store_headers(ctx, config, folder, headers, notify_min_uid).await?;
-    Ok((thread_ids, fresh, count))
+    Ok((thread_ids, fresh, count, covered_hi))
 }
 
 async fn extend_history(
@@ -2793,7 +2956,7 @@ async fn extend_history(
     let hi = (cursor - 1).max(1) as u32;
     let lo = hi.saturating_sub(HISTORY_CHUNK - 1).max(1);
     let set = format!("{lo}:{hi}");
-    let (thread_ids, _, _) =
+    let (thread_ids, _, _, _) =
         fetch_and_store_headers(ctx, config, session, folder, &set, |_| true, None).await?;
     if !thread_ids.is_empty() {
         ctx.bus.emit(CoreEvent::MailUpdated { thread_ids });
