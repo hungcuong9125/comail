@@ -2202,8 +2202,8 @@ interface DraftLoc {
 const draftIndex = new Map<number, DraftLoc>();
 const draftArgsById = new Map<number, SaveDraftArgs>();
 
-// Approval tokens the mock mints for picks/drops; mirrors the Rust registry
-// so save_draft can resolve token entries to staged ones.
+// Approval tokens the mock mints for picks/drops/forwards; mirrors the Rust
+// registry so save_draft can resolve token entries to staged ones.
 const mockAttachmentTokens = new Map<
   string,
   { filename: string; path: string; size: number }
@@ -2214,7 +2214,9 @@ function mockApproved(filename: string, path?: string): ApprovedAttachment {
   const token = `mock-token-${++mockTokenSeq}`;
   const p = path ?? `/tmp/comail-mock/${filename}`;
   mockAttachmentTokens.set(token, { filename, path: p, size: 2048 });
-  return { token, filename, path: p, size: 2048, mimeType: null };
+  // `source` is the opaque dedupe alias the real backend sends; one alias
+  // per distinct fake path keeps the demo's dedupe behaving like prod.
+  return { token, filename, source: p, size: 2048, mimeType: null };
 }
 
 function mockAttachmentName(attachmentId: number): string {
@@ -2227,14 +2229,12 @@ function mockAttachmentName(attachmentId: number): string {
 }
 
 /** Resolve incoming attachment entries to the staged references a real
- *  save_draft returns (tokens/forward ids become `staged` rows). */
+ *  save_draft returns (tokens become `staged` rows). */
 function stageAttachments(atts: DraftAttachment[]): DraftAttachment[] {
   return atts.map((a) => {
     if (a.kind === "staged") return a;
     const filename =
-      a.kind === "token"
-        ? (mockAttachmentTokens.get(a.token)?.filename ?? "attachment")
-        : mockAttachmentName(a.attachmentId);
+      mockAttachmentTokens.get(a.token)?.filename ?? "attachment";
     return {
       kind: "staged" as const,
       filePath: `/tmp/comail-mock/staged/${id()}/${filename}`,
@@ -3143,10 +3143,16 @@ export async function mockInvoke(
     }
 
     case "claim_dropped_attachments":
-      return delay(
-        (a.paths as string[]).map((p) =>
+      return delay({
+        approved: (a.paths as string[]).map((p) =>
           mockApproved(p.split(/[\\/]/).pop() || p, p),
         ),
+        skipped: [],
+      });
+
+    case "prepare_forward_attachment":
+      return delay(
+        mockApproved(mockAttachmentName(a.attachmentId as number)),
       );
 
     case "save_draft":

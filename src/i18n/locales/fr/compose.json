@@ -77,6 +77,7 @@
   "couldntSend": "Impossible d’envoyer : {{error}}",
   "sendNoDraft": "Aucun brouillon à envoyer",
   "couldntPickFiles": "Impossible de sélectionner les fichiers : {{error}}",
+  "attachmentSkipped": "{{name}} ignoré : {{reason}}",
   "showQuoted": "Afficher le texte cité",
   "hideQuoted": "Masquer",
   "removeQuoted": "Retirer",

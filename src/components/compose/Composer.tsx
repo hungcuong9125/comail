@@ -6,7 +6,22 @@ import { errorMessage, parseError } from "../../ipc/errors";
 import { call } from "../../ipc/commands";
 import { MOCK_MODE } from "../../ipc/mock";
 import { subscribeEvent } from "../../ipc/events";
-import type { Address, AiDraftAction, ApprovedAttachment, DraftAttachment, MessageDetail, Snippet } from "../../ipc/types";
+import type { Address, AiDraftAction, ApprovedAttachment, MessageDetail, Snippet } from "../../ipc/types";
+import {
+  addChips,
+  allReady,
+  applySavedRefs,
+  approvedChips,
+  chipFailed,
+  chipResolved,
+  forwardChip,
+  mapSavedRefs,
+  removeChip,
+  restoredChip,
+  wireEntries,
+  withoutForwardChips,
+  type ComposerAttachment,
+} from "../../lib/draftAttachments";
 import { RecipientField } from "./RecipientField";
 import { Checkbox } from "../ui/Field";
 import { onComposerAction } from "../../keyboard/commands";
@@ -63,52 +78,6 @@ function forwardBlock(m: MessageDetail): string {
     "",
     m.textBody ?? m.snippet,
   ].join("\n");
-}
-
-/** A composer attachment chip: the `DraftAttachment` the backend consumes
- *  plus the display metadata the wire type doesn't always carry (a `token`
- *  entry gets its name from the `ApprovedAttachment` it was minted with). */
-interface AttachmentChip {
-  entry: DraftAttachment;
-  filename: string;
-  /** Source path for tooltip + dedupe on token/staged entries; null for
-   *  forwarded attachments, which are identified by row id. */
-  path: string | null;
-  size: number | null;
-}
-
-/** Stable identity for dedupe/removal: token by token, forward by row id,
- *  staged by staged path. */
-function attKey(entry: DraftAttachment): string {
-  switch (entry.kind) {
-    case "token":
-      return `tok:${entry.token}`;
-    case "forward":
-      return `fwd:${entry.attachmentId}`;
-    case "staged":
-      return `staged:${entry.filePath}`;
-  }
-}
-
-/** Wrap a wire `DraftAttachment` for display. Staged entries carry their own
- *  filename; anything else shows the fallback. */
-function chipFromEntry(entry: DraftAttachment): AttachmentChip {
-  return {
-    entry,
-    filename: entry.kind === "staged" ? entry.filename : "attachment",
-    path: entry.kind === "staged" ? entry.filePath : null,
-    size: null,
-  };
-}
-
-/** Wrap an approval result (dialog pick or drop claim) for display. */
-function chipFromApproved(a: ApprovedAttachment): AttachmentChip {
-  return {
-    entry: { kind: "token", token: a.token },
-    filename: a.filename,
-    path: a.path,
-    size: a.size,
-  };
 }
 
 /** The quoted/forwarded original, kept out of the editable body and shown
@@ -273,12 +242,15 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   const [sendLaterOpen, setSendLaterOpen] = useState(false);
   const [snippetOpen, setSnippetOpen] = useState(false);
   const [sending, setSending] = useState(false);
-  const [attachments, setAttachments] = useState<AttachmentChip[]>(
-    (state.initial?.attachments ?? []).map(chipFromEntry),
+  const [attachments, setAttachments] = useState<ComposerAttachment[]>(
+    (state.initial?.attachments ?? []).map(restoredChip),
   );
+  /** Composer session nonce attachment tokens are bound to. Carried through
+   *  an undo-send reopen via `state.composerNonce`; minted fresh otherwise. */
+  const [composerNonce] = useState(() => state.composerNonce ?? crypto.randomUUID());
   const [dragOver, setDragOver] = useState(false);
   /** the original's attachments, kept so the toggle can re-add them */
-  const forwardFilesRef = useRef<AttachmentChip[]>([]);
+  const forwardFilesRef = useRef<ComposerAttachment[]>([]);
   const [includeForwardFiles, setIncludeForwardFiles] = useState(true);
   const includeForwardFilesRef = useRef(true);
   const forwardFileCount = (state.replyTo?.attachments ?? []).filter((a) => !a.isInline).length;
@@ -356,6 +328,20 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
     quote: init.quote, quoteRemoved,
   };
 
+  // THE attachment writer: every chip mutation computes the next list from
+  // fieldsRef (the synchronous source of truth - never a stale render
+  // snapshot or a React updater's `cur`), writes it back synchronously, and
+  // mirrors it into state. Saves and sends therefore always see the latest
+  // list, including refs swapped in by a just-committed save.
+  const setChips = useCallback(
+    (fn: (cur: ComposerAttachment[]) => ComposerAttachment[]) => {
+      const next = fn(fieldsRef.current.attachments);
+      fieldsRef.current.attachments = next;
+      setAttachments(next);
+    },
+    [],
+  );
+
   // One serialized saver per composer instance: autosave, Send,
   // save-and-close and Discard all funnel through it so at most one
   // save_draft call is ever in flight. onSaved only fires while the composer
@@ -373,10 +359,10 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
               f.quote,
               f.quoteRemoved,
             );
-            // Snapshot the chips this save consumes: on success the backend
-            // hands back the same attachments as `staged` entries (in order),
-            // which replace one-shot token/forward entries so a later save
-            // can echo them.
+            // Snapshot the chips this request is built from: the result's
+            // attachments come back in request order and are zipped back
+            // onto those chips by stable id - chips that appeared or
+            // vanished while the save was in flight are untouched.
             const snapshot = f.attachments;
             const result = await call("save_draft", {
               args: {
@@ -390,19 +376,16 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
                 bodyHtml,
                 mode: state.mode,
                 inReplyToMessageId: state.replyTo?.id ?? null,
-                attachments: snapshot.map((a) => a.entry),
+                attachments: wireEntries(snapshot),
+                composerNonce,
               },
             });
-            const resolved = result.attachments.map(chipFromEntry);
-            const at = new Map(snapshot.map((a, i) => [a, i]));
-            setAttachments((cur) => {
-              const next = cur.map((a) => {
-                const i = at.get(a);
-                return i == null ? a : resolved[i];
-              });
-              fieldsRef.current.attachments = next;
-              return next;
-            });
+            const next = applySavedRefs(
+              fieldsRef.current.attachments,
+              mapSavedRefs(snapshot, result.attachments),
+            );
+            fieldsRef.current.attachments = next;
+            setAttachments(next);
             return result.draftId;
           },
           onSaved: (id, clean) => {
@@ -483,26 +466,53 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSig]);
 
+  // Resolve one forward chip to an approval token OUTSIDE save_draft
+  // (`prepare_forward_attachment` downloads/copies the bytes itself), so a
+  // failing download marks just that chip and never blocks saving the
+  // draft's text. Updates the live list and the toggle's stash by stable id.
+  const prepareForwardChip = useCallback(
+    (chip: ComposerAttachment) => {
+      if (chip.origin.kind !== "forward") return;
+      const attachmentId = chip.origin.attachmentId;
+      const apply = (fn: (c: ComposerAttachment) => ComposerAttachment) => {
+        forwardFilesRef.current = forwardFilesRef.current.map((c) =>
+          c.id === chip.id ? fn(c) : c,
+        );
+        setChips((cur) => cur.map((c) => (c.id === chip.id ? fn(c) : c)));
+      };
+      void call("prepare_forward_attachment", { attachmentId, composerNonce })
+        .then((a) => apply((c) => chipResolved(c, a)))
+        .catch((err: unknown) => {
+          const detail = errorMessage(err);
+          apply((c) => chipFailed(c, detail));
+          pushToast({
+            kind: "error",
+            message: t("compose:forwardAttachFailed", {
+              name: chip.displayName,
+              detail,
+            }),
+          });
+        });
+    },
+    [composerNonce, pushToast, setChips, t],
+  );
+
   // A fresh forward carries the original's files (not inline images, which
-  // belong to the quoted body) by attachments-row id; Rust resolves the ids
-  // to cached bytes when the draft saves - no path ever crosses the IPC.
+  // belong to the quoted body) as forward chips - each starts "attaching"
+  // and resolves to a token when its bytes are ready.
   useEffect(() => {
     if (state.mode !== "forward" || state.initial || state.draftId) return;
     const files = (state.replyTo?.attachments ?? []).filter((a) => !a.isInline);
     if (files.length === 0) return;
-    const chips: AttachmentChip[] = files.map((a) => ({
-      entry: { kind: "forward", attachmentId: a.id },
-      filename: a.filename ?? t("thread:attachment.fallbackName"),
-      path: null,
-      size: a.size ?? null,
-    }));
+    const chips = files.map((a) =>
+      forwardChip(a.id, a.filename ?? t("thread:attachment.fallbackName")),
+    );
     forwardFilesRef.current = chips;
     if (includeForwardFilesRef.current) {
-      setAttachments((cur) => {
-        const have = new Set(cur.map((x) => attKey(x.entry)));
-        return [...cur, ...chips.filter((c) => !have.has(attKey(c.entry)))];
-      });
+      setChips((cur) => addChips(cur, chips).chips);
+      markDirty();
     }
+    chips.forEach(prepareForwardChip);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -551,9 +561,15 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
       // A discard in flight owns the draft id; sending now would race the
       // delete. No state change - the composer is closing anyway.
       if (saver.isDiscarding) return;
-      const f = fieldsRef.current;
-      if (f.to.length === 0) {
+      if (fieldsRef.current.to.length === 0) {
         pushToast({ kind: "error", message: t("compose:addRecipient"), durationMs: 3000 });
+        return;
+      }
+      // A forward attachment still downloading must resolve (or be removed)
+      // first - its chip has no wire ref yet, so sending now would silently
+      // mail the draft without it.
+      if (!allReady(fieldsRef.current.attachments)) {
+        pushToast({ kind: "info", message: t("compose:forwardAttaching"), durationMs: 3000 });
         return;
       }
       if (sending) return;
@@ -571,6 +587,10 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
           });
           return;
         }
+        // Re-read AFTER the flush: the save that just committed swapped
+        // token refs for staged ones, and a snapshot taken before the await
+        // would carry stale one-shot entries into the undo reopen.
+        const f = fieldsRef.current;
         const sendAt = opts.instant ? Date.now() : opts.sendAt;
         const res = await call("queue_send", { args: { draftId: id, sendAt } });
         // The draft is now the send queue's: stop autosaving against it so a
@@ -584,6 +604,7 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
           draftId: id,
           accountId: f.accountId,
           replyTo: state.replyTo,
+          composerNonce,
           initial: {
             to: f.to,
             cc: f.cc,
@@ -591,7 +612,7 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
             subject: f.subject,
             body: htmlToText(f.body),
             bodyHtml: f.body,
-            attachments: f.attachments.map((a) => a.entry),
+            attachments: wireEntries(f.attachments),
           },
         };
         closeComposer();
@@ -659,19 +680,14 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         setSending(false);
       }
     },
-    [saver, sending, state.mode, state.replyTo, closeComposer, pushToast, t],
+    [saver, sending, state.mode, state.replyTo, closeComposer, pushToast, t, composerNonce],
   );
 
   // Merge approved picks/drops into the attachment list, skipping dupes by
-  // their canonical source path.
-  const addApproved = (approved: ApprovedAttachment[]) => {
+  // their source identity (origin), never the mutable ref.
+  const addApproved = (approved: ApprovedAttachment[], kind: "picked" | "dropped") => {
     if (approved.length === 0) return;
-    setAttachments((cur) => [
-      ...cur,
-      ...approved
-        .filter((p) => !cur.some((a) => a.path === p.path))
-        .map(chipFromApproved),
-    ]);
+    setChips((cur) => addChips(cur, approvedChips(approved, kind)).chips);
     markDirty();
   };
 
@@ -679,7 +695,10 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   // the webview never sees a usable source path.
   const attachFiles = useCallback(async () => {
     try {
-      addApproved(await call("pick_draft_attachments", {}));
+      addApproved(
+        await call("pick_draft_attachments", { composerNonce }),
+        "picked",
+      );
     } catch (err) {
       pushToast({
         kind: "error",
@@ -692,20 +711,38 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   // The webview intercepts native OS file drops at the window level (no
   // "over any composer" scoping needed - App.tsx only ever mounts one
   // Composer at a time, full-screen or inline). Skipped in mock/browser dev
-  // since there's no real Tauri webview to subscribe to.
+  // since there's no real Tauri webview to subscribe to. The `disposed`
+  // flag makes registration cleanup-safe under StrictMode's double
+  // mount/unmount and fast remounts: a listener whose registration promise
+  // resolves after cleanup unregisters itself instead of leaking.
   useEffect(() => {
     if (MOCK_MODE) return;
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     void getCurrentWebview()
       .onDragDropEvent((event) => {
         if (event.payload.type === "drop") {
           setDragOver(false);
           // The Rust window-event handler already registered these paths as
-          // a real OS drop; the claim only exchanges paths Rust saw.
+          // a real OS drop; the claim only exchanges paths Rust saw. A
+          // duplicate claim for an already-claimed drop comes back empty -
+          // a silent no-op, not an error.
           void call("claim_dropped_attachments", {
             paths: event.payload.paths,
+            composerNonce,
           })
-            .then(addApproved)
+            .then((claim) => {
+              for (const s of claim.skipped) {
+                pushToast({
+                  kind: "error",
+                  message: t("compose:attachmentSkipped", {
+                    name: s.path.split(/[\\/]/).pop() ?? s.path,
+                    reason: s.reason,
+                  }),
+                });
+              }
+              addApproved(claim.approved, "dropped");
+            })
             .catch((err) =>
               pushToast({
                 kind: "error",
@@ -721,28 +758,41 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         }
       })
       .then((fn) => {
-        unlisten = fn;
+        if (disposed) fn();
+        else unlisten = fn;
       });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** Forward with or without the original's files. */
+  /** Forward with or without the original's files - keyed on the chips'
+   *  forward ORIGIN, which survives the token → staged ref swap, so the
+   *  toggle works the same before and after the first autosave. */
   const toggleForwardFiles = () => {
     const next = !includeForwardFilesRef.current;
     includeForwardFilesRef.current = next;
     setIncludeForwardFiles(next);
-    const files = forwardFilesRef.current;
-    const keys = new Set(files.map((f) => attKey(f.entry)));
-    setAttachments((cur) => {
-      const rest = cur.filter((a) => !keys.has(attKey(a.entry)));
-      return next ? [...rest, ...files] : rest;
-    });
+    if (next) {
+      // Chips that failed to download retry on re-enable.
+      const retry = forwardFilesRef.current.filter((c) => c.status === "error");
+      if (retry.length) {
+        forwardFilesRef.current = forwardFilesRef.current.map((c) =>
+          c.status === "error" ? { ...c, status: "attaching" as const, error: undefined } : c,
+        );
+      }
+      setChips((cur) => addChips(cur, forwardFilesRef.current).chips);
+      retry.forEach(prepareForwardChip);
+    } else {
+      setChips((cur) => withoutForwardChips(cur));
+    }
     markDirty();
   };
 
-  const removeAttachment = (key: string) => {
-    setAttachments((cur) => cur.filter((a) => attKey(a.entry) !== key));
+  const removeAttachment = (id: string) => {
+    setChips((cur) => removeChip(cur, id));
     markDirty();
   };
 
@@ -1299,16 +1349,24 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
               )}
               {attachments.map((a) => (
                 <span
-                  key={attKey(a.entry)}
-                  className="co-chip"
-                  title={a.path ?? a.filename}
+                  key={a.id}
+                  className={`co-chip${a.status === "error" ? " border-danger/60 text-danger" : ""}`}
+                  title={a.error ?? a.displayName}
                 >
                   <Icon name="paperclip" size={11} />
-                  {a.filename}
+                  {a.displayName}
+                  {a.status === "attaching" && (
+                    <span
+                      className="ml-1 text-ink-faint"
+                      aria-label={t("compose:forwardAttaching")}
+                    >
+                      …
+                    </span>
+                  )}
                   <button
                     className="ml-0.5 rounded px-0.5 text-ink-faint hover:text-danger"
-                    onClick={() => removeAttachment(attKey(a.entry))}
-                    aria-label={t("compose:removeNamed", { name: a.filename })}
+                    onClick={() => removeAttachment(a.id)}
+                    aria-label={t("compose:removeNamed", { name: a.displayName })}
                   >
                     ×
                   </button>
