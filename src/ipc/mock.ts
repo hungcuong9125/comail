@@ -62,9 +62,7 @@ import {
   queryToCondition,
 } from "../lib/ruleCondition";
 
-export const MOCK_MODE =
-  typeof window !== "undefined" &&
-  (!("__TAURI_INTERNALS__" in window) || import.meta.env.VITE_MOCK === "1");
+export { MOCK_MODE } from "./mockMode";
 
 // ---------------------------------------------------------------------------
 // Fixture state

@@ -4,7 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import i18n from "../../i18n";
 import { errorMessage, parseError } from "../../ipc/errors";
 import { call } from "../../ipc/commands";
-import { MOCK_MODE } from "../../ipc/mock";
+import { MOCK_MODE } from "../../ipc/mockMode";
 import { subscribeEvent } from "../../ipc/events";
 import type { Address, AiDraftAction, MessageDetail, Snippet } from "../../ipc/types";
 import type {

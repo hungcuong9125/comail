@@ -7,7 +7,7 @@ import { toggleSidebar } from "../lib/sidebar";
 import { call } from "../ipc/commands";
 import { errorMessage } from "../ipc/errors";
 import { subscribeEvent } from "../ipc/events";
-import { MOCK_MODE } from "../ipc/mock";
+import { MOCK_MODE } from "../ipc/mockMode";
 import type { Account, Address, Settings, ThreadDetail } from "../ipc/types";
 import { addDays, addMonths, startOfMonth } from "../lib/calendarGrid";
 import { addressName, IS_MAC, primaryCorrespondent } from "../lib/format";
