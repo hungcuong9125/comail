@@ -862,8 +862,14 @@ impl Core {
         }
         self.cal_handles.write().await.remove(&account_id);
         self.contacts_handles.write().await.remove(&account_id);
-        self.tokens.forget(account_id).await;
+        // Delete the stored credentials BEFORE clearing the token caches: a
+        // grant queued on the account's refresh lock must find the refresh
+        // token already gone, and `forget` bumps the account's generation so
+        // a grant still in flight discards its result instead of writing a
+        // rotated refresh token back into the keyring or resurrecting the
+        // account's cache entry (account ids are recycled).
         credentials::delete_all(account_id);
+        self.tokens.forget(account_id).await;
         self.db
             .write(move |conn| {
                 // Unwind address-book names before the cascade drops the cards.
@@ -3874,32 +3880,42 @@ impl Core {
                 v
             }
         };
-        // The index is global (no per-account partition): when scoped, fetch a
-        // deeper candidate pool so post-filtering still leaves ~k hits from
-        // the right account.
-        let pool = if account_id.is_some() {
-            k.saturating_mul(8).clamp(k, 2_000)
-        } else {
-            k
+        let Some(account) = account_id else {
+            let idx = self.embed.index.read().await;
+            return Ok(idx.search(&qv, k));
         };
-        let idx = self.embed.index.read().await;
-        let hits = idx.search(&qv, pool);
-        drop(idx);
-        match account_id {
-            None => Ok(hits),
-            Some(account) => self.scope_hits_to_account(hits, account, k).await,
+        // The index is global (no per-account partition): when scoped, widen
+        // the candidate pool adaptively — an account holding only a small
+        // share of the index may need many more candidates before k of its
+        // own hits surface. The pool grows up to SCOPE_WIDEN_ROUNDS times
+        // until k in-account hits are found or the index is exhausted. If the
+        // index is extremely skewed this can still return fewer than k hits;
+        // keyword retrieval then remains the account's coverage.
+        const SCOPE_WIDEN_ROUNDS: usize = 3;
+        let mut pool = k.saturating_mul(8).clamp(k, 2_000);
+        let mut scoped = Vec::new();
+        for _ in 0..=SCOPE_WIDEN_ROUNDS {
+            let (hits, idx_len) = {
+                let idx = self.embed.index.read().await;
+                (idx.search(&qv, pool.min(idx.len())), idx.len())
+            };
+            scoped = self.scope_hits_to_account(hits, account).await?;
+            if scoped.len() >= k || pool >= idx_len {
+                break;
+            }
+            pool = pool.saturating_mul(4).min(idx_len);
         }
+        Ok(scoped.into_iter().take(k).collect())
     }
 
-    /// Keep only vector hits whose message lives in `account` (score order and
-    /// count `k` preserved). The in-memory index stores message ids only, so
-    /// account scoping is a DB lookup; the ids are from our own index and safe
-    /// to inline like `repo::search`'s candidate queries do.
+    /// Keep only vector hits whose message lives in `account` (score order
+    /// preserved). The in-memory index stores message ids only, so account
+    /// scoping is a DB lookup; the ids are from our own index and safe to
+    /// inline like `repo::search`'s candidate queries do.
     async fn scope_hits_to_account(
         &self,
         hits: Vec<(i64, f32)>,
         account_id: i64,
-        k: usize,
     ) -> Result<Vec<(i64, f32)>> {
         if hits.is_empty() {
             return Ok(hits);
@@ -3925,7 +3941,6 @@ impl Core {
         Ok(hits
             .into_iter()
             .filter(|(id, _)| keep.contains(id))
-            .take(k)
             .collect())
     }
 
@@ -6274,16 +6289,13 @@ mod ask_scope_tests {
         let (m1, m2) = seed_two_accounts(&core.db).await;
 
         let hits = vec![(m2, 0.9f32), (m1, 0.8)];
-        let one = core
-            .scope_hits_to_account(hits.clone(), 1, 10)
-            .await
-            .unwrap();
+        let one = core.scope_hits_to_account(hits.clone(), 1).await.unwrap();
         assert_eq!(one, vec![(m1, 0.8)]);
-        let two = core.scope_hits_to_account(hits, 2, 10).await.unwrap();
+        let two = core.scope_hits_to_account(hits, 2).await.unwrap();
         assert_eq!(two, vec![(m2, 0.9)]);
         // Ids not in the DB at all are dropped too.
         let gone = core
-            .scope_hits_to_account(vec![(999_999, 0.7), (m1, 0.6)], 1, 10)
+            .scope_hits_to_account(vec![(999_999, 0.7), (m1, 0.6)], 1)
             .await
             .unwrap();
         assert_eq!(gone, vec![(m1, 0.6)]);
