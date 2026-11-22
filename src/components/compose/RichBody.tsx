@@ -9,10 +9,11 @@ import {
 import { useTranslation } from "react-i18next";
 import { captureOutsideSelection } from "../../lib/selection";
 import { stripFormatting, textToHtml } from "../../lib/richtext";
-import { sanitizeEditorHtml } from "../../lib/signatures";
+import { EDITOR_IMAGE_TYPES, sanitizeEditorHtml } from "../../lib/signatures";
 import { activeMention } from "../../lib/mentions";
 import { addressName, IS_MAC } from "../../lib/format";
 import { call } from "../../ipc/commands";
+import { useUi } from "../../stores/ui";
 import type { Address } from "../../ipc/types";
 import { Button } from "../ui/Button";
 
@@ -24,6 +25,27 @@ export interface RichBodyHandle {
   insertText(text: string): void;
   /** Insert an HTML fragment at the caret (availability slots). */
   insertHtml(html: string): void;
+}
+
+/** Insert `html` at the current selection: execCommand where the engine
+ *  allows it (keeps ⌘Z), a manual Range insert otherwise. The fragment must
+ *  already be sanitized. */
+function insertFragmentAtSelection(sel: Selection, html: string) {
+  if (sel.rangeCount === 0) return;
+  if (!document.execCommand("insertHTML", false, html)) {
+    const range = sel.getRangeAt(0);
+    range.deleteContents();
+    const tpl = document.createElement("template");
+    tpl.innerHTML = html;
+    const last = tpl.content.lastChild;
+    range.insertNode(tpl.content);
+    const after = document.createRange();
+    if (last) after.setStartAfter(last);
+    else after.setStart(range.startContainer, range.startOffset);
+    after.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(after);
+  }
 }
 
 /** Replace `range` with `text` (newlines become <br>) and collapse the selection
@@ -86,7 +108,19 @@ export const RichBody = forwardRef<
   const { t } = useTranslation();
   const elRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const lastEmittedRef = useRef(value);
+  // The HTML the parent last heard from us (or what the DOM last synced to) -
+  // doubles as emit() dedup and the "this value is our own emission" check.
+  const lastEmittedRef = useRef("");
+  // The last external `value` prop the DOM was synced from. Sanitizing applies
+  // only to those external values; our own emissions are already clean and
+  // echoed back through `value`, which must not trigger another pass.
+  const consumedValueRef = useRef<string | null>(null);
+  // Composer hands down a fresh inline callback each render; a ref keeps the
+  // sync effect's deps stable without going stale.
+  const onChangeRef = useRef(onChange);
+  useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
   // Selection captured when a popover opens (inputs steal focus, so we restore
   // the editor's range before applying the command).
   const savedRangeRef = useRef<Range | null>(null);
@@ -114,32 +148,34 @@ export const RichBody = forwardRef<
     setEmpty(el.textContent?.trim() === "" && !el.querySelector("img"));
   }, []);
 
-  // Sync external value -> DOM (only when it actually differs, so typing
-  // never fights the caret). The value goes through the editor allowlist
-  // first: drafts and AI output are raw HTML, and whatever lands in the DOM is
-  // what send/draft-save serializes back out.
+  // Sync EXTERNAL value -> DOM: drafts, AI output, quick-reply inserts. A
+  // `value` that is our own last emission (echoed back through the parent) or
+  // the external value already synced in needs no pass at all - the DOM is
+  // the source for it, and every insertion path sanitizes on the way in, so
+  // the allowlist never sees self-produced content.
   useEffect(() => {
     const el = elRef.current;
     if (!el) return;
+    if (value === lastEmittedRef.current || value === consumedValueRef.current) return;
+    consumedValueRef.current = value;
     const clean = sanitizeEditorHtml(value);
     if (el.innerHTML === clean) return;
     el.innerHTML = clean;
     refreshEmpty(el);
+    // The sanitized DOM is the new baseline: emit() compares against it, and
+    // no onChange fires for the load-time normalization - the parent marking
+    // the composer dirty on a draft open must only come from a real edit.
     lastEmittedRef.current = el.innerHTML;
-    // When the allowlist changed the input, hand the safe version back so the
-    // parent's body state (and any draft/send built from it) carries it too.
-    // Idempotent - editor-produced HTML is a fixed point, so this settles in
-    // one pass and never fires for ordinary typing.
-    if (clean !== value) onChange(el.innerHTML);
-  }, [value, onChange, refreshEmpty]);
+  }, [value, refreshEmpty]);
 
   const emit = useCallback(() => {
     const el = elRef.current;
     if (!el || el.innerHTML === lastEmittedRef.current) return;
     lastEmittedRef.current = el.innerHTML;
+    consumedValueRef.current = el.innerHTML;
     refreshEmpty(el);
-    onChange(el.innerHTML);
-  }, [onChange, refreshEmpty]);
+    onChangeRef.current(el.innerHTML);
+  }, [refreshEmpty]);
 
   /**
    * "Convert to plain text": drop the formatting of the selection, or of the
@@ -593,6 +629,16 @@ export const RichBody = forwardRef<
   };
 
   const insertImageFile = (file: File) => {
+    // Only the raster types the editor allowlist accepts as data: sources.
+    // An SVG/TIFF/HEIC insert would be stripped by the next sanitizing pass
+    // (reopened draft), so refuse it here instead of losing it silently.
+    if (!EDITOR_IMAGE_TYPES.has(file.type)) {
+      useUi.getState().pushToast({
+        kind: "error",
+        message: t("compose:couldntPickFiles", { error: file.type || file.name }),
+      });
+      return;
+    }
     const reader = new FileReader();
     reader.onload = () => {
       const el = elRef.current;
@@ -646,8 +692,10 @@ export const RichBody = forwardRef<
     const raw = linkUrl.trim();
     restoreSelection();
     if (raw) {
-      // Bare hostnames get https:// so they aren't treated as relative paths.
-      const href = /^(https?:|mailto:|tel:|#|\/)/i.test(raw) ? raw : `https://${raw}`;
+      // Only the schemes the link allowlist keeps: a relative "/path" or
+      // bare "#anchor" href is meaningless to a mail recipient (and would be
+      // stripped anyway), so anything else gets the https:// prefix as before.
+      const href = /^(https?:|mailto:|tel:)/i.test(raw) ? raw : `https://${raw}`;
       const sel = document.getSelection();
       if (sel && sel.isCollapsed && sel.rangeCount) {
         // Build the anchor as a node: outerHTML serializes both the attribute
@@ -929,26 +977,57 @@ export const RichBody = forwardRef<
             const sel = document.getSelection();
             if (!sel || sel.rangeCount === 0) return;
             if (clean) {
-              if (!document.execCommand("insertHTML", false, clean)) {
-                const range = sel.getRangeAt(0);
-                range.deleteContents();
-                const tpl = document.createElement("template");
-                tpl.innerHTML = clean;
-                const last = tpl.content.lastChild;
-                range.insertNode(tpl.content);
-                const after = document.createRange();
-                if (last) after.setStartAfter(last);
-                else after.setStart(range.startContainer, range.startOffset);
-                after.collapse(true);
-                sel.removeAllRanges();
-                sel.addRange(after);
-              }
+              insertFragmentAtSelection(sel, clean);
             } else if (plain) {
               // Nothing survived the allowlist; keep the plain text at least.
               replaceRangeWithText(sel.getRangeAt(0), sel, plain);
             }
             emit();
           }
+        }}
+        onDrop={(e) => {
+          // Dragged-in HTML enters the DOM raw unless the drop is intercepted
+          // just like paste is. File drops carry no text data and are left to
+          // the composer's attachment handling.
+          const dt = e.dataTransfer;
+          if (!dt) return;
+          const html = dt.getData("text/html");
+          const text = dt.getData("text/plain");
+          if (!html && !text) return;
+          e.preventDefault();
+          const el = elRef.current;
+          if (!el) return;
+          el.focus();
+          // Put the caret where the drop landed; fall back to the end when
+          // the point can't be resolved or lies outside the editor.
+          let range: Range | null = null;
+          if (document.caretRangeFromPoint) {
+            range = document.caretRangeFromPoint(e.clientX, e.clientY);
+          } else {
+            const pos = document.caretPositionFromPoint?.(e.clientX, e.clientY);
+            if (pos) {
+              range = document.createRange();
+              range.setStart(pos.offsetNode, pos.offset);
+              range.collapse(true);
+            }
+          }
+          if (!range || !el.contains(range.startContainer)) {
+            range = document.createRange();
+            range.selectNodeContents(el);
+            range.collapse(false);
+          }
+          const sel = document.getSelection();
+          if (!sel) return;
+          sel.removeAllRanges();
+          sel.addRange(range);
+          if (html) {
+            const clean = sanitizeEditorHtml(html);
+            if (clean) insertFragmentAtSelection(sel, clean);
+            else if (text) replaceRangeWithText(sel.getRangeAt(0), sel, text);
+          } else {
+            replaceRangeWithText(sel.getRangeAt(0), sel, text);
+          }
+          emit();
         }}
       />
 
