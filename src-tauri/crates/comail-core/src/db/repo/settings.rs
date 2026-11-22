@@ -2,6 +2,25 @@ use crate::error::Result;
 use crate::models::Settings;
 use rusqlite::{Connection, OptionalExtension, params};
 
+/// JSON keys of the retired inline client-secret fields. Rows written before
+/// the secrets moved to the OS keyring still carry them; `set` keeps them
+/// alive (see below) until the startup migration has moved them across.
+pub const GOOGLE_CLIENT_SECRET_KEY: &str = "googleClientSecret";
+pub const MS_CLIENT_SECRET_KEY: &str = "msClientSecret";
+
+const LEGACY_SECRET_KEYS: [&str; 2] = [GOOGLE_CLIENT_SECRET_KEY, MS_CLIENT_SECRET_KEY];
+
+fn row_json(conn: &Connection) -> Result<Option<serde_json::Value>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'settings'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
+}
+
 pub fn get(conn: &Connection) -> Result<Settings> {
     let json: Option<String> = conn
         .query_row(
@@ -20,13 +39,77 @@ pub fn get(conn: &Connection) -> Result<Settings> {
     Ok(settings)
 }
 
+/// Legacy inline client secrets are the last copy standing when the keyring
+/// migration has not run or keeps failing (locked keychain, headless box):
+/// `set` must keep them in the row. `skip_serializing` drops them from the
+/// outgoing JSON, so they are re-added here — the incoming value wins, else
+/// the previously stored one survives.
+fn keep_legacy_secret_keys(
+    conn: &Connection,
+    settings: &Settings,
+    json: &mut serde_json::Value,
+) -> Result<()> {
+    let Some(obj) = json.as_object_mut() else {
+        return Ok(());
+    };
+    let stored = row_json(conn)?;
+    for (key, incoming) in [
+        (
+            GOOGLE_CLIENT_SECRET_KEY,
+            settings.google_client_secret.trim(),
+        ),
+        (MS_CLIENT_SECRET_KEY, settings.ms_client_secret.trim()),
+    ] {
+        let keep = if !incoming.is_empty() {
+            Some(incoming.to_string())
+        } else {
+            stored
+                .as_ref()
+                .and_then(|v| v.get(key))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        if let Some(secret) = keep {
+            obj.insert(key.to_string(), serde_json::Value::String(secret));
+        }
+    }
+    Ok(())
+}
+
 pub fn set(conn: &Connection, settings: &Settings) -> Result<()> {
+    let mut json = serde_json::to_value(settings)?;
+    keep_legacy_secret_keys(conn, settings, &mut json)?;
     conn.execute(
         "INSERT INTO app_settings (key, value) VALUES ('settings', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![serde_json::to_string(settings)?],
+        params![serde_json::to_string(&json)?],
     )?;
     Ok(())
+}
+
+/// Drop one retired inline-secret key from the stored row, keeping every
+/// other key verbatim (including ones a newer schema might add). Only called
+/// once the value is verified in the OS keyring — or when the user clears it.
+/// Returns whether the key was present.
+pub fn strip_legacy_secret_key(conn: &Connection, key: &str) -> Result<bool> {
+    if !LEGACY_SECRET_KEYS.contains(&key) {
+        return Ok(false);
+    }
+    let Some(mut json) = row_json(conn)? else {
+        return Ok(false);
+    };
+    let removed = json
+        .as_object_mut()
+        .map(|obj| obj.remove(key).is_some())
+        .unwrap_or(false);
+    if removed {
+        conn.execute(
+            "UPDATE app_settings SET value = ?1 WHERE key = 'settings'",
+            params![serde_json::to_string(&json)?],
+        )?;
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -165,5 +248,112 @@ mod tests {
         assert!(s.signatures.is_empty());
         assert!(s.ai_zero_retention);
         assert!(s.ai_quick_replies);
+    }
+
+    /// Rows written before secrets moved to the keyring still deserialize:
+    /// the inline values land in the retired fields for the migration.
+    #[test]
+    fn legacy_client_secrets_deserialize_but_never_serialize() {
+        let c = testutil::conn();
+        c.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('settings',
+             '{\"theme\":\"snow\",\"undoSendSeconds\":10,\"loadRemoteImages\":true,
+               \"googleClientSecret\":\"g-secret\",\"msClientSecret\":\"ms-secret\"}')",
+            [],
+        )
+        .unwrap();
+        let s = get(&c).unwrap();
+        assert_eq!(s.google_client_secret, "g-secret");
+        assert_eq!(s.ms_client_secret, "ms-secret");
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(!out.contains("g-secret"));
+        assert!(!out.contains("ms-secret"));
+        assert!(!out.contains("googleClientSecret"));
+        assert!(!out.contains("msClientSecret"));
+    }
+
+    /// Any settings write (not just the migration) must keep an unmigrated
+    /// inline secret in the row: while the keyring is unavailable it is the
+    /// only copy sign-in can still use.
+    #[test]
+    fn set_preserves_unmigrated_legacy_secrets() {
+        let c = testutil::conn();
+        c.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('settings',
+             '{\"theme\":\"snow\",\"undoSendSeconds\":10,\"loadRemoteImages\":true,
+               \"googleClientSecret\":\"g-secret\",\"msClientSecret\":\"ms-secret\"}')",
+            [],
+        )
+        .unwrap();
+        // A whole-object write from a client that no longer knows the fields.
+        let mut s = get(&c).unwrap();
+        s.theme = "carbon".into();
+        s.google_client_secret.clear();
+        s.ms_client_secret.clear();
+        set(&c, &s).unwrap();
+        let raw: String = c
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = 'settings'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["googleClientSecret"], "g-secret");
+        assert_eq!(json["msClientSecret"], "ms-secret");
+        // And get() keeps exposing them to the migration.
+        assert_eq!(get(&c).unwrap().google_client_secret, "g-secret");
+    }
+
+    /// A write that still carries an inline value (pre-keyring client while
+    /// the keyring was unavailable) stores that newer value, not a stale one.
+    #[test]
+    fn set_keeps_incoming_inline_secret() {
+        let c = testutil::conn();
+        let s = Settings {
+            google_client_secret: "fresh-secret".into(),
+            ..Settings::default()
+        };
+        set(&c, &s).unwrap();
+        let raw: String = c
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = 'settings'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["googleClientSecret"], "fresh-secret");
+        assert!(json.get("msClientSecret").is_none());
+    }
+
+    /// Once the keyring holds the value, strip drops only the secret keys and
+    /// leaves the rest of the row byte-identical.
+    #[test]
+    fn strip_removes_secret_keys_and_keeps_the_rest() {
+        let c = testutil::conn();
+        c.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('settings',
+             '{\"theme\":\"snow\",\"googleClientSecret\":\"g-secret\",
+               \"msClientSecret\":\"ms-secret\",\"futureKey\":{\"x\":1}}')",
+            [],
+        )
+        .unwrap();
+        assert!(strip_legacy_secret_key(&c, GOOGLE_CLIENT_SECRET_KEY).unwrap());
+        let raw: String = c
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = 'settings'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(json.get("googleClientSecret").is_none());
+        assert_eq!(json["msClientSecret"], "ms-secret");
+        assert_eq!(json["theme"], "snow");
+        assert_eq!(json["futureKey"], serde_json::json!({"x": 1}));
+        // Second strip is a no-op; unrelated keys are refused.
+        assert!(!strip_legacy_secret_key(&c, GOOGLE_CLIENT_SECRET_KEY).unwrap());
+        assert!(!strip_legacy_secret_key(&c, "theme").unwrap());
     }
 }

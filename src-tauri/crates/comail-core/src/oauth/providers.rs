@@ -1,3 +1,4 @@
+use crate::accounts::credentials::{self, Slot};
 use crate::error::{CoreError, Result};
 use crate::models::Provider;
 
@@ -62,67 +63,95 @@ pub fn for_provider(p: Provider) -> Option<&'static OAuthProviderConfig> {
     }
 }
 
-/// Client credentials the user entered in Settings. Refreshed on startup and
-/// whenever settings change; env vars still take precedence at resolve time.
+/// The keyring slot holding `provider`'s user-supplied client secret — an
+/// app-level secret stored under account id 0, like the AI key.
+pub fn client_secret_slot(provider: Provider) -> Option<Slot> {
+    match provider {
+        Provider::Gmail => Some(Slot::GoogleClientSecret),
+        Provider::Microsoft => Some(Slot::MsClientSecret),
+        Provider::Imap => None,
+    }
+}
+
+/// Client credentials the user entered in Settings: the client id, plus a
+/// legacy inline secret kept only until the startup migration moves it into
+/// the OS keyring (and only while the keyring stays unavailable). Refreshed
+/// on startup and whenever settings change; env vars still take precedence
+/// at resolve time.
 fn configured() -> &'static RwLock<HashMap<Provider, (String, Option<String>)>> {
     static MAP: OnceLock<RwLock<HashMap<Provider, (String, Option<String>)>>> = OnceLock::new();
     MAP.get_or_init(Default::default)
 }
 
-pub fn set_configured(provider: Provider, client_id: &str, client_secret: &str) {
+pub fn set_configured(provider: Provider, client_id: &str, legacy_secret: Option<&str>) {
     let mut map = configured().write().unwrap();
     let id = client_id.trim();
     if id.is_empty() {
         map.remove(&provider);
     } else {
-        let secret = Some(client_secret.trim())
+        let secret = legacy_secret
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         map.insert(provider, (id.to_string(), secret));
     }
 }
 
-/// (client_id, client_secret) for an OAuth provider: env vars first,
-/// then the values configured in Settings.
-pub fn resolve_credentials(provider: Provider) -> Result<(String, Option<String>)> {
+/// (client_id, client_secret) for an OAuth provider: env vars first, then
+/// the client id configured in Settings with the secret read from the OS
+/// keyring. A not-yet-migrated inline secret (keyring unavailable since the
+/// upgrade) remains usable as the fallback so sign-in is never broken.
+pub async fn resolve_credentials(provider: Provider) -> Result<(String, Option<String>)> {
     let cfg = for_provider(provider)
         .ok_or_else(|| CoreError::Auth("provider does not use oauth".into()))?;
     if let Ok(id) = std::env::var(cfg.client_id_env) {
         return Ok((id, std::env::var(cfg.client_secret_env).ok()));
     }
-    if let Some(entry) = configured().read().unwrap().get(&provider) {
-        return Ok(entry.clone());
-    }
-    Err(CoreError::Auth(format!(
-        "no OAuth app configured for {}: add a client ID in Settings → Accounts, or set {}",
-        provider.as_str(),
-        cfg.client_id_env
-    )))
+    let (id, legacy) = configured()
+        .read()
+        .unwrap()
+        .get(&provider)
+        .cloned()
+        .ok_or_else(|| {
+            CoreError::Auth(format!(
+                "no OAuth app configured for {}: add a client ID in Settings → Accounts, or set {}",
+                provider.as_str(),
+                cfg.client_id_env
+            ))
+        })?;
+    let secret = match client_secret_slot(provider) {
+        Some(slot) => credentials::load_async(0, slot).await.ok().or(legacy),
+        None => legacy,
+    };
+    Ok((id, secret))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn resolve_uses_configured_values_and_clears() {
-        // Microsoft: no env vars set in the test environment.
-        set_configured(Provider::Microsoft, "  ms-id  ", "");
-        let (id, secret) = resolve_credentials(Provider::Microsoft).unwrap();
+    #[tokio::test]
+    async fn resolve_uses_configured_values_and_clears() {
+        // Microsoft: no env vars set in the test environment. The keyring may
+        // or may not hold a real secret on a dev machine, so assertions only
+        // pin what must hold either way; the keyring path itself is covered
+        // by the oauth_secrets integration tests under the insecure file.
+        set_configured(Provider::Microsoft, "  ms-id  ", None);
+        let (id, _) = resolve_credentials(Provider::Microsoft).await.unwrap();
         assert_eq!(id, "ms-id");
-        assert_eq!(secret, None);
 
-        set_configured(Provider::Microsoft, "ms-id", "  s3cret ");
-        let (_, secret) = resolve_credentials(Provider::Microsoft).unwrap();
-        assert_eq!(secret.as_deref(), Some("s3cret"));
+        set_configured(Provider::Microsoft, "ms-id", Some("  s3cret "));
+        let (_, secret) = resolve_credentials(Provider::Microsoft).await.unwrap();
+        // Keyring value wins when present; otherwise the legacy copy serves.
+        assert!(secret.is_some());
 
         // Empty id clears the registration entirely.
-        set_configured(Provider::Microsoft, "", "whatever");
-        assert!(resolve_credentials(Provider::Microsoft).is_err());
+        set_configured(Provider::Microsoft, "", Some("whatever"));
+        assert!(resolve_credentials(Provider::Microsoft).await.is_err());
     }
 
-    #[test]
-    fn resolve_rejects_non_oauth_provider() {
-        assert!(resolve_credentials(Provider::Imap).is_err());
+    #[tokio::test]
+    async fn resolve_rejects_non_oauth_provider() {
+        assert!(resolve_credentials(Provider::Imap).await.is_err());
     }
 }

@@ -5,6 +5,7 @@ use crate::error::{CoreError, Result};
 
 const SERVICE: &str = "comail";
 
+#[derive(Clone, Copy)]
 pub enum Slot {
     Password,
     RefreshToken,
@@ -24,6 +25,10 @@ pub enum Slot {
     DecisionOpenAiKey,
     /// Key for a custom decision endpoint (account id 0).
     DecisionCustomKey,
+    /// User-supplied Google OAuth client secret (app-level, account id 0).
+    GoogleClientSecret,
+    /// User-supplied Microsoft/Entra OAuth client secret (account id 0).
+    MsClientSecret,
 }
 
 impl Slot {
@@ -39,6 +44,8 @@ impl Slot {
             Slot::DecisionApiKey => "decision_api_key",
             Slot::DecisionOpenAiKey => "decision_api_key_openai",
             Slot::DecisionCustomKey => "decision_api_key_custom",
+            Slot::GoogleClientSecret => "google_client_secret",
+            Slot::MsClientSecret => "ms_client_secret",
         }
     }
 }

@@ -521,6 +521,7 @@ pub fn run() {
             commands::email_stats,
             commands::ai_plan_automation,
             commands::set_ai_key,
+            commands::set_oauth_client_secret,
             commands::set_decision_key,
             commands::test_decision_provider,
             commands::create_category,

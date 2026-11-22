@@ -276,9 +276,9 @@ impl Core {
         };
 
         // Make saved OAuth app registrations available before any actor
-        // needs a token refresh.
-        let settings = core.db.read(|conn| repo::settings::get(conn)).await?;
-        apply_oauth_settings(&settings);
+        // needs a token refresh, moving pre-keyring inline client secrets
+        // into the OS keyring first (kept in the row while it is unavailable).
+        core.migrate_oauth_client_secrets().await;
 
         // Recover any actions orphaned mid-flight by a previous crash/kill, so a
         // send that was executing when the app died retries instead of sticking
@@ -5775,11 +5775,104 @@ impl Core {
         avatars::resolve(&self.paths.data_dir, email).await
     }
 
-    pub async fn get_settings(&self) -> Result<Settings> {
-        self.db.read(|conn| repo::settings::get(conn)).await
+    /// Move client secrets stored inline by pre-keyring builds into the OS
+    /// keyring, then push the OAuth app registrations into the resolver.
+    /// Best-effort and idempotent: a keyring failure leaves the row untouched
+    /// (the secret keeps working through the resolver's legacy fallback) and
+    /// the move retries on the next start or settings save.
+    pub async fn migrate_oauth_client_secrets(&self) {
+        let mut settings = match self.db.read(|conn| repo::settings::get(conn)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "oauth: cannot load settings for client-secret migration");
+                return;
+            }
+        };
+        migrate_oauth_secret(
+            &self.db,
+            Provider::Gmail,
+            &mut settings.google_client_secret,
+        )
+        .await;
+        migrate_oauth_secret(
+            &self.db,
+            Provider::Microsoft,
+            &mut settings.ms_client_secret,
+        )
+        .await;
+        apply_oauth_settings(&settings);
     }
 
-    pub async fn set_settings(&self, settings: Settings) -> Result<()> {
+    /// Store (or, when empty, forget) the OAuth client secret for "gmail" |
+    /// "google" | "microsoft". Like the AI key it lives in the OS keyring
+    /// under account id 0; the settings row only ever carries a presence flag.
+    pub async fn set_oauth_client_secret(&self, provider: String, secret: String) -> Result<()> {
+        let provider = match provider.as_str() {
+            "gmail" | "google" => Provider::Gmail,
+            "microsoft" => Provider::Microsoft,
+            other => {
+                return Err(CoreError::Other(format!("unknown oauth provider: {other}")));
+            }
+        };
+        let Some(slot) = oauth::providers::client_secret_slot(provider) else {
+            return Err(CoreError::Other("provider does not use oauth".into()));
+        };
+        let secret = secret.trim().to_string();
+        if secret.is_empty() {
+            tokio::task::spawn_blocking(move || credentials::delete(0, slot))
+                .await
+                .map_err(|e| CoreError::Other(e.to_string()))?;
+        } else {
+            credentials::store_async(0, slot, secret).await?;
+        }
+        // Any legacy row copy is now redundant: a clear must not leave it
+        // serving sign-ins, and a successful set means the keyring holds it.
+        let key = oauth_secret_json_key(provider);
+        self.db
+            .write(move |conn| repo::settings::strip_legacy_secret_key(conn, key))
+            .await?;
+        // Refresh the resolver's (id, legacy) map so a cleared secret stops
+        // being served and the fallback mirrors what the row still carries.
+        let settings = self.db.read(|conn| repo::settings::get(conn)).await?;
+        apply_oauth_settings(&settings);
+        Ok(())
+    }
+
+    pub async fn get_settings(&self) -> Result<Settings> {
+        let mut settings = self.db.read(|conn| repo::settings::get(conn)).await?;
+        // Presence only: secret values never leave the OS keyring. An
+        // unmigrated inline copy still counts as "set" - it can sign in.
+        settings.has_google_client_secret = !settings.google_client_secret.trim().is_empty()
+            || credentials::load_async(0, Slot::GoogleClientSecret)
+                .await
+                .is_ok();
+        settings.has_ms_client_secret = !settings.ms_client_secret.trim().is_empty()
+            || credentials::load_async(0, Slot::MsClientSecret)
+                .await
+                .is_ok();
+        // `skip_serializing` already keeps these out of the reply; clear them
+        // anyway so no in-memory copy travels with the returned struct.
+        settings.google_client_secret.clear();
+        settings.ms_client_secret.clear();
+        Ok(settings)
+    }
+
+    pub async fn set_settings(&self, mut settings: Settings) -> Result<()> {
+        // A pre-keyring client may still submit the secrets inline: run them
+        // through the same move as the startup migration first, so a
+        // whole-object write can neither store a secret nor erase one.
+        migrate_oauth_secret(
+            &self.db,
+            Provider::Gmail,
+            &mut settings.google_client_secret,
+        )
+        .await;
+        migrate_oauth_secret(
+            &self.db,
+            Provider::Microsoft,
+            &mut settings.ms_client_secret,
+        )
+        .await;
         apply_oauth_settings(&settings);
         self.db
             .write(move |conn| {
@@ -6225,18 +6318,95 @@ fn invite_body_text(args: &CreateEventArgs) -> String {
     out
 }
 
-/// Push user-entered OAuth app registrations into the resolver.
+/// Push user-entered OAuth app registrations into the resolver: client ids,
+/// plus a legacy inline secret kept only while a keyring migration is still
+/// pending — the live value is always read from the OS keyring.
 fn apply_oauth_settings(settings: &Settings) {
     oauth::providers::set_configured(
         Provider::Gmail,
         &settings.google_client_id,
-        &settings.google_client_secret,
+        legacy_inline(&settings.google_client_secret),
     );
     oauth::providers::set_configured(
         Provider::Microsoft,
         &settings.ms_client_id,
-        &settings.ms_client_secret,
+        legacy_inline(&settings.ms_client_secret),
     );
+}
+
+/// A still-unmigrated inline secret, trimmed; `None` when empty.
+fn legacy_inline(s: &str) -> Option<&str> {
+    let t = s.trim();
+    (!t.is_empty()).then_some(t)
+}
+
+/// The settings-row key one provider's retired inline secret sits under.
+fn oauth_secret_json_key(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Gmail => repo::settings::GOOGLE_CLIENT_SECRET_KEY,
+        Provider::Microsoft => repo::settings::MS_CLIENT_SECRET_KEY,
+        Provider::Imap => "",
+    }
+}
+
+/// Move one retired inline client secret into the OS keyring. Write, then
+/// prove the keyring returns the same value before the settings copy is
+/// dropped — a crash between the two leaves the secret in both places, so it
+/// is recoverable from at least one location at every point. On any keyring
+/// failure `field` is left alone (the row keeps it via `repo::settings::set`,
+/// and the resolver still serves it as the legacy fallback) and the move is
+/// retried on the next start or save.
+async fn migrate_oauth_secret(db: &Db, provider: Provider, field: &mut String) {
+    let Some(slot) = oauth::providers::client_secret_slot(provider) else {
+        return;
+    };
+    let value = field.trim().to_string();
+    if value.is_empty() {
+        return;
+    }
+    let verified = match credentials::store_async(0, slot, value.clone()).await {
+        Ok(()) => match credentials::load_async(0, slot).await {
+            Ok(back) if back == value => true,
+            Ok(_) => {
+                tracing::warn!(
+                    ?provider,
+                    "oauth: client secret keyring read-back mismatch; keeping settings copy"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?provider,
+                    error = %e,
+                    "oauth: client secret keyring read-back failed; keeping settings copy"
+                );
+                false
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                ?provider,
+                error = %e,
+                "oauth: OS keyring unavailable; client secret stays in settings until next start"
+            );
+            false
+        }
+    };
+    if !verified {
+        return;
+    }
+    field.clear();
+    let key = oauth_secret_json_key(provider);
+    if let Err(e) = db
+        .write(move |conn| repo::settings::strip_legacy_secret_key(conn, key))
+        .await
+    {
+        tracing::warn!(
+            ?provider,
+            error = %e,
+            "oauth: stripping migrated client secret from settings failed; retried next start"
+        );
+    }
 }
 
 /// Which mail an automation pass looks at.
