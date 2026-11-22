@@ -988,6 +988,8 @@ mod selective_section_tests {
     fn sanitize_keeps_safe_img_src_but_drops_active_data_uris() {
         let out = sanitize_html(concat!(
             r#"<img src="data:image/png;base64,AAAA">"#,
+            r#"<img src="data:image/jpg;base64,AAAA">"#,
+            r#"<img src="data:image/x-png;base64,AAAA">"#,
             r#"<img src="cid:logo@x">"#,
             r#"<img src="https://cdn.example.com/x.png">"#,
             r#"<img src="data:text/html;base64,PGI+">"#,
@@ -997,6 +999,8 @@ mod selective_section_tests {
         ));
         for kept in [
             r#"src="data:image/png;base64,AAAA""#,
+            r#"src="data:image/jpg;base64,AAAA""#,
+            r#"src="data:image/x-png;base64,AAAA""#,
             r#"src="cid:logo@x""#,
             r#"src="https://cdn.example.com/x.png""#,
         ] {
@@ -1278,8 +1282,9 @@ fn allowed_img_src(value: &str) -> bool {
 }
 
 /// True only for `data:` URIs whose media type is a raster image we render:
-/// png, jpeg, gif or webp. `data:text/html`, `data:image/svg+xml` and every
-/// non-image payload fail the check.
+/// png, jpeg, gif or webp (plus the `image/jpg`, `image/pjpeg` and
+/// `image/x-png` aliases real mail uses). `data:text/html`,
+/// `data:image/svg+xml` and every non-image payload fail the check.
 fn allowed_data_image_src(value: &str) -> bool {
     let value = value.trim_start();
     if value.len() < 5 || !value[..5].eq_ignore_ascii_case("data:") {
@@ -1289,7 +1294,13 @@ fn allowed_data_image_src(value: &str) -> bool {
     let mime = meta.split(';').next().unwrap_or_default().trim();
     matches!(
         mime.to_ascii_lowercase().as_str(),
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        "image/png"
+            | "image/x-png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/pjpeg"
+            | "image/gif"
+            | "image/webp"
     )
 }
 
@@ -1348,9 +1359,12 @@ pub fn rewrite_cid_src(html: &str, map: &std::collections::HashMap<String, Strin
 
 /// Raster image media types a `cid:` attachment may be inlined under as a
 /// `data:` URI - the same set [`allowed_data_image_src`] lets survive on
-/// `img[src]`. Returns the canonical type to embed, or None when the part is
-/// anything else (SVG, HTML, arbitrary octet-stream), in which case the
-/// `cid:` reference is left unresolved rather than inlined.
+/// `img[src]`, including the aliases real mail uses (`image/jpg`,
+/// `image/pjpeg`, `image/x-png`). Returns the canonical type.
+///
+/// Note this only describes the *declared* Content-Type; the type emitted
+/// into the `data:` URI always comes from [`sniff_image_mime`] so a part
+/// mislabelled by its headers is emitted as what it really is.
 pub fn inline_image_mime(mime_type: &str) -> Option<&'static str> {
     match mime_type
         .split(';')
@@ -1360,11 +1374,50 @@ pub fn inline_image_mime(mime_type: &str) -> Option<&'static str> {
         .to_ascii_lowercase()
         .as_str()
     {
-        "image/png" => Some("image/png"),
-        "image/jpeg" => Some("image/jpeg"),
+        "image/png" | "image/x-png" => Some("image/png"),
+        "image/jpeg" | "image/jpg" | "image/pjpeg" => Some("image/jpeg"),
         "image/gif" => Some("image/gif"),
         "image/webp" => Some("image/webp"),
         _ => None,
+    }
+}
+
+/// Whether a `cid:` attachment is worth reading as a potential inline image.
+/// Candidates are a declared raster type, any other `image/*` (a sender may
+/// label a PNG `image/svg+xml` or `image/bmp`), `application/octet-stream`,
+/// or no declared type at all - real mail is sloppy and the browser used to
+/// sniff these anyway. Anything else (text/html, application/pdf, ...) is
+/// skipped without touching the filesystem.
+pub fn inline_image_candidate(mime_type: Option<&str>) -> bool {
+    match mime_type {
+        None => true,
+        Some(declared) => {
+            let base = declared.split(';').next().unwrap_or_default().trim();
+            inline_image_mime(base).is_some()
+                || base
+                    .get(..6)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("image/"))
+                || base.eq_ignore_ascii_case("application/octet-stream")
+        }
+    }
+}
+
+/// Canonical image MIME from a file's leading bytes: PNG, JPEG, GIF87a/89a
+/// or RIFF WEBP signatures only. The `data:` URI emitted for a `cid:` part
+/// always uses this - never the declared Content-Type - so a part labelled
+/// `image/png` that is really SVG or HTML is refused rather than inlined as
+/// active markup, and a mislabelled raster is emitted as what it really is.
+pub fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 
@@ -1426,12 +1479,16 @@ mod cid_tests {
     #[test]
     fn inline_image_mime_allowlist() {
         use super::inline_image_mime;
-        // Raster types survive, normalized to canonical lowercase.
+        // Raster types survive, normalized to canonical lowercase, and the
+        // aliases real mail uses map to the canonical type.
         for (input, expected) in [
             ("image/png", Some("image/png")),
             ("IMAGE/JPEG", Some("image/jpeg")),
             (" image/gif ", Some("image/gif")),
             ("image/webp", Some("image/webp")),
+            ("image/jpg", Some("image/jpeg")),
+            ("image/pjpeg", Some("image/jpeg")),
+            ("image/x-png", Some("image/png")),
             ("image/png; name=\"logo.png\"", Some("image/png")),
         ] {
             assert_eq!(inline_image_mime(input), expected, "input: {input}");
@@ -1448,6 +1505,71 @@ mod cid_tests {
         ] {
             assert_eq!(inline_image_mime(input), None, "input: {input}");
         }
+    }
+
+    #[test]
+    fn inline_image_candidate_covers_sloppy_declarations() {
+        use super::inline_image_candidate;
+        // Declared raster types, aliases, other image/*, octet-stream and
+        // missing declarations all get read and sniffed.
+        for input in [
+            None,
+            Some("image/png"),
+            Some("image/jpg"),
+            Some("image/pjpeg"),
+            Some("image/x-png"),
+            Some("image/bmp"),
+            Some("image/svg+xml"),
+            Some("application/octet-stream"),
+            Some("IMAGE/PNG; name=\"a.png\""),
+        ] {
+            assert!(inline_image_candidate(input), "input: {input:?}");
+        }
+        // Non-image types are never read for inlining.
+        for input in [
+            Some("text/html"),
+            Some("text/plain"),
+            Some("application/pdf"),
+            Some("application/zip"),
+            Some("multipart/related"),
+        ] {
+            assert!(!inline_image_candidate(input), "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn sniff_image_mime_reads_magic_bytes() {
+        use super::sniff_image_mime;
+        let png = b"\x89PNG\r\n\x1a\nrest-of-file";
+        let jpeg = b"\xff\xd8\xff\xe0rest";
+        let gif87 = b"GIF87a\x01\x00";
+        let gif89 = b"GIF89a\x01\x00";
+        let webp = b"RIFF\x9c\x00\x00\x00WEBPVP8 ";
+        assert_eq!(sniff_image_mime(png), Some("image/png"));
+        assert_eq!(sniff_image_mime(jpeg), Some("image/jpeg"));
+        assert_eq!(sniff_image_mime(gif87), Some("image/gif"));
+        assert_eq!(sniff_image_mime(gif89), Some("image/gif"));
+        assert_eq!(sniff_image_mime(webp), Some("image/webp"));
+        // RIFF that is not WEBP (e.g. a WAV) is refused.
+        assert_eq!(sniff_image_mime(b"RIFF\x24\x00\x00\x00WAVEfmt "), None);
+    }
+
+    #[test]
+    fn sniff_image_mime_refuses_non_raster_and_truncated() {
+        use super::sniff_image_mime;
+        // Declared image/png but really SVG/HTML: refused outright.
+        assert_eq!(
+            sniff_image_mime(b"<svg xmlns=\"http://www.w3.org/2000/svg\">"),
+            None
+        );
+        assert_eq!(sniff_image_mime(b"<!doctype html><html>"), None);
+        assert_eq!(sniff_image_mime(b"<?xml version=\"1.0\"?>"), None);
+        // Truncated signatures never match.
+        assert_eq!(sniff_image_mime(b""), None);
+        assert_eq!(sniff_image_mime(b"\x89PNG\r\n\x1a"), None);
+        assert_eq!(sniff_image_mime(b"\xff\xd8"), None);
+        assert_eq!(sniff_image_mime(b"GIF8"), None);
+        assert_eq!(sniff_image_mime(b"RIFF\x00\x00\x00\x00WEB"), None);
     }
 
     #[test]

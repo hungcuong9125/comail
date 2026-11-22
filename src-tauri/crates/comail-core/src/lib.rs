@@ -1205,13 +1205,16 @@ impl Core {
             _ => return html,
         };
         let mut fetched = Vec::new();
+        // Total raw bytes one call may embed; once exhausted, remaining parts
+        // keep their cid: reference and render as the browser's broken-image
+        // affordance (alt text where the sender set one) rather than loading.
         let mut budget = crate::mime::InlineImageBudget::default();
         for (attachment_id, content_id, mime) in atts {
-            // Only raster image parts are ever inlined; anything else keeps
-            // its cid: reference and is not even fetched for this.
-            let Some(mime) = mime.as_deref().and_then(crate::mime::inline_image_mime) else {
+            // Only image-ish parts are candidates; anything else keeps its
+            // cid: reference and is not even fetched for this.
+            if !crate::mime::inline_image_candidate(mime.as_deref()) {
                 continue;
-            };
+            }
             let Ok(path) = self.get_attachment(attachment_id).await else {
                 continue;
             };
@@ -1222,7 +1225,10 @@ impl Core {
             if meta.len() > crate::mime::INLINE_IMAGE_MAX_BYTES {
                 continue;
             }
+            // The emitted data: URI always uses the sniffed type - a part
+            // labelled image/png that is really SVG/HTML is refused.
             if let Ok(bytes) = tokio::fs::read(&path).await
+                && let Some(mime) = crate::mime::sniff_image_mime(&bytes)
                 && budget.try_reserve(bytes.len() as u64)
             {
                 fetched.push((content_id, mime, bytes));
@@ -1307,13 +1313,16 @@ impl Core {
 
         let mut fetched: Vec<(i64, String, &'static str, Vec<u8>)> = Vec::new();
         let mut missing: Vec<i64> = Vec::new();
+        // Total raw bytes one call may embed; once exhausted, remaining parts
+        // keep their cid: reference and render as the browser's broken-image
+        // affordance (alt text where the sender set one) rather than loading.
         let mut budget = crate::mime::InlineImageBudget::default();
         for (message_id, attachment_id, content_id, mime, file_path) in atts {
-            // Only raster image parts are ever inlined; anything else keeps
-            // its cid: reference and is not even fetched for this.
-            let Some(mime) = mime.as_deref().and_then(crate::mime::inline_image_mime) else {
+            // Only image-ish parts are candidates; anything else keeps its
+            // cid: reference and is not even fetched for this.
+            if !crate::mime::inline_image_candidate(mime.as_deref()) {
                 continue;
-            };
+            }
             // Unavailable means "on disk but unreadable/absent" and earns a
             // refetch below; an on-disk part over the per-image cap instead
             // leaves the cid: reference unresolved on purpose.
@@ -1336,10 +1345,15 @@ impl Core {
                 None => None,
             };
             match bytes {
-                Some(bytes) if budget.try_reserve(bytes.len() as u64) => {
-                    fetched.push((message_id, content_id, mime, bytes));
+                // The emitted data: URI always uses the sniffed type - a part
+                // labelled image/png that is really SVG/HTML is refused.
+                Some(bytes) => {
+                    if let Some(mime) = crate::mime::sniff_image_mime(&bytes)
+                        && budget.try_reserve(bytes.len() as u64)
+                    {
+                        fetched.push((message_id, content_id, mime, bytes));
+                    }
                 }
-                Some(_) => {}
                 None if unavailable => missing.push(attachment_id),
                 None => {}
             }
