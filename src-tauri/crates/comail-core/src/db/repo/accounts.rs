@@ -87,7 +87,50 @@ pub fn insert(conn: &Connection, a: &NewAccount) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+/// FTS rows removed per statement. The mailbox can hold hundreds of
+/// thousands of messages; batching keeps each contentless-delete index update
+/// (and the rowid subquery materialization) bounded instead of one giant
+/// delete inside the single writer's transaction.
+const FTS_DELETE_BATCH: i64 = 5_000;
+
+/// Delete an account and every auxiliary structure keyed to it that the FK
+/// cascade does not reach. Must run inside the caller's transaction: the FTS
+/// rows are keyed by message rowid, so they have to go BEFORE the
+/// `DELETE FROM accounts` cascades the `messages` rows that identify them.
+///
+/// Covered explicitly:
+/// - `messages_fts`: a virtual FTS5 table with no foreign key; same
+///   `DELETE ... rowid` mechanism `repo::messages::delete` uses for one
+///   message, batched by account.
+/// - `search_events`: `thread_id` is a bare integer with no FK; stale rows
+///   would lift a recycled thread id with a dead account's queries.
+///
+/// Everything else keyed by account/message/thread id (bodies, attachments,
+/// labels, snoozes, pending actions, embeddings, calendar/contacts sync
+/// state, sync_failures, notification_outbox, ...) is covered by an
+/// `ON DELETE CASCADE` back to `accounts` or `messages`.
 pub fn delete(conn: &Connection, id: i64) -> Result<()> {
+    // The LIMIT must bound the FTS rowids, not the message ids: the messages
+    // rows are only dropped by the cascade below, so limiting their SELECT
+    // would return the same first N ids on every pass and stop early. Each
+    // pass deletes up to BATCH of the account's remaining FTS rows.
+    loop {
+        let n = conn.execute(
+            "DELETE FROM messages_fts WHERE rowid IN (
+                 SELECT rowid FROM messages_fts
+                 WHERE rowid IN (SELECT id FROM messages WHERE account_id = ?1)
+                 LIMIT ?2)",
+            params![id, FTS_DELETE_BATCH],
+        )?;
+        if n < FTS_DELETE_BATCH as usize {
+            break;
+        }
+    }
+    conn.execute(
+        "DELETE FROM search_events WHERE thread_id IN (
+             SELECT id FROM threads WHERE account_id = ?1)",
+        params![id],
+    )?;
     conn.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
     Ok(())
 }
