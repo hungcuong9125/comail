@@ -335,7 +335,7 @@ pub(super) async fn call(core: &Core, name: &str, args: Value) -> ToolResult {
     let Some(def) = defs().into_iter().find(|d| d.name == name) else {
         return Err(format!("{UNKNOWN_TOOL}: {name}"));
     };
-    let settings = core.get_settings().await?;
+    let settings = core.settings().await?;
     if !allowed(def.group, &settings) {
         return Err(format!(
             "{name} is turned off. The user can allow it in comail Settings > AI clients (MCP)."

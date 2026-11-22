@@ -42,36 +42,26 @@ pub fn get(conn: &Connection) -> Result<Settings> {
 /// Legacy inline client secrets are the last copy standing when the keyring
 /// migration has not run or keeps failing (locked keychain, headless box):
 /// `set` must keep them in the row. `skip_serializing` drops them from the
-/// outgoing JSON, so they are re-added here — the incoming value wins, else
-/// the previously stored one survives.
-fn keep_legacy_secret_keys(
-    conn: &Connection,
-    settings: &Settings,
-    json: &mut serde_json::Value,
-) -> Result<()> {
+/// outgoing JSON, so the previously stored value is re-added here. Values in
+/// the incoming object are ignored on purpose: only the startup migration
+/// moves a row secret to the keyring, and letting a write smuggle one in
+/// would let a stale client clobber a newer keyring secret.
+fn keep_legacy_secret_keys(conn: &Connection, json: &mut serde_json::Value) -> Result<()> {
     let Some(obj) = json.as_object_mut() else {
         return Ok(());
     };
     let stored = row_json(conn)?;
-    for (key, incoming) in [
-        (
-            GOOGLE_CLIENT_SECRET_KEY,
-            settings.google_client_secret.trim(),
-        ),
-        (MS_CLIENT_SECRET_KEY, settings.ms_client_secret.trim()),
-    ] {
-        let keep = if !incoming.is_empty() {
-            Some(incoming.to_string())
-        } else {
-            stored
-                .as_ref()
-                .and_then(|v| v.get(key))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
-        if let Some(secret) = keep {
-            obj.insert(key.to_string(), serde_json::Value::String(secret));
+    for key in LEGACY_SECRET_KEYS {
+        if let Some(secret) = stored
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            obj.insert(
+                key.to_string(),
+                serde_json::Value::String(secret.to_string()),
+            );
         }
     }
     Ok(())
@@ -79,7 +69,7 @@ fn keep_legacy_secret_keys(
 
 pub fn set(conn: &Connection, settings: &Settings) -> Result<()> {
     let mut json = serde_json::to_value(settings)?;
-    keep_legacy_secret_keys(conn, settings, &mut json)?;
+    keep_legacy_secret_keys(conn, &mut json)?;
     conn.execute(
         "INSERT INTO app_settings (key, value) VALUES ('settings', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -305,10 +295,11 @@ mod tests {
         assert_eq!(get(&c).unwrap().google_client_secret, "g-secret");
     }
 
-    /// A write that still carries an inline value (pre-keyring client while
-    /// the keyring was unavailable) stores that newer value, not a stale one.
+    /// A write that still carries an inline value (a stale pre-keyring
+    /// client) must NOT store it: only the migration moves a row secret to
+    /// the keyring, and a smuggled write could clobber a newer keyring value.
     #[test]
-    fn set_keeps_incoming_inline_secret() {
+    fn set_ignores_incoming_inline_secret() {
         let c = testutil::conn();
         let s = Settings {
             google_client_secret: "fresh-secret".into(),
@@ -323,7 +314,7 @@ mod tests {
             )
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(json["googleClientSecret"], "fresh-secret");
+        assert!(json.get("googleClientSecret").is_none());
         assert!(json.get("msClientSecret").is_none());
     }
 
