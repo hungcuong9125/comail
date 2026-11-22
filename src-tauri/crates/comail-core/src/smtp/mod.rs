@@ -94,13 +94,21 @@ pub async fn send_raw(
     Ok(())
 }
 
-/// SMTP reply codes that genuinely mean the AUTH step failed (RFC 4954):
-/// 432 password transition needed, 454 temporary authentication failure,
-/// 534 credentials/mechanism too weak, 535 authentication failed, 538
-/// encryption required for the mechanism. Every one is only issued in
-/// response to AUTH. 530 is deliberately absent: it can also mean "STARTTLS
-/// first", so its text is checked instead.
-const AUTH_REPLY_CODES: &[u16] = &[432, 454, 534, 535, 538];
+/// SMTP reply codes that genuinely mean the credentials are wrong or must
+/// be refreshed (RFC 4954): 454 temporary authentication failure, 534
+/// mechanism too weak / credentials refused, 535 authentication failed.
+/// Each is only issued in response to AUTH.
+const AUTH_REPLY_CODES: &[u16] = &[454, 534, 535];
+
+/// Reply codes RFC 4954 reserves for the AUTH exchange itself, where the
+/// code alone is the whole verdict and any enhanced code in the text is
+/// decoration: 432 (password transition needed - a protocol step the
+/// client performs, not something re-entering a password fixes), 454, 530
+/// (auth only when its text says so; providers also use it for "STARTTLS
+/// first"), 534, 535, and 538 (encryption required for the mechanism - a
+/// transport policy no re-login resolves, so it must surface as a normal,
+/// terminal SMTP failure rather than pausing the queue for re-auth).
+const AUTH_STEP_CODES: &[u16] = &[432, 454, 530, 534, 535, 538];
 
 /// Enhanced status codes (RFC 3463/5248) that mean the credentials
 /// themselves: 5.7.8 credentials invalid, 5.7.9 mechanism too weak, 5.7.11
@@ -131,8 +139,10 @@ fn is_auth_failure(status: Option<u16>, msg: &str, client_side: bool) -> bool {
         if AUTH_REPLY_CODES.contains(&code) {
             return true;
         }
-        if code == 530 {
-            return msg.to_lowercase().contains("auth");
+        // An AUTH-exchange code is its own verdict; its enhanced code is
+        // decoration. 530 only counts when the text actually says auth.
+        if AUTH_STEP_CODES.contains(&code) {
+            return code == 530 && msg.to_lowercase().contains("auth");
         }
         // Credential-class enhanced codes are only honoured on permanent
         // (5xx) rejections; a 4xx transient with an x.7.x code is rate
@@ -238,18 +248,6 @@ mod tests {
             (
                 Some(454),
                 "transient error (454): 4.7.0 Temporary authentication failure",
-                false,
-            ),
-            // 432/538 are RFC 4954 AUTH replies (password transition needed,
-            // encryption required for the mechanism).
-            (
-                Some(432),
-                "transient error (432): 4.7.12 A password transition is needed",
-                false,
-            ),
-            (
-                Some(538),
-                "permanent error (538): 5.7.11 Encryption required for requested authentication mechanism",
                 false,
             ),
             // 530 "Authentication required" - text confirms it means AUTH.
@@ -375,6 +373,21 @@ mod tests {
                 "permanent error (530): 5.7.0 Must issue a STARTTLS command first",
                 false,
             ),
+            // 432/538 are AUTH-step replies that re-auth cannot resolve:
+            // 432 asks for a password transition (a client-side protocol
+            // step), 538 demands encryption for the mechanism. Both stay
+            // normal SMTP failures even when their text carries a
+            // credential-class enhanced code.
+            (
+                Some(432),
+                "transient error (432): 4.7.12 A password transition is needed",
+                false,
+            ),
+            (
+                Some(538),
+                "permanent error (538): 5.7.11 Encryption required for requested authentication mechanism",
+                false,
+            ),
             (Some(421), "transient error (421): try again later", false),
             (Some(451), "transient error (451): local error", false),
             // Non-response lettre errors carry no reply code.
@@ -388,6 +401,102 @@ mod tests {
             assert!(
                 !is_auth_failure(*status, msg, *client_side),
                 "expected smtp: {msg}"
+            );
+        }
+    }
+
+    /// A bare-bones SMTP responder: greets, accepts EHLO, and answers every
+    /// MAIL FROM with `reply`. `send_raw` against it produces the lettre
+    /// `Error` the classifier really sees on the wire - parsed reply code
+    /// and lettre's own Display text included.
+    async fn lettre_error_for(reply: &'static str) -> lettre::transport::smtp::Error {
+        use lettre::address::Envelope;
+        use lettre::transport::smtp::client::Tls;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = socket.split();
+            if writer.write_all(b"220 test ESMTP\r\n").await.is_err() {
+                return;
+            }
+            let mut lines = BufReader::new(reader).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let verb = line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+                let answer = match verb.as_str() {
+                    "EHLO" | "HELO" => "250 OK\r\n",
+                    "RSET" | "QUIT" | "NOOP" => "221 Bye\r\n",
+                    _ => reply,
+                };
+                if writer.write_all(answer.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
+            .port(port)
+            .tls(Tls::None)
+            .build();
+        let envelope = Envelope::new(
+            Some("a@test.dev".parse().unwrap()),
+            vec!["b@test.dev".parse().unwrap()],
+        )
+        .unwrap();
+        transport
+            .send_raw(
+                &envelope,
+                b"From: a@test.dev\r\nTo: b@test.dev\r\n\r\nhi\r\n",
+            )
+            .await
+            .expect_err("the scripted reply always fails the send")
+    }
+
+    #[tokio::test]
+    async fn classifier_sees_real_lettre_reply_errors() {
+        // Real lettre Errors produced on the wire, not hand-built (code,
+        // text) pairs - this also exercises lettre's Display, which the
+        // queue's permanence check reads.
+        let cases: &[(&str, bool, &str)] = &[
+            (
+                "535 5.7.8 Authentication credentials invalid\r\n",
+                true,
+                "credential rejection is Auth",
+            ),
+            (
+                "421 4.7.0 Try again later\r\n",
+                false,
+                "4xx rate limit is not auth",
+            ),
+            (
+                "552 5.3.4 Message exceeds fixed size limit\r\n",
+                false,
+                "5xx size rejection is not auth",
+            ),
+            (
+                "530 5.7.0 Must issue a STARTTLS command first\r\n",
+                false,
+                "530 STARTTLS demand is not auth",
+            ),
+        ];
+        for &(reply, expect_auth, why) in cases {
+            let error = lettre_error_for(reply).await;
+            assert!(
+                error.status().is_some(),
+                "lettre must parse the reply code: {reply}"
+            );
+            let mapped = classify_send_error(error);
+            assert_eq!(
+                matches!(mapped, CoreError::Auth(_)),
+                expect_auth,
+                "{why}: {reply}"
             );
         }
     }
