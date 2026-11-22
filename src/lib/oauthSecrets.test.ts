@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { Settings } from "../ipc/types";
-import { oauthSecretFlag, withOAuthSecretFlag } from "./oauthSecrets";
+import {
+  oauthSecretFlag,
+  submittableSecret,
+  withOAuthSecretFlag,
+} from "./oauthSecrets";
 
 const base = {
   hasGoogleClientSecret: true,
@@ -12,6 +16,14 @@ describe("oauthSecretFlag", () => {
   it("maps each provider to its presence flag", () => {
     expect(oauthSecretFlag("google")).toBe("hasGoogleClientSecret");
     expect(oauthSecretFlag("microsoft")).toBe("hasMsClientSecret");
+  });
+});
+
+describe("submittableSecret", () => {
+  it("never returns an empty secret — an empty save must not clear", () => {
+    expect(submittableSecret("")).toBeNull();
+    expect(submittableSecret("   ")).toBeNull();
+    expect(submittableSecret("  GOCSPX-abc  ")).toBe("GOCSPX-abc");
   });
 });
 

@@ -23,6 +23,7 @@ import { automationRisk, automationRiskMessage } from "../../lib/automationRisk"
 import { syncNowAndRefresh, useManualSyncBusy } from "../../lib/syncNow";
 import { normalizeSyncStatus } from "../../lib/syncStatus";
 import {
+  submittableSecret,
   withOAuthSecretFlag,
   type OAuthSecretProvider,
 } from "../../lib/oauthSecrets";
@@ -73,6 +74,7 @@ import {
   Checkbox,
   EmptyState,
   inputCls,
+  ConfirmButton,
   PageHeader,
   PanelShell,
   SectionLabel,
@@ -2810,10 +2812,9 @@ function OAuthSecretField({
   const [value, setValue] = useState("");
   const [saving, setSaving] = useState(false);
 
-  const save = async () => {
+  const apply = async (secret: string) => {
     if (saving) return;
     setSaving(true);
-    const secret = value.trim();
     try {
       await call("set_oauth_client_secret", { provider, secret });
       pushToast({
@@ -2836,6 +2837,12 @@ function OAuthSecretField({
     }
   };
 
+  // An empty input never clears: clearing is the explicit danger action.
+  const save = () => {
+    const secret = submittableSecret(value);
+    if (secret !== null) void apply(secret);
+  };
+
   return (
     <SettingRow
       label={label}
@@ -2847,16 +2854,30 @@ function OAuthSecretField({
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") void save();
+            if (e.key === "Enter") save();
           }}
           placeholder={hasSecret ? "••••••••" : placeholder}
           autoComplete="off"
           spellCheck={false}
           className={`${inputCls} !w-[220px]`}
         />
-        <Button variant="primary" busy={saving} onClick={() => void save()}>
+        <Button
+          variant="primary"
+          busy={saving}
+          disabled={!value.trim()}
+          onClick={save}
+        >
           {t("settings:ai.save")}
         </Button>
+        {hasSecret && (
+          <ConfirmButton
+            size="md"
+            label={t("settings:oauth.secretClear")}
+            ariaLabel={t("settings:oauth.secretClear")}
+            confirmLabel={t("settings:oauth.secretClearConfirm")}
+            onConfirm={() => void apply("")}
+          />
+        )}
       </div>
     </SettingRow>
   );

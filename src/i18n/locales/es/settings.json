@@ -286,7 +286,9 @@
     },
     "secretSaved": "Secreto de cliente guardado",
     "secretCleared": "Secreto de cliente borrado",
-    "secretStored": "Guardado en el llavero del sistema y nunca se muestra. Guarda en blanco para borrarlo."
+    "secretStored": "Guardado en el llavero del sistema y nunca se muestra.",
+    "secretClear": "Borrar",
+    "secretClearConfirm": "Eliminar"
   },
   "accounts": {
     "signedOut": "Sesión cerrada. La sincronización de correo está en pausa hasta que inicies sesión de nuevo.",

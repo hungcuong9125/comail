@@ -286,7 +286,9 @@
     },
     "secretSaved": "Đã lưu client secret",
     "secretCleared": "Đã xóa client secret",
-    "secretStored": "Được lưu trong khoá hệ thống và không bao giờ hiển thị. Lưu để trống để xóa."
+    "secretStored": "Được lưu trong khoá hệ thống và không bao giờ hiển thị.",
+    "secretClear": "Xoá",
+    "secretClearConfirm": "Xác nhận xoá"
   },
   "accounts": {
     "signedOut": "Đã đăng xuất. Đồng bộ thư tạm dừng cho đến khi bạn đăng nhập lại.",

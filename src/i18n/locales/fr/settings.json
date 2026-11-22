@@ -286,7 +286,9 @@
     },
     "secretSaved": "Secret client enregistré",
     "secretCleared": "Secret client effacé",
-    "secretStored": "Enregistré dans le trousseau système et jamais affiché. Enregistrer vide pour l'effacer."
+    "secretStored": "Enregistré dans le trousseau système et jamais affiché.",
+    "secretClear": "Effacer",
+    "secretClearConfirm": "Supprimer"
   },
   "accounts": {
     "signedOut": "Déconnecté. La synchronisation du courrier est en pause jusqu'à la reconnexion.",

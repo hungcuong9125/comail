@@ -286,7 +286,9 @@
     },
     "secretSaved": "Client secret saved",
     "secretCleared": "Client secret cleared",
-    "secretStored": "Stored in the system keychain and never shown. Save empty to clear it."
+    "secretStored": "Stored in the system keychain and never shown.",
+    "secretClear": "Clear",
+    "secretClearConfirm": "Remove"
   },
   "accounts": {
     "signedOut": "Signed out. Mail sync is paused until you sign in again.",
