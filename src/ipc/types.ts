@@ -260,18 +260,30 @@ export interface SaveDraftArgs {
   composerNonce?: string | null;
 }
 
-/** What `save_draft` returns: the draft id plus every attachment as it was
- *  persisted - always `staged` entries in request order, which the composer
- *  swaps in for one-shot `token` entries so the next save can echo them. */
+/** The persisted outcome of ONE `save_draft` attachment entry, aligned to
+ *  the request by index. `staged` entries are echoed back on re-save (a
+ *  one-shot `token` must never be replayed); `refused` entries were
+ *  rejected per-entry (e.g. over the draft's limits) while the rest of the
+ *  draft saved - the chip is marked failed and left off the wire. */
+export type SavedAttachment =
+  | { kind: "staged"; filePath: string; filename: string }
+  | { kind: "refused"; reason: string };
+
+/** What `save_draft` returns: the draft id plus one `SavedAttachment` per
+ *  request entry, in request order - index alignment is the mapping back
+ *  onto the chips the request was built from. */
 export interface SaveDraftResult {
   draftId: number;
-  attachments: DraftAttachment[];
+  attachments: SavedAttachment[];
 }
 
 export interface QueueSendArgs {
   draftId: number;
   /** ms epoch; omit for "send now" (goes out after the undo window) */
   sendAt?: number;
+  /** Backstop: the staged paths the composer believes the draft holds.
+   *  Queueing is refused when the draft's real rows differ. */
+  expectedAttachments?: string[];
 }
 
 export interface QueueSendResult {
@@ -1243,18 +1255,25 @@ export interface Commands {
   cancel_send(args: { actionId: number }): Promise<{ cancelled: boolean }>;
   send_now(args: { actionId: number }): Promise<{ sent: boolean }>;
 
-  /** Opens the native file picker from Rust and returns one approval token
-   *  per chosen file (empty when the dialog was cancelled). Tokens are
-   *  bound to `composerNonce`. */
+  /** Opens the native file picker from Rust and returns approval tokens
+   *  for the chosen files (empty when the dialog was cancelled). Tokens
+   *  are bound to `composerNonce`; picks that would push the draft past
+   *  its attachment limits come back in `skipped`, not as chips.
+   *  `currentCount`/`currentBytes` are the draft's present totals. */
   pick_draft_attachments(args: {
     composerNonce?: string | null;
-  }): Promise<ApprovedAttachment[]>;
+    currentCount?: number;
+    currentBytes?: number;
+  }): Promise<DropClaim>;
   /** Exchanges OS-drop paths Rust observed on the window for approval
    *  tokens. Paths the Rust drop handler never saw are refused; observed
-   *  but unusable entries come back in `skipped` for the UI to surface. */
+   *  but unusable entries (and over-limit files) come back in `skipped`
+   *  for the UI to surface. */
   claim_dropped_attachments(args: {
     paths: string[];
     composerNonce?: string | null;
+    currentCount?: number;
+    currentBytes?: number;
   }): Promise<DropClaim>;
   /** Resolves a received attachment (by row id) to an approval token so a
    *  forward chip can carry it - the download happens here, outside
@@ -1262,6 +1281,8 @@ export interface Commands {
   prepare_forward_attachment(args: {
     attachmentId: number;
     composerNonce?: string | null;
+    currentCount?: number;
+    currentBytes?: number;
   }): Promise<ApprovedAttachment>;
   save_draft(args: { args: SaveDraftArgs }): Promise<SaveDraftResult>;
   get_draft(args: { draftId: number }): Promise<SaveDraftArgs>;

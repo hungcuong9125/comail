@@ -2230,7 +2230,9 @@ function mockAttachmentName(attachmentId: number): string {
 
 /** Resolve incoming attachment entries to the staged references a real
  *  save_draft returns (tokens become `staged` rows). */
-function stageAttachments(atts: DraftAttachment[]): DraftAttachment[] {
+function stageAttachments(
+  atts: DraftAttachment[],
+): Extract<DraftAttachment, { kind: "staged" }>[] {
   return atts.map((a) => {
     if (a.kind === "staged") return a;
     const filename =
@@ -3137,9 +3139,10 @@ export async function mockInvoke(
     case "pick_draft_attachments": {
       // The mock "dialog" picks one file per click.
       const n = mockAttachmentTokens.size + 1;
-      return delay([
-        mockApproved(`quarterly-report-${n}.pdf`),
-      ]);
+      return delay({
+        approved: [mockApproved(`quarterly-report-${n}.pdf`)],
+        skipped: [],
+      });
     }
 
     case "claim_dropped_attachments":

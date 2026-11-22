@@ -9,7 +9,11 @@
  * ref it updates synchronously alongside React state.
  */
 
-import type { ApprovedAttachment, DraftAttachment } from "../ipc/types";
+import type {
+  ApprovedAttachment,
+  DraftAttachment,
+  SavedAttachment,
+} from "../ipc/types";
 
 /** Where a chip's bytes came from. Immutable once the chip exists. */
 export type AttachmentOrigin =
@@ -180,38 +184,39 @@ export function wireEntries(chips: ComposerAttachment[]): DraftAttachment[] {
   return chips.flatMap((c) => (c.ref !== null ? [c.ref] : []));
 }
 
-/** Zip `save_draft`'s returned attachments back onto the chips that
- *  produced the request. `snapshot` is the chip array the request was built
- *  from; saved entries come back in request order, and the request had one
- *  entry per chip whose `ref` was non-null, so index alignment is exact -
- *  no filename matching. Returns id → new ref for every mapped chip. */
-export function mapSavedRefs(
+/** Zip `save_draft`'s aligned result back onto the CURRENT chip array.
+ *  `snapshot` is the chip list the request was built from; result entry i
+ *  corresponds to the i-th request entry, i.e. the i-th snapshot chip with
+ *  a non-null ref. A `staged` result swaps the chip's ref; a `refused`
+ *  result marks that chip failed (over-limit) so it stays visible, blocks
+ *  send, and contributes nothing to the next save. Chips added or removed
+ *  while the save was in flight are untouched. */
+export function applySaveResult(
+  current: ComposerAttachment[],
   snapshot: ComposerAttachment[],
-  saved: DraftAttachment[],
-): Map<string, DraftAttachment> {
-  const refs = new Map<string, DraftAttachment>();
+  saved: SavedAttachment[],
+): ComposerAttachment[] {
+  const outcomes = new Map<string, SavedAttachment>();
   let i = 0;
   for (const chip of snapshot) {
     if (chip.ref === null) continue;
     const entry = saved[i];
-    if (entry !== undefined) refs.set(chip.id, entry);
+    if (entry !== undefined) outcomes.set(chip.id, entry);
     i += 1;
   }
-  return refs;
-}
-
-/** Apply `mapSavedRefs` output to the CURRENT chip array by stable id:
- *  chips removed while the save was in flight simply drop out; chips added
- *  meanwhile keep their own ref. Also flips resolved `error` chips back to
- *  `ready` is NOT done here - errors only clear via retry/removal. */
-export function applySavedRefs(
-  current: ComposerAttachment[],
-  newRefs: Map<string, DraftAttachment>,
-): ComposerAttachment[] {
-  if (newRefs.size === 0) return current;
+  if (outcomes.size === 0) return current;
   return current.map((c) => {
-    const ref = newRefs.get(c.id);
-    return ref !== undefined && ref !== c.ref ? { ...c, ref } : c;
+    const s = outcomes.get(c.id);
+    if (s === undefined) return c;
+    if (s.kind === "staged") {
+      const ref: DraftAttachment = {
+        kind: "staged",
+        filePath: s.filePath,
+        filename: s.filename,
+      };
+      return ref === c.ref ? c : { ...c, ref };
+    }
+    return chipFailed(c, s.reason);
   });
 }
 

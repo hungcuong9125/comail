@@ -2,12 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   addChips,
   allReady,
-  applySavedRefs,
+  applySaveResult,
   approvedChips,
   chipFailed,
   chipResolved,
   forwardChip,
-  mapSavedRefs,
   removeChip,
   restoredChip,
   toggleForwardChips,
@@ -16,13 +15,13 @@ import {
   type ComposerAttachment,
   type ForwardSource,
 } from "./draftAttachments";
-import type { ApprovedAttachment, DraftAttachment } from "../ipc/types";
+import type { ApprovedAttachment, SavedAttachment } from "../ipc/types";
 
 function approved(filename: string, source: string, token = `tok-${source}`): ApprovedAttachment {
   return { token, filename, source, size: 42, mimeType: "text/plain" };
 }
 
-const staged = (p: string, f: string): DraftAttachment => ({
+const staged = (p: string, f: string): Extract<SavedAttachment, { kind: "staged" }> => ({
   kind: "staged",
   filePath: p,
   filename: f,
@@ -100,7 +99,7 @@ describe("forward toggle", () => {
     // First save commits: refs become staged.
     let snapshot = chips;
     let saved = [staged("/st/1/report.pdf", "report.pdf"), staged("/st/1/img.png", "img.png")];
-    chips = applySavedRefs(chips, mapSavedRefs(snapshot, saved));
+    chips = applySaveResult(chips, snapshot, saved);
     expect(wireEntries(chips)).toEqual(saved);
 
     // Untick -> save: forward refs gone from the wire.
@@ -125,7 +124,7 @@ describe("forward toggle", () => {
     // Second save commits on those fresh tokens.
     snapshot = chips;
     saved = [staged("/st/2/report.pdf", "report.pdf"), staged("/st/2/img.png", "img.png")];
-    chips = applySavedRefs(chips, mapSavedRefs(snapshot, saved));
+    chips = applySaveResult(chips, snapshot, saved);
     expect(wireEntries(chips)).toEqual(saved);
     expect(allReady(chips)).toBe(true);
   });
@@ -141,7 +140,7 @@ describe("forward toggle", () => {
   });
 });
 
-describe("wireEntries + mapSavedRefs", () => {
+describe("wireEntries + applySaveResult", () => {
   it("sends only ready chips' refs and skips attaching/error chips", () => {
     const ready = approvedChips([approved("a.txt", "s1")], "picked");
     const attaching = forwardChip(9, "b.pdf");
@@ -168,23 +167,38 @@ describe("wireEntries + mapSavedRefs", () => {
       staged("/staged/1/same.txt", "same.txt"),
       staged("/staged/2/same.txt", "same.txt"),
     ];
-    const refs = mapSavedRefs(snapshot, saved);
-    expect(refs.get(snapshot[0].id)).toEqual(saved[0]);
-    expect(refs.get(snapshot[1].id)).toEqual(saved[1]);
-    expect(refs.has(snapshot[2].id)).toBe(false);
+    const merged = applySaveResult(snapshot, snapshot, saved);
+    expect(merged[0].ref).toEqual(saved[0]);
+    expect(merged[1].ref).toEqual(saved[1]);
+    expect(merged[2].ref).toBeNull();
   });
 
-  it("applySavedRefs updates by id even if chips changed during the save", () => {
+  it("marks a refused entry failed while the rest stage", () => {
+    const snapshot = approvedChips(
+      [approved("a.txt", "s1"), approved("huge.bin", "s2")],
+      "picked",
+    );
+    const merged = applySaveResult(snapshot, snapshot, [
+      staged("/s/a.txt", "a.txt"),
+      { kind: "refused", reason: "over the draft's attachment limit" },
+    ]);
+    expect(merged[0].ref).toEqual(staged("/s/a.txt", "a.txt"));
+    expect(merged[0].status).toBe("ready");
+    expect(merged[1].status).toBe("error");
+    // The refused chip leaves the wire; the next save echoes only a.txt.
+    expect(wireEntries(merged)).toEqual([staged("/s/a.txt", "a.txt")]);
+  });
+
+  it("applySaveResult updates by id even if chips changed during the save", () => {
     const snapshot = approvedChips(
       [approved("a.txt", "s1"), approved("b.txt", "s2")],
       "picked",
     );
     const saved = [staged("/s/a.txt", "a.txt"), staged("/s/b.txt", "b.txt")];
-    const refs = mapSavedRefs(snapshot, saved);
     // While the save was in flight: b was removed, a new chip was added.
     const extra = approvedChips([approved("c.txt", "s3")], "picked");
     const current = [snapshot[0], ...extra];
-    const merged = applySavedRefs(current, refs);
+    const merged = applySaveResult(current, snapshot, saved);
     expect(merged[0].ref).toEqual(saved[0]);
     expect(merged[1].ref).toEqual({ kind: "token", token: "tok-s3" });
     // Removed chip is simply absent - no resurrection.
