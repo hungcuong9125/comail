@@ -68,7 +68,10 @@ async function writeSettingsPatch(
     return true;
   } catch (err) {
     reportFailure(err);
-    rollbackTheme(patch, prevTheme);
+    // Roll the theme back to the last confirmed value, not the pre-call one:
+    // an earlier failed patch may have left the UI on a theme that itself
+    // was never persisted.
+    rollbackTheme(patch, cur.theme);
     // A failed write must not leave the cache claiming it succeeded: restore
     // the loaded state, then reconcile against the backend - but only once
     // the queue has run, or the refetch could land on top of a later write's
