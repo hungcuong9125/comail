@@ -292,6 +292,43 @@ mod tests {
     use super::*;
     use crate::db::testutil;
 
+    /// Pins the exact JSON contract flag/label actions rely on
+    /// (`remote_candidates` reads folderId/uid/uidValidity). lib.rs's
+    /// `action_identity_payload` builds the same shape for user actions;
+    /// this test is the drift guard between the two builders.
+    #[test]
+    fn identity_payload_matches_the_flag_action_shape() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        // seed_message stores uid = thread_id; folder 1 has no uidvalidity.
+        let (thread_id, msg_id) = testutil::seed_message(&conn, "a@b.c", "s", false);
+
+        let payload = identity_payload(&conn, msg_id).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "folderId": 1, "uid": thread_id, "uidValidity": null })
+        );
+
+        conn.execute("UPDATE folders SET uidvalidity = 42 WHERE id = 1", [])
+            .unwrap();
+        let payload = identity_payload(&conn, msg_id).unwrap();
+        assert_eq!(payload["uidValidity"], 42);
+
+        // No folder: every remote coordinate is null, keys still present.
+        conn.execute(
+            "UPDATE messages SET folder_id = NULL WHERE id = ?1",
+            [msg_id],
+        )
+        .unwrap();
+        let payload = identity_payload(&conn, msg_id).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "folderId": null, "uid": thread_id, "uidValidity": null })
+        );
+
+        assert!(identity_payload(&conn, 999_999).is_err());
+    }
+
     #[test]
     fn live_recovery_is_scoped_and_preserves_retry_and_remote_identity() {
         let conn = testutil::conn();
