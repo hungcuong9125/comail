@@ -27,6 +27,50 @@ fn mailto_from_args<I: IntoIterator<Item = String>>(args: I) -> Option<String> {
     args.into_iter().find(|a| is_mailto(a))
 }
 
+/// What the webview may do with a requested navigation.
+#[derive(Debug, PartialEq, Eq)]
+enum NavDecision {
+    /// The app's own origins may load in the webview.
+    Allow,
+    /// External web/mailto targets go to the OS handler; the in-app
+    /// navigation itself is cancelled.
+    OpenExternal,
+    /// Everything else is refused (`data:`, `file:`, `javascript:`, other
+    /// localhost ports, unknown schemes).
+    Deny,
+}
+
+/// Strict allowlist for webview navigations. The app loads itself from
+/// `tauri://localhost` (custom protocol - macOS, iOS, Linux where the scheme
+/// registers), `http(s)://tauri.localhost` (the wry fallback origin used on
+/// Windows and wherever the custom scheme is unavailable), and the dev-server
+/// URL from tauri.conf.json in debug builds. `about:` documents must pass
+/// because the callback is also invoked for subframe loads on some engines
+/// (wry does not filter to the main frame: on macOS it hooks
+/// `decidePolicyForNavigationAction`, which WKWebView raises for any frame,
+/// so the `about:srcdoc`/`about:blank` loads of the sandboxed email-body
+/// iframe report here too; WebView2's `NavigationStarting` is main-frame
+/// only).
+fn nav_decision(url: &tauri::Url, dev_url: Option<&tauri::Url>) -> NavDecision {
+    let app_url = match url.scheme() {
+        "tauri" => url.host_str() == Some("localhost"),
+        "about" => true,
+        "http" | "https" => {
+            url.host_str() == Some("tauri.localhost")
+                || (cfg!(debug_assertions)
+                    && dev_url.is_some_and(|dev| url.origin() == dev.origin()))
+        }
+        _ => false,
+    };
+    if app_url {
+        return NavDecision::Allow;
+    }
+    if matches!(url.scheme(), "http" | "https" | "mailto") {
+        return NavDecision::OpenExternal;
+    }
+    NavDecision::Deny
+}
+
 /// Bring the window forward and hand a `mailto:` link to the frontend (which
 /// opens a prefilled composer). De-duplicated because the same link can arrive
 /// twice on a cold start (launch argv *and* the deep-link plugin's callback).
@@ -209,18 +253,15 @@ pub fn run() {
             // Pin the (unused) plugin-config type to `()`; only the runtime is
             // inferred. Without this the config type param can't be resolved.
             tauri::plugin::Builder::<_, ()>::new("comail-external-links")
-                .on_navigation(|_webview, url| {
-                    let host = url.host_str().unwrap_or("");
-                    let app_host = host.is_empty()
-                        || host == "localhost"
-                        || host == "tauri.localhost"
-                        || host.ends_with(".localhost");
-                    let external_web = matches!(url.scheme(), "http" | "https") && !app_host;
-                    if external_web || url.scheme() == "mailto" {
-                        let _ = tauri_plugin_opener::open_url(url.as_str(), None::<&str>);
-                        return false;
+                .on_navigation(|webview, url| {
+                    match nav_decision(url, webview.config().build.dev_url.as_ref()) {
+                        NavDecision::Allow => true,
+                        NavDecision::OpenExternal => {
+                            let _ = tauri_plugin_opener::open_url(url.as_str(), None::<&str>);
+                            false
+                        }
+                        NavDecision::Deny => false,
                     }
-                    true
                 })
                 .build(),
         )
@@ -360,9 +401,13 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                api.prevent_close();
+            // Only the main window hides-to-tray on close; auxiliary windows
+            // (e.g. the intro's cinema backdrop) must close normally.
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -490,4 +535,81 @@ pub fn run() {
                 show_main(_app);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{nav_decision, NavDecision};
+    use tauri::Url;
+
+    const DEV: &str = "http://localhost:1420";
+
+    fn decision(url: &str) -> NavDecision {
+        nav_decision(&Url::parse(url).unwrap(), Some(&Url::parse(DEV).unwrap()))
+    }
+
+    /// The dev-server allowance is compiled to debug builds only; assert the
+    /// variant this build actually implements.
+    fn dev_expected() -> NavDecision {
+        if cfg!(debug_assertions) {
+            NavDecision::Allow
+        } else {
+            NavDecision::OpenExternal
+        }
+    }
+
+    #[test]
+    fn navigation_allowlist() {
+        for (url, expected) in [
+            // App origins per platform.
+            ("tauri://localhost", NavDecision::Allow),
+            ("tauri://localhost/", NavDecision::Allow),
+            ("tauri://localhost/index.html", NavDecision::Allow),
+            ("http://tauri.localhost", NavDecision::Allow),
+            ("https://tauri.localhost/", NavDecision::Allow),
+            ("https://tauri.localhost/index.html", NavDecision::Allow),
+            // Subframe documents reported through the same hook.
+            ("about:blank", NavDecision::Allow),
+            ("about:srcdoc", NavDecision::Allow),
+            // External web and mailto links go to the OS handler.
+            ("https://example.com", NavDecision::OpenExternal),
+            ("http://example.com/path?q=1", NavDecision::OpenExternal),
+            ("mailto:a@b.c", NavDecision::OpenExternal),
+            // Nothing else navigates, in particular:
+            ("data:text/html,<h1>x</h1>", NavDecision::Deny),
+            ("file:///etc/passwd", NavDecision::Deny),
+            ("javascript:alert(1)", NavDecision::Deny),
+            ("cid:logo@x", NavDecision::Deny),
+            ("ws://localhost:1420", NavDecision::Deny),
+            ("custom-scheme://x", NavDecision::Deny),
+            // Lookalike app origins that are not the app.
+            ("tauri://localhost.evil.com", NavDecision::Deny),
+            ("http://tauri.localhost.evil.com", NavDecision::OpenExternal),
+            (
+                "https://evil.com/@tauri.localhost",
+                NavDecision::OpenExternal,
+            ),
+            // Other localhost ports are never "the app".
+            ("http://localhost:9999", NavDecision::OpenExternal),
+            ("http://127.0.0.1:1420", NavDecision::OpenExternal),
+            ("http://foo.localhost", NavDecision::OpenExternal),
+            ("http://localhost", NavDecision::OpenExternal),
+        ] {
+            assert_eq!(decision(url), expected, "url: {url}");
+        }
+    }
+
+    #[test]
+    fn dev_server_url_is_allowed_only_in_debug() {
+        assert_eq!(decision(DEV), dev_expected());
+        assert_eq!(decision("http://localhost:1420/"), dev_expected());
+        // A different port on the same host is not the dev server.
+        assert_eq!(decision("http://localhost:1421"), NavDecision::OpenExternal);
+    }
+
+    #[test]
+    fn no_configured_dev_url_means_no_localhost() {
+        let url = Url::parse(DEV).unwrap();
+        assert_eq!(nav_decision(&url, None), NavDecision::OpenExternal);
+    }
 }
