@@ -5822,6 +5822,9 @@ impl Core {
         let Some(slot) = oauth::providers::client_secret_slot(provider) else {
             return Err(CoreError::Other("provider does not use oauth".into()));
         };
+        // Serialize against in-flight re-probes and migrations: the epoch
+        // bump this write produces makes their stale results uncommittable.
+        let _write = oauth::providers::secret_write_lock(provider).lock().await;
         let secret = secret.trim().to_string();
         let state = if secret.is_empty() {
             // A delete failure surfaces: without it the row copy would still
@@ -6360,7 +6363,19 @@ async fn apply_oauth_settings(
                 }
                 Some(state) => state,
                 None if !id.trim().is_empty() => oauth::providers::probe_secret(provider).await,
-                None => oauth::providers::SecretState::Unset,
+                None => {
+                    // No client ID either: probe once anyway so a secret
+                    // stored before its ID still reports "stored" — the
+                    // recorded flag then suppresses further probes.
+                    if !oauth::providers::presence_known(provider) {
+                        let state = oauth::providers::probe_secret(provider).await;
+                        oauth::providers::set_secret_presence(
+                            provider,
+                            matches!(state, oauth::providers::SecretState::Value(_)),
+                        );
+                    }
+                    oauth::providers::SecretState::Unset
+                }
             },
         };
         oauth::providers::set_configured(provider, id, legacy_inline(legacy_field), secret);
@@ -6404,6 +6419,9 @@ async fn migrate_oauth_secret(
     if value.is_empty() {
         return None;
     }
+    // Serialize the keyring write against set_oauth_client_secret and
+    // re-probe commits, all under the same per-provider guard.
+    let _write = oauth::providers::secret_write_lock(provider).lock().await;
     let state = match credentials::try_load_async(0, slot).await {
         Ok(Some(existing)) => {
             if existing != value {

@@ -14,7 +14,8 @@ use comail_core::db::{Db, repo};
 use comail_core::error::CoreError;
 use comail_core::models::{Provider, Settings};
 use comail_core::oauth::providers::{
-    SecretState, reset_provider_config, resolve_credentials, set_configured, set_reprobe_interval,
+    self, SecretState, reset_provider_config, resolve_credentials, set_configured, set_probe_gate,
+    set_reprobe_interval,
 };
 use std::path::Path;
 use std::time::Duration;
@@ -440,4 +441,74 @@ async fn unavailable_state_heals_via_reprobe() {
     credentials::store(0, Slot::MsClientSecret, "recovered").unwrap();
     let (_, secret) = resolve_credentials(Provider::Microsoft).await.unwrap();
     assert_eq!(secret.as_deref(), Some("recovered"));
+}
+
+/// A probe result computed before an explicit write must never overwrite
+/// it — in the cache or the keyring. The gate parks the re-probe between
+/// its keyring read (result: Unset) and its commit while the user saves a
+/// new secret; releasing it must not resurrect the stale outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_probe_result_cannot_overwrite_a_newer_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = creds_env(&tmp.path().join("credentials.json")).await;
+    let db = Db::open(&paths(&tmp).db_file()).unwrap();
+    db.write(|conn| {
+        let mut s = repo::settings::get(conn)?;
+        s.google_client_id = "g-id".into();
+        repo::settings::set(conn, &s)
+    })
+    .await
+    .unwrap();
+
+    let core = Core::start(paths(&tmp)).await.unwrap();
+    set_configured(
+        Provider::Gmail,
+        "g-id",
+        Some("row-secret"),
+        SecretState::Unavailable,
+    );
+    set_reprobe_interval(Duration::ZERO);
+    let gate = std::sync::Arc::new(providers::ProbeGate {
+        parked: tokio::sync::Barrier::new(2),
+        release: tokio::sync::Barrier::new(2),
+    });
+    set_probe_gate(Some(gate.clone()));
+
+    // resolve → re-probe → reads the empty keyring (Unset) → parks.
+    let resolve = tokio::spawn(async { resolve_credentials(Provider::Gmail).await });
+    gate.parked.wait().await;
+    set_probe_gate(None);
+
+    // The explicit write lands while the probe result is stale — only then
+    // is the parked probe allowed to attempt its commit.
+    core.set_oauth_client_secret("google".into(), "new-secret".into())
+        .await
+        .unwrap();
+    gate.release.wait().await;
+
+    // The commit is dropped: resolver and keyring both hold the new secret —
+    // never the stale Unset or the pending row copy.
+    let (id, secret) = resolve.await.unwrap().unwrap();
+    assert_eq!(id, "g-id");
+    assert_eq!(secret.as_deref(), Some("new-secret"));
+    assert_eq!(
+        credentials::load(0, Slot::GoogleClientSecret).unwrap(),
+        "new-secret"
+    );
+}
+
+/// Cold start with a keyring secret but no client ID: the presence probe
+/// runs even without an entry, so the flag — and the Clear button — survive
+/// a restart. (Proves the cold case: the provider cache was reset first.)
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_start_reports_secret_without_client_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = creds_env(&tmp.path().join("credentials.json")).await;
+    reset_provider_config();
+    credentials::store(0, Slot::GoogleClientSecret, "stored-secret").unwrap();
+
+    let core = Core::start(paths(&tmp)).await.unwrap();
+    let settings = core.get_settings().await.unwrap();
+    assert!(settings.has_google_client_secret);
+    assert!(!settings.has_ms_client_secret);
 }

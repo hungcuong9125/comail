@@ -122,11 +122,14 @@ impl std::fmt::Debug for Configured {
     }
 }
 
-/// One provider's cache slot: the configured credentials plus when the last
-/// `Unavailable` probe ran — the rate limiter for re-probes.
+/// One provider's cache slot: the configured credentials, when the last
+/// `Unavailable` probe ran (rate limiter), and a write epoch — bumped by
+/// every explicit write so a stale re-probe result can never overwrite a
+/// newer state (compare-and-set at commit time).
 struct ProviderEntry {
     configured: Configured,
     unavailable_since: Option<Instant>,
+    epoch: u64,
 }
 
 fn configured() -> &'static RwLock<HashMap<Provider, ProviderEntry>> {
@@ -154,12 +157,49 @@ fn reprobe_interval_cell() -> &'static RwLock<Duration> {
 }
 
 /// Override the `Unavailable` re-probe interval (test support).
+#[doc(hidden)]
 pub fn set_reprobe_interval(interval: Duration) {
     *reprobe_interval_cell().write().unwrap() = interval;
 }
 
-/// One re-probe at a time per provider; waiters re-check before probing.
-fn reprobe_lock(provider: Provider) -> &'static tokio::sync::Mutex<()> {
+/// Test gate installed between a re-probe's keyring read and its commit:
+/// `parked` lets the test rendezvous with the parked probe, `release` holds
+/// it until the test's concurrent write has finished — making the stale
+/// result's compare-and-set drop fully deterministic.
+#[doc(hidden)]
+pub struct ProbeGate {
+    pub parked: tokio::sync::Barrier,
+    pub release: tokio::sync::Barrier,
+}
+
+fn probe_gate_cell() -> &'static RwLock<Option<std::sync::Arc<ProbeGate>>> {
+    static GATE: OnceLock<RwLock<Option<std::sync::Arc<ProbeGate>>>> = OnceLock::new();
+    GATE.get_or_init(|| RwLock::new(None))
+}
+
+#[doc(hidden)]
+pub fn set_probe_gate(gate: Option<std::sync::Arc<ProbeGate>>) {
+    *probe_gate_cell().write().unwrap() = gate;
+}
+
+/// Single-flight: at most one re-probe per provider at a time; waiters
+/// re-check `unavailable_due` after acquiring.
+fn flight_lock(provider: Provider) -> &'static tokio::sync::Mutex<()> {
+    static GMAIL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static MS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static OTHER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    match provider {
+        Provider::Gmail => &GMAIL,
+        Provider::Microsoft => &MS,
+        Provider::Imap => &OTHER,
+    }
+}
+
+/// Serializes keyring writes and cache commits for a provider's secret:
+/// `set_oauth_client_secret`, the migration, and a re-probe's commit all
+/// hold it, so a probe result computed before an explicit write can never
+/// clobber it — in the cache (epoch compare-and-set) or the keyring.
+pub(crate) fn secret_write_lock(provider: Provider) -> &'static tokio::sync::Mutex<()> {
     static GMAIL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     static MS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     static OTHER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -196,6 +236,7 @@ pub fn set_configured(
         map.remove(&provider);
     } else {
         mark_presence(provider, &entry);
+        let epoch = map.get(&provider).map(|e| e.epoch + 1).unwrap_or(0);
         map.insert(
             provider,
             ProviderEntry {
@@ -203,6 +244,7 @@ pub fn set_configured(
                 // rate limit starts now.
                 unavailable_since: matches!(entry.secret, SecretState::Unavailable)
                     .then(Instant::now),
+                epoch,
                 configured: entry,
             },
         );
@@ -221,9 +263,16 @@ pub fn cached_secret_state(provider: Provider) -> Option<SecretState> {
 /// Drop every cached entry and presence flag (test support — the cache is a
 /// process-global because `TokenProvider` and the flow code resolve without
 /// a `Core` instance).
+#[doc(hidden)]
 pub fn reset_provider_config() {
     configured().write().unwrap().clear();
     secret_presence().write().unwrap().clear();
+}
+
+/// Whether the presence map holds any record for `provider` — a recorded
+/// `false` means "probed, nothing stored", distinct from "never probed".
+pub(crate) fn presence_known(provider: Provider) -> bool {
+    secret_presence().read().unwrap().contains_key(&provider)
 }
 
 /// Read `provider`'s client secret from the keyring once, distinguishing a
@@ -251,10 +300,11 @@ pub fn has_client_secret(provider: Provider) -> bool {
         .unwrap_or(false)
 }
 
-/// Record the presence flag directly — used by `set_oauth_client_secret`,
-/// which always knows the truth even when the provider has no client ID yet
-/// (and so has no resolver entry for `apply` to update the flag through).
-pub fn set_secret_presence(provider: Provider, present: bool) {
+/// Record the presence flag directly — used by `set_oauth_client_secret`
+/// and the cold-start presence probe, which know the truth even when the
+/// provider has no client ID yet (no resolver entry for `apply` to update
+/// the flag through).
+pub(crate) fn set_secret_presence(provider: Provider, present: bool) {
     secret_presence().write().unwrap().insert(provider, present);
 }
 
@@ -277,34 +327,57 @@ fn unavailable_due(provider: Provider) -> bool {
 /// right here — the row key itself is stripped by the next
 /// `migrate_oauth_client_secrets` pass.
 async fn reprobe_unavailable(provider: Provider) {
-    let _permit = reprobe_lock(provider).lock().await;
+    let _flight = flight_lock(provider).lock().await;
     // A waiter may have healed the entry while we queued for the lock.
     if !unavailable_due(provider) {
         return;
     }
-    if let Some(e) = configured().write().unwrap().get_mut(&provider) {
-        e.unavailable_since = Some(Instant::now());
-    }
-    let mut state = probe_secret(provider).await;
-    let mut migrated_legacy = false;
-    if matches!(state, SecretState::Unset) {
-        let pending = configured()
-            .read()
-            .unwrap()
-            .get(&provider)
-            .and_then(|e| e.configured.legacy.clone());
-        if let (Some(value), Some(slot)) = (pending, client_secret_slot(provider)) {
-            let verified = credentials::store_async(0, slot, value.clone())
-                .await
-                .is_ok()
-                && matches!(
-                    credentials::try_load_async(0, slot).await,
-                    Ok(Some(back)) if back == value
-                );
-            if verified {
-                state = SecretState::Value(value);
-                migrated_legacy = true;
+    let epoch = {
+        let mut map = configured().write().unwrap();
+        match map.get_mut(&provider) {
+            Some(e) => {
+                e.unavailable_since = Some(Instant::now());
+                e.epoch
             }
+            None => return,
+        }
+    };
+    let mut state = probe_secret(provider).await;
+    // Test hook — see ProbeGate.
+    let gate = probe_gate_cell().read().unwrap().clone();
+    if let Some(gate) = gate {
+        gate.parked.wait().await;
+        gate.release.wait().await;
+    }
+    // The write guard serializes against set_oauth_client_secret/migration;
+    // the epoch re-check under it decides whether the probe result is still
+    // fresh enough to commit — and whether the legacy store may run at all.
+    let _write = secret_write_lock(provider).lock().await;
+    let pending_legacy = {
+        let map = configured().read().unwrap();
+        match map.get(&provider) {
+            Some(e)
+                if e.epoch == epoch && matches!(e.configured.secret, SecretState::Unavailable) =>
+            {
+                e.configured.legacy.clone()
+            }
+            _ => return,
+        }
+    };
+    let mut migrated_legacy = false;
+    if matches!(state, SecretState::Unset)
+        && let (Some(value), Some(slot)) = (pending_legacy, client_secret_slot(provider))
+    {
+        let verified = credentials::store_async(0, slot, value.clone())
+            .await
+            .is_ok()
+            && matches!(
+                credentials::try_load_async(0, slot).await,
+                Ok(Some(back)) if back == value
+            );
+        if verified {
+            state = SecretState::Value(value);
+            migrated_legacy = true;
         }
     }
     if let Some(e) = configured().write().unwrap().get_mut(&provider) {
@@ -315,6 +388,7 @@ async fn reprobe_unavailable(provider: Provider) {
         if !matches!(state, SecretState::Unavailable) {
             e.unavailable_since = None;
         }
+        e.epoch += 1;
         let c = e.configured.clone();
         mark_presence(provider, &c);
     }
