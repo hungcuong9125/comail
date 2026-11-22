@@ -48,6 +48,9 @@ export class DraftSaver {
   /** Serializes drains; never rejects (each `run` promise carries errors). */
   private chain: Promise<unknown> = Promise.resolve();
   private closedFlag = false;
+  /** A discard is in flight: Send/save-and-close must no-op, not reuse the
+   *  id that is about to be deleted. */
+  private discardingFlag = false;
 
   constructor(
     private readonly hooks: DraftSaverHooks,
@@ -70,6 +73,12 @@ export class DraftSaver {
     return this.closedFlag;
   }
 
+  /** Discard flow in progress: controls must not send/save against the id
+   *  that is being deleted. */
+  get isDiscarding(): boolean {
+    return this.discardingFlag;
+  }
+
   markChanged(): void {
     this.version += 1;
   }
@@ -86,6 +95,9 @@ export class DraftSaver {
    *  reply always has a draft to queue. Resolves with the draft id the
    *  last save produced (so a queued send always targets the one draft). */
   flush(): Promise<number | null> {
+    // A discard owns the draft id now: never hand it out for a send that
+    // would race the delete.
+    if (this.discardingFlag) return Promise.resolve(null);
     if (this.closedFlag) return Promise.resolve(this.draftIdValue);
     return this.enqueue();
   }
@@ -117,6 +129,7 @@ export class DraftSaver {
   async discard(
     deleteDraft: (id: number) => Promise<void>,
   ): Promise<{ done: boolean; error?: unknown }> {
+    this.discardingFlag = true;
     this.closedFlag = true;
     await this.idle();
     const id = this.draftIdValue;
@@ -126,6 +139,7 @@ export class DraftSaver {
       return { done: true };
     } catch (error) {
       if (this.hooks.isDraftGone?.(error)) return { done: true };
+      this.discardingFlag = false;
       this.closedFlag = false;
       return { done: false, error };
     }
