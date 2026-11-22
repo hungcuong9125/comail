@@ -42,6 +42,14 @@ const MAX_ODS_DENSE: u64 = 8_000_000;
 const MAX_DOCX_HTML: usize = 500_000;
 const MAX_SLIDE_LINES: usize = 5_000;
 const MAX_LINE_CHARS: usize = 4_000;
+/// Per-cell display text cap for sheet previews. A giant shared string
+/// referenced by thousands of cells would otherwise be copied once per
+/// reference - the cap is checked on the borrowed text before it is
+/// materialized.
+const MAX_CELL_CHARS: usize = 4_000;
+/// Total retained cell text across one preview grid; bounds the sum of many
+/// medium cells, which a per-cell cap alone cannot.
+const MAX_GRID_TEXT: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -313,29 +321,68 @@ fn sheet_preview(bytes: &[u8]) -> AttachmentPreview {
 
 fn grid_from_range(name: String, range: &calamine::Range<calamine::Data>) -> SheetPreview {
     let mut rows = Vec::new();
+    let mut retained_bytes = 0usize;
     let mut truncated = false;
     for row in range.rows() {
-        if rows.len() >= MAX_ROWS {
+        if rows.len() >= MAX_ROWS || retained_bytes >= MAX_GRID_TEXT {
             truncated = true;
             break;
         }
         if row.len() > MAX_COLS {
             truncated = true;
         }
-        rows.push(
-            row.iter()
-                .take(MAX_COLS)
-                .map(|c| match c {
-                    calamine::Data::Empty => String::new(),
-                    other => other.to_string(),
-                })
-                .collect(),
-        );
+        let out: Vec<String> = row
+            .iter()
+            .take(MAX_COLS)
+            .map(|c| match c {
+                calamine::Data::Empty => String::new(),
+                calamine::Data::String(s) => clip_cell_text(s),
+                other => other.to_string(),
+            })
+            .collect();
+        retained_bytes += out.iter().map(|s| s.len()).sum::<usize>();
+        rows.push(out);
     }
     SheetPreview {
         name,
         rows,
         truncated,
+    }
+}
+
+/// Display text for one sheet cell, capped at MAX_CELL_CHARS. The cap is
+/// checked on the borrowed payload before anything is allocated: a giant
+/// shared string referenced by many cells is clipped from its `&str`
+/// without ever materializing the full copy. Non-string scalars are already
+/// small once rendered.
+fn cell_text_bounded(v: &calamine::DataRef<'_>) -> String {
+    let s = match v {
+        calamine::DataRef::SharedString(s) => s,
+        calamine::DataRef::String(s)
+        | calamine::DataRef::DateTimeIso(s)
+        | calamine::DataRef::DurationIso(s) => s.as_str(),
+        other => {
+            let owned: calamine::Data = (*other).clone().into();
+            return owned.to_string();
+        }
+    };
+    clip_cell_text(s)
+}
+
+/// Clip cell display text to MAX_CELL_CHARS on a char boundary, appending
+/// the same "…" marker the other previews use for truncation. Chars, not
+/// bytes: a multi-byte char counts once.
+fn clip_cell_text(s: &str) -> String {
+    match s.char_indices().nth(MAX_CELL_CHARS) {
+        // Short enough already - the common case costs one scan, no copy of
+        // the un-truncated tail.
+        None => s.to_string(),
+        Some((i, _)) => {
+            let mut t = String::with_capacity(i + 3);
+            t.push_str(&s[..i]);
+            t.push('…');
+            t
+        }
     }
 }
 
@@ -369,6 +416,7 @@ fn grid_from_cell_stream<'a, E>(
     let mut truncated = dims_area(dims) > MAX_SHEET_BBOX;
     let mut anchor_row: Option<u32> = None;
     let mut cells: std::collections::BTreeMap<(u32, u32), String> = Default::default();
+    let mut retained_bytes = 0usize;
     let mut scanned = 0usize;
     loop {
         let cell = match next_cell() {
@@ -390,13 +438,13 @@ fn grid_from_cell_stream<'a, E>(
         // before the anchor row (out-of-order records) or past the window
         // truncates the preview.
         if r >= ar && r < ar.saturating_add(MAX_ROWS as u32) {
-            if cells.len() >= MAX_RETAINED {
+            if cells.len() >= MAX_RETAINED || retained_bytes >= MAX_GRID_TEXT {
                 truncated = true;
                 break;
             }
-            let v: calamine::Data = cell.get_value().clone().into();
-            let s = v.to_string();
+            let s = cell_text_bounded(cell.get_value());
             if !s.is_empty() {
+                retained_bytes += s.len();
                 cells.insert((r, c), s);
             }
         } else {
@@ -1425,6 +1473,55 @@ mod tests {
         assert!(!worksheet_dimensions_ok(b"<dimension ref=\"B5:A1\"/>"));
         // ...and a column-only inversion is caught too.
         assert!(!worksheet_dimensions_ok(b"<dimension ref=\"C1:A5\"/>"));
+    }
+
+    #[test]
+    fn xlsx_giant_shared_string_is_clipped_per_cell_and_in_total() {
+        // One ~1 MB shared string referenced by 4000 cells: unbounded the
+        // grid would copy it per reference (~4 GB). Per-cell clipping turns
+        // each into ~4 KB and the retained-bytes budget stops the rest.
+        let big = "x".repeat(1_000_000);
+        let sst = format!(
+            r#"<?xml version="1.0"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="4000" uniqueCount="1"><si><t>{big}</t></si></sst>"#
+        );
+        let mut sheet = String::from(
+            r#"<?xml version="1.0"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>"#,
+        );
+        for r in 1..=500u32 {
+            sheet.push_str(&format!("<row r=\"{r}\">"));
+            for c in ["A", "B", "C", "D", "E", "F", "G", "H"] {
+                sheet.push_str(&format!("<c r=\"{c}{r}\" t=\"s\"><v>0</v></c>"));
+            }
+            sheet.push_str("</row>");
+        }
+        sheet.push_str("</sheetData></worksheet>");
+        let bytes = xlsx_with_sheet(&sheet, &[("xl/sharedStrings.xml", sst.as_bytes())]);
+        let p = build_preview(&bytes, Some("bomb.xlsx"), None);
+        match p {
+            AttachmentPreview::Sheet { sheets } => {
+                let total: usize = sheets[0]
+                    .rows
+                    .iter()
+                    .flat_map(|r| r.iter().map(|s| s.len()))
+                    .sum();
+                assert!(
+                    total <= MAX_GRID_TEXT + MAX_CELL_CHARS + 8,
+                    "retained text {total} exceeds the grid budget"
+                );
+                for row in &sheets[0].rows {
+                    for s in row {
+                        assert!(s.chars().count() <= MAX_CELL_CHARS + 1);
+                        if s.chars().count() > MAX_CELL_CHARS {
+                            assert!(s.ends_with('\u{2026}'), "clipped cell needs the marker");
+                        }
+                    }
+                }
+            }
+            other => panic!("expected sheet, got {other:?}"),
+        }
     }
 
     #[test]
