@@ -57,6 +57,22 @@ pub fn enqueue(
     Ok(conn.last_insert_rowid())
 }
 
+/// Remote-identity payload for flag/label actions: where the message lives
+/// right now (folder, UID, UIDVALIDITY), so the executor can find it even
+/// after local moves. Same shape `apply_thread_action` enqueues for
+/// mark_read/mark_unread/star/label kinds.
+pub fn identity_payload(conn: &Connection, message_id: i64) -> Result<serde_json::Value> {
+    let row = super::messages::get_row(conn, message_id)?
+        .ok_or_else(|| crate::error::CoreError::NotFound("message for action".into()))?;
+    let validity = row
+        .folder_id
+        .map(|id| super::folders::get(conn, id))
+        .transpose()?
+        .flatten()
+        .and_then(|folder| folder.uidvalidity);
+    Ok(serde_json::json!({ "folderId": row.folder_id, "uid": row.uid, "uidValidity": validity }))
+}
+
 /// Due actions for one account, oldest first.
 pub fn due(conn: &Connection, account_id: i64, now: i64, limit: i64) -> Result<Vec<PendingAction>> {
     // cal_% actions belong to the CalDAV task, not the IMAP executor.
