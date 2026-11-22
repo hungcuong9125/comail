@@ -14,11 +14,19 @@ const ENTITIES: Record<string, string> = {
   "&nbsp;": " ",
 };
 
+/** One match per reference, so nothing is decoded twice (`&amp;lt;` stays
+ *  "&lt;", the text the author typed). Numeric references that don't name a
+ *  scalar value (above U+10FFFF, surrogates, junk) keep their literal text
+ *  instead of throwing in fromCodePoint. */
+const ENTITY_RE = /&(amp|lt|gt|quot|apos|nbsp);|&#(\d+);|&#x([0-9a-f]+);/gi;
+
 export function decodeEntities(s: string): string {
-  return s
-    .replace(/&(amp|lt|gt|quot|#39|apos|nbsp);/g, (m) => ENTITIES[m] ?? m)
-    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)));
+  return s.replace(ENTITY_RE, (m, named: string | undefined, dec: string | undefined, hex: string | undefined) => {
+    if (named !== undefined) return ENTITIES[`&${named.toLowerCase()};`] ?? m;
+    const cp = dec !== undefined ? Number(dec) : parseInt(hex ?? "", 16);
+    if (!Number.isFinite(cp) || cp < 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return m;
+    return String.fromCodePoint(cp);
+  });
 }
 
 export function escapeHtml(s: string): string {
@@ -132,6 +140,23 @@ function plainImg(tag: string): string {
   return `<img src="${escapeHtml(decodeEntities(src))}"${altAttr}>`;
 }
 
+/** Rebuild a mention chip from the matched <span>...</span>, keeping only the
+ *  attributes the chip needs - anything else on the source tag is dropped, so
+ *  a forged chip can't smuggle handlers or styles through "plain text" mode. */
+function plainMention(markup: string): string {
+  const open = /^<span\b[^>]*>/i.exec(markup)?.[0] ?? "";
+  const email =
+    /\bdata-email\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))/i.exec(open);
+  const raw = email?.[1] ?? email?.[2] ?? email?.[3] ?? "";
+  const inner = markup.slice(open.length, markup.length - "</span>".length);
+  const text = inner.replace(/<[^>]+>/g, "");
+  return (
+    `<span class="co-mention" contenteditable="false"` +
+    ` data-email="${escapeHtml(decodeEntities(raw))}">` +
+    `${escapeHtml(decodeEntities(text))}</span>`
+  );
+}
+
 /**
  * Strip every formatting construct from `html`, keeping the text and its line
  * structure. Tables, lists, quotes, headings, fonts, colors and inline styles
@@ -155,8 +180,8 @@ export function stripFormatting(html: string): string {
 
   s = s.replace(/<img\b[^>]*>/gi, (m) => keep(plainImg(m)));
   s = s.replace(
-    /<span\b[^>]*class="[^"]*co-mention[^"]*"[^>]*>[\s\S]*?<\/span>/gi,
-    (m) => keep(m),
+    /<span\b[^>]*\bclass\s*=\s*("[^"]*co-mention[^"]*"|'[^']*co-mention[^']*'|[^\s>]*co-mention[^\s>]*)[^>]*>[\s\S]*?<\/span>/gi,
+    (m) => keep(plainMention(m)),
   );
   s = s.replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (_, attrs: string, inner: string) => {
     const href = /\bhref\s*=\s*"([^"]*)"/i.exec(attrs)?.[1] ?? "";
