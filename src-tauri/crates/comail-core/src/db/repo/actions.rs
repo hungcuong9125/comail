@@ -57,6 +57,22 @@ pub fn enqueue(
     Ok(conn.last_insert_rowid())
 }
 
+/// Remote-identity payload for flag/label actions: where the message lives
+/// right now (folder, UID, UIDVALIDITY), so the executor can find it even
+/// after local moves. Same shape `apply_thread_action` enqueues for
+/// mark_read/mark_unread/star/label kinds.
+pub fn identity_payload(conn: &Connection, message_id: i64) -> Result<serde_json::Value> {
+    let row = super::messages::get_row(conn, message_id)?
+        .ok_or_else(|| crate::error::CoreError::NotFound("message for action".into()))?;
+    let validity = row
+        .folder_id
+        .map(|id| super::folders::get(conn, id))
+        .transpose()?
+        .flatten()
+        .and_then(|folder| folder.uidvalidity);
+    Ok(serde_json::json!({ "folderId": row.folder_id, "uid": row.uid, "uidValidity": validity }))
+}
+
 /// Due actions for one account, oldest first.
 pub fn due(conn: &Connection, account_id: i64, now: i64, limit: i64) -> Result<Vec<PendingAction>> {
     // cal_% actions belong to the CalDAV task, not the IMAP executor.
@@ -275,6 +291,43 @@ pub fn gc(conn: &Connection, older_than_ms: i64) -> Result<()> {
 mod tests {
     use super::*;
     use crate::db::testutil;
+
+    /// Pins the exact JSON contract flag/label actions rely on
+    /// (`remote_candidates` reads folderId/uid/uidValidity). lib.rs's
+    /// `action_identity_payload` builds the same shape for user actions;
+    /// this test is the drift guard between the two builders.
+    #[test]
+    fn identity_payload_matches_the_flag_action_shape() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        // seed_message stores uid = thread_id; folder 1 has no uidvalidity.
+        let (thread_id, msg_id) = testutil::seed_message(&conn, "a@b.c", "s", false);
+
+        let payload = identity_payload(&conn, msg_id).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "folderId": 1, "uid": thread_id, "uidValidity": null })
+        );
+
+        conn.execute("UPDATE folders SET uidvalidity = 42 WHERE id = 1", [])
+            .unwrap();
+        let payload = identity_payload(&conn, msg_id).unwrap();
+        assert_eq!(payload["uidValidity"], 42);
+
+        // No folder: every remote coordinate is null, keys still present.
+        conn.execute(
+            "UPDATE messages SET folder_id = NULL WHERE id = ?1",
+            [msg_id],
+        )
+        .unwrap();
+        let payload = identity_payload(&conn, msg_id).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "folderId": null, "uid": thread_id, "uidValidity": null })
+        );
+
+        assert!(identity_payload(&conn, 999_999).is_err());
+    }
 
     #[test]
     fn live_recovery_is_scoped_and_preserves_retry_and_remote_identity() {
