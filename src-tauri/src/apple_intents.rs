@@ -120,7 +120,7 @@ async fn handle(app: &AppHandle, request: &str) -> Value {
                 return reply(false, "What do you want to know about your email?");
             }
             let request_id = format!("siri-{}", std::process::id() as u64 ^ now_nanos());
-            match core.ai_ask(question, request_id).await {
+            match core.ai_ask(question, request_id, None).await {
                 Ok(result) => {
                     let answer = strip_citations(&result.answer);
                     json!({ "ok": true, "dialog": answer, "value": answer })

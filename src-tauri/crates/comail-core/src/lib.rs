@@ -862,6 +862,7 @@ impl Core {
         }
         self.cal_handles.write().await.remove(&account_id);
         self.contacts_handles.write().await.remove(&account_id);
+        self.tokens.forget(account_id).await;
         credentials::delete_all(account_id);
         self.db
             .write(move |conn| {
@@ -3732,7 +3733,7 @@ impl Core {
     /// most relevant to `query`, for few-shot voice imitation. Prefers semantic
     /// retrieval; falls back to recent sent mail when the index is empty.
     async fn voice_examples(&self, query: &str, k: usize) -> Result<Vec<(String, String)>> {
-        let hits = self.vector_hits(query, 40).await.unwrap_or_default();
+        let hits = self.vector_hits(query, 40, None).await.unwrap_or_default();
         let hit_ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
         self.db
             .read(move |conn| {
@@ -3788,7 +3789,7 @@ impl Core {
             if parsed.text.chars().count() < 3 {
                 Vec::new()
             } else {
-                self.vector_hits(&parsed.text, 200)
+                self.vector_hits(&parsed.text, 200, parsed.account_id)
                     .await
                     .unwrap_or_default()
             }
@@ -3851,8 +3852,14 @@ impl Core {
     /// Embed `text` as a query and return the top-`k` (message_id, score) hits
     /// from the in-memory index. Empty when no local model is loaded. Query
     /// embeddings are cached, so repeated or backspaced-over queries skip the
-    /// model forward pass entirely.
-    async fn vector_hits(&self, text: &str, k: usize) -> Result<Vec<(i64, f32)>> {
+    /// model forward pass entirely. `account_id` scopes the hits to one
+    /// account; `None` searches the whole index.
+    async fn vector_hits(
+        &self,
+        text: &str,
+        k: usize,
+        account_id: Option<i64>,
+    ) -> Result<Vec<(i64, f32)>> {
         let Some(embedder) = self.embed.embedder().await else {
             return Ok(Vec::new());
         };
@@ -3867,8 +3874,59 @@ impl Core {
                 v
             }
         };
+        // The index is global (no per-account partition): when scoped, fetch a
+        // deeper candidate pool so post-filtering still leaves ~k hits from
+        // the right account.
+        let pool = if account_id.is_some() {
+            k.saturating_mul(8).clamp(k, 2_000)
+        } else {
+            k
+        };
         let idx = self.embed.index.read().await;
-        Ok(idx.search(&qv, k))
+        let hits = idx.search(&qv, pool);
+        drop(idx);
+        match account_id {
+            None => Ok(hits),
+            Some(account) => self.scope_hits_to_account(hits, account, k).await,
+        }
+    }
+
+    /// Keep only vector hits whose message lives in `account` (score order and
+    /// count `k` preserved). The in-memory index stores message ids only, so
+    /// account scoping is a DB lookup; the ids are from our own index and safe
+    /// to inline like `repo::search`'s candidate queries do.
+    async fn scope_hits_to_account(
+        &self,
+        hits: Vec<(i64, f32)>,
+        account_id: i64,
+        k: usize,
+    ) -> Result<Vec<(i64, f32)>> {
+        if hits.is_empty() {
+            return Ok(hits);
+        }
+        let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+        let keep: HashSet<i64> = self
+            .db
+            .read(move |conn| {
+                let id_list = ids
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT id FROM visible_messages WHERE account_id = ?1 AND id IN ({id_list})"
+                ))?;
+                let set = stmt
+                    .query_map(rusqlite::params![account_id], |r| r.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<HashSet<i64>>>()?;
+                Ok::<_, CoreError>(set)
+            })
+            .await?;
+        Ok(hits
+            .into_iter()
+            .filter(|(id, _)| keep.contains(id))
+            .take(k)
+            .collect())
     }
 
     /// Pre-compute and cache the query embedding for `query` while the user is
@@ -3932,7 +3990,14 @@ impl Core {
     /// reformulate queries and read whole threads before answering. Every round
     /// streams. Falls back to a plain
     /// one-shot RAG answer if the model/endpoint doesn't support tool calling.
-    pub async fn ai_ask(&self, question: String, request_id: String) -> Result<AskResult> {
+    /// `account_id` scopes retrieval to one account (the sidebar filter);
+    /// `None` searches every account.
+    pub async fn ai_ask(
+        &self,
+        question: String,
+        request_id: String,
+        account_id: Option<i64>,
+    ) -> Result<AskResult> {
         const MAX_ROUNDS: usize = 6;
         let cfg = self.ai_config(Scenario::Ask).await?;
 
@@ -3942,7 +4007,7 @@ impl Core {
 
         // RAG seed: the model always starts from the best hybrid matches.
         let seed = if on_device { 4 } else { 8 };
-        let sources = self.retrieve_search(&question, seed).await?;
+        let sources = self.retrieve_search(&question, seed, account_id).await?;
         if sources.is_empty() {
             return Ok(AskResult {
                 answer: "I couldn't find anything relevant in your mailbox. \
@@ -4034,12 +4099,22 @@ impl Core {
                     for call in calls {
                         let (result, added) = match call.name.as_str() {
                             "search_inbox" => {
-                                self.run_search_inbox(&call.arguments, &mut sources, &reasoning)
-                                    .await
+                                self.run_search_inbox(
+                                    &call.arguments,
+                                    &mut sources,
+                                    account_id,
+                                    &reasoning,
+                                )
+                                .await
                             }
                             "read_email" => (
-                                self.run_read_email(&call.arguments, &sources, &reasoning)
-                                    .await,
+                                self.run_read_email(
+                                    &call.arguments,
+                                    &sources,
+                                    account_id,
+                                    &reasoning,
+                                )
+                                .await,
                                 0,
                             ),
                             other => (format!("Unknown tool: {other}"), 0),
@@ -4127,11 +4202,21 @@ impl Core {
     /// `subject:`/`is:`/`has:` keyword filters) hydrated to message details for
     /// citation. Powers both the Ask RAG seed and the agentic `search_inbox`
     /// tool, so the model can search by meaning, sender, recipient, and more.
-    async fn retrieve_search(&self, query: &str, k: usize) -> Result<Vec<MessageDetail>> {
-        let parsed = crate::search::parse(query);
+    /// `account_id` scopes every branch to one account; `None` searches all.
+    async fn retrieve_search(
+        &self,
+        query: &str,
+        k: usize,
+        account_id: Option<i64>,
+    ) -> Result<Vec<MessageDetail>> {
+        let mut parsed = crate::search::parse(query);
+        // The account filter is a query operator for the repo layer: it narrows
+        // the lexical branch and the semantic hits alike (see
+        // `repo::search::message_hits`).
+        parsed.account_id = account_id;
         // Semantic branch only carries meaning for queries of a few chars+.
         let vec_hits = if parsed.text.chars().count() >= 3 {
-            self.vector_hits(&parsed.text, 200)
+            self.vector_hits(&parsed.text, 200, account_id)
                 .await
                 .unwrap_or_default()
         } else {
@@ -4155,10 +4240,12 @@ impl Core {
     /// Execute a `search_inbox` tool call: run the search, append any *new*
     /// messages to `sources` with stable citation numbers, and return the
     /// excerpt block for the model plus how many new sources were added.
+    /// `account_id` keeps the tool inside the sidebar's account filter.
     async fn run_search_inbox(
         &self,
         arguments: &str,
         sources: &mut Vec<MessageDetail>,
+        account_id: Option<i64>,
         progress: &impl Fn(String),
     ) -> (String, usize) {
         let args: serde_json::Value =
@@ -4176,12 +4263,17 @@ impl Core {
         progress(format!("\nSearching \u{201c}{query}\u{201d}\n"));
         let limit = args["limit"].as_u64().unwrap_or(6).clamp(1, 8) as usize;
         let details = self
-            .retrieve_search(&query, limit)
+            .retrieve_search(&query, limit, account_id)
             .await
             .unwrap_or_default();
         let details: Vec<MessageDetail> = details
             .into_iter()
-            .filter(|d| !sources.iter().any(|s| s.id == d.id))
+            .filter(|d| {
+                // Retrieval is already account-scoped; the explicit check
+                // keeps another account's mail out even if that ever regresses.
+                account_id.is_none_or(|a| d.account_id == a)
+                    && !sources.iter().any(|s| s.id == d.id)
+            })
             .collect();
         let details = self.ensure_bodies(details).await;
 
@@ -4208,10 +4300,12 @@ impl Core {
 
     /// Execute a `read_email` tool call: the whole thread behind citation `n`,
     /// with full bodies (fetched now if they haven't downloaded yet).
+    /// `account_id` keeps the tool inside the sidebar's account filter.
     async fn run_read_email(
         &self,
         arguments: &str,
         sources: &[MessageDetail],
+        account_id: Option<i64>,
         progress: &impl Fn(String),
     ) -> String {
         let args: serde_json::Value =
@@ -4227,9 +4321,14 @@ impl Core {
         let Some(src) = n.checked_sub(1).and_then(|i| sources.get(i)) else {
             return format!("No excerpt [{n}]. Valid numbers are 1-{}.", sources.len());
         };
+        // Sources are account-scoped already, but never serve another
+        // account's content when a filter is set.
+        if account_id.is_some_and(|a| src.account_id != a) {
+            return format!("Excerpt [{n}] is outside the selected account.");
+        }
         progress(format!("\nReading \u{201c}{}\u{201d}\n", src.subject));
         let thread_id = src.thread_id;
-        let messages = match self
+        let mut messages = match self
             .db
             .read(move |conn| repo::messages::list_for_thread(conn, thread_id))
             .await
@@ -4237,6 +4336,12 @@ impl Core {
             Ok(m) if !m.is_empty() => m,
             _ => vec![src.clone()],
         };
+        if let Some(a) = account_id {
+            messages.retain(|m| m.account_id == a);
+            if messages.is_empty() {
+                messages = vec![src.clone()];
+            }
+        }
         let messages = self.ensure_bodies(messages).await;
         format!(
             "Full conversation for [{n}] (Subject: {}):\n\n{}",
@@ -6070,6 +6175,162 @@ mod trash_regression_tests {
             })
             .unwrap();
         assert_eq!(folder, 2);
+    }
+}
+
+#[cfg(test)]
+mod ask_scope_tests {
+    use super::*;
+    use crate::db::testutil;
+
+    /// A minimal `Core` over a fresh tempdir DB - enough to run the Ask
+    /// retrieval path (no actors, no embedder, no network).
+    async fn test_core() -> (Core, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::for_tests(root.path());
+        paths.ensure().unwrap();
+        let core = Core {
+            db: Db::open(&paths.db_file()).unwrap(),
+            bus: EventBus::new(),
+            paths: Arc::new(paths),
+            tokens: TokenProvider::new(),
+            handles: Arc::new(RwLock::new(HashMap::new())),
+            cal_handles: Arc::new(RwLock::new(HashMap::new())),
+            contacts_handles: Arc::new(RwLock::new(HashMap::new())),
+            attachment_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            embed: Arc::new(embed::EmbedState::new()),
+            oauth_cancel: Arc::new(tokio::sync::Notify::new()),
+            ui_ready: Arc::new(tokio::sync::Notify::new()),
+            ai_router_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mcp: Arc::new(mcp::McpManager::default()),
+        };
+        (core, root)
+    }
+
+    /// Two accounts, each with one indexed message sharing `sharedterm`.
+    /// Returns (account-1 message id, account-2 message id).
+    async fn seed_two_accounts(db: &Db) -> (i64, i64) {
+        db.write(|conn| {
+            testutil::seed_account(conn);
+            let (_, m1) = testutil::seed_message(conn, "a@one.dev", "sharedterm alpha", false);
+            repo::search::index_message(conn, m1)?;
+            // A body keeps `ensure_bodies` from kicking off (and waiting on)
+            // a network fetch in tests.
+            repo::messages::store_body(conn, m1, Some("alpha body"), None, None, false, None)?;
+            conn.execute(
+                "INSERT INTO accounts (id, email, provider, auth_kind, username,
+                 imap_host, imap_port, smtp_host, smtp_port, created_at)
+                 VALUES (2,'me2@test.dev','imap','password','me2','h',993,'h',587,0)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO folders (id, account_id, imap_name, role) VALUES (2,2,'INBOX','inbox')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO threads (id, account_id, subject_norm, unread_count, last_message_at)
+                 VALUES (99, 2, 'sharedterm beta', 1, 1000)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO messages (thread_id, account_id, folder_id, uid, message_id, subject,
+                 from_addr, date, is_read, is_automated, is_draft, is_outgoing)
+                 VALUES (99, 2, 2, 99, 'mid-99', 'sharedterm beta', 'b@two.dev', 1000, 0, 0, 0, 0)",
+                [],
+            )?;
+            let m2 = conn.last_insert_rowid();
+            repo::search::index_message(conn, m2)?;
+            repo::messages::store_body(conn, m2, Some("beta body"), None, None, false, None)?;
+            Ok::<_, CoreError>((m1, m2))
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn retrieve_search_scopes_keyword_hits_to_the_account() {
+        let (core, _tmp) = test_core().await;
+        let (m1, m2) = seed_two_accounts(&core.db).await;
+
+        let all = core.retrieve_search("sharedterm", 10, None).await.unwrap();
+        assert!(all.iter().any(|m| m.id == m1));
+        assert!(all.iter().any(|m| m.id == m2));
+
+        let one = core
+            .retrieve_search("sharedterm", 10, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(one.iter().map(|m| m.id).collect::<Vec<_>>(), vec![m1]);
+        let two = core
+            .retrieve_search("sharedterm", 10, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(two.iter().map(|m| m.id).collect::<Vec<_>>(), vec![m2]);
+    }
+
+    #[tokio::test]
+    async fn vector_hit_scoping_drops_other_accounts() {
+        let (core, _tmp) = test_core().await;
+        let (m1, m2) = seed_two_accounts(&core.db).await;
+
+        let hits = vec![(m2, 0.9f32), (m1, 0.8)];
+        let one = core
+            .scope_hits_to_account(hits.clone(), 1, 10)
+            .await
+            .unwrap();
+        assert_eq!(one, vec![(m1, 0.8)]);
+        let two = core.scope_hits_to_account(hits, 2, 10).await.unwrap();
+        assert_eq!(two, vec![(m2, 0.9)]);
+        // Ids not in the DB at all are dropped too.
+        let gone = core
+            .scope_hits_to_account(vec![(999_999, 0.7), (m1, 0.6)], 1, 10)
+            .await
+            .unwrap();
+        assert_eq!(gone, vec![(m1, 0.6)]);
+    }
+
+    #[tokio::test]
+    async fn search_inbox_tool_respects_account_scope() {
+        let (core, _tmp) = test_core().await;
+        let (m1, _m2) = seed_two_accounts(&core.db).await;
+        let mut sources = Vec::new();
+        let noop = |_| {};
+        let (text, added) = core
+            .run_search_inbox(r#"{"query":"sharedterm"}"#, &mut sources, Some(1), &noop)
+            .await;
+        assert_eq!(added, 1);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, m1);
+        assert!(!text.contains("sharedterm beta"));
+    }
+
+    #[tokio::test]
+    async fn read_email_tool_refuses_out_of_scope_source() {
+        let (core, _tmp) = test_core().await;
+        let (_m1, m2) = seed_two_accounts(&core.db).await;
+        let mut sources = core
+            .retrieve_search("sharedterm", 10, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+        // A foreign-account detail slipped into the citation list must not be
+        // readable while the filter is on (scoped retrieval can't produce one,
+        // but the guard holds even if it ever did).
+        let foreign = core
+            .db
+            .read(move |conn| repo::messages::detail(conn, m2))
+            .await
+            .unwrap();
+        sources.push(foreign);
+        let noop = |_| {};
+        let out = core
+            .run_read_email(r#"{"n":2}"#, &sources, Some(1), &noop)
+            .await;
+        assert!(out.contains("outside the selected account"));
+        let out = core
+            .run_read_email(r#"{"n":1}"#, &sources, Some(1), &noop)
+            .await;
+        assert!(out.contains("sharedterm alpha"));
     }
 }
 
