@@ -950,6 +950,69 @@ mod selective_section_tests {
     }
 
     #[test]
+    fn sanitize_drops_unsafe_link_hrefs() {
+        // data:, cid: and javascript: hrefs used to survive and could
+        // navigate the app window; only real link schemes stay.
+        let out = sanitize_html(concat!(
+            r#"<a href="data:text/html;base64,PHNjcmlwdD4=">a</a>"#,
+            r#"<a href="cid:logo@x">b</a>"#,
+            r#"<a href="javascript:alert(1)">c</a>"#,
+            r#"<a href="tel:+15551234">d</a>"#,
+            r#"<a href="file:///etc/passwd">e</a>"#,
+        ));
+        for tag in [">a<", ">b<", ">c<", ">d<", ">e<"] {
+            assert!(out.contains(tag), "anchor text kept: {out}");
+        }
+        assert!(!out.contains("href"), "{out}");
+    }
+
+    #[test]
+    fn sanitize_keeps_real_links_and_anchors() {
+        let out = sanitize_html(concat!(
+            r#"<a href="https://example.com">web</a>"#,
+            r#"<a href="http://example.com">web2</a>"#,
+            r#"<a href="mailto:a@b.c">mail</a>"#,
+            r##"<a href="#quoted">jump</a>"##,
+        ));
+        for kept in [
+            r#"href="https://example.com""#,
+            r#"href="http://example.com""#,
+            r#"href="mailto:a@b.c""#,
+            r##"href="#quoted""##,
+        ] {
+            assert!(out.contains(kept), "{kept} missing from {out}");
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_safe_img_src_but_drops_active_data_uris() {
+        let out = sanitize_html(concat!(
+            r#"<img src="data:image/png;base64,AAAA">"#,
+            r#"<img src="cid:logo@x">"#,
+            r#"<img src="https://cdn.example.com/x.png">"#,
+            r#"<img src="data:text/html;base64,PGI+">"#,
+            r#"<img src="data:image/svg+xml;base64,PHN2Zz4=">"#,
+            r#"<img src="data:image/bmp;base64,AAAA">"#,
+            r#"<img src="javascript:alert(1)">"#,
+        ));
+        for kept in [
+            r#"src="data:image/png;base64,AAAA""#,
+            r#"src="cid:logo@x""#,
+            r#"src="https://cdn.example.com/x.png""#,
+        ] {
+            assert!(out.contains(kept), "{kept} missing from {out}");
+        }
+        for dropped in [
+            "data:text/html",
+            "data:image/svg",
+            "data:image/bmp",
+            "javascript:",
+        ] {
+            assert!(!out.contains(dropped), "{dropped} should be gone: {out}");
+        }
+    }
+
+    #[test]
     fn decodes_charset_and_sanitizes_html_sections() {
         let plain = decode_text_section(
             TextSectionKind::Plain,
@@ -1173,9 +1236,62 @@ static SANITIZER: Lazy<ammonia::Builder<'static>> = Lazy::new(|| {
     .url_schemes(std::collections::HashSet::from([
         "http", "https", "mailto", "cid", "data",
     ]))
+    // `url_schemes` is global across URL attributes, so `data:` and `cid:`
+    // must stay listed for inline images. The per-attribute rules below keep
+    // them where they belong: `a[href]` holds only real link targets (a
+    // `data:text/html` href used to survive and could navigate the app
+    // window); `img[src]` holds `cid:` and raster `data:` URIs only.
+    .attribute_filter(|element, attribute, value| {
+        let allowed = match (element, attribute) {
+            ("a", "href") => allowed_link_href(value),
+            ("img", "src") => allowed_img_src(value),
+            _ => true,
+        };
+        allowed.then_some(std::borrow::Cow::Borrowed(value))
+    })
     .link_rel(Some("noopener noreferrer"));
     b
 });
+
+/// `a[href]` keep-list: http(s) and mailto only, plus relative references
+/// (in-document `#anchor` links). The scheme allow-list alone cannot express
+/// this because `data:`/`cid:` have to remain enabled for `img[src]`.
+fn allowed_link_href(value: &str) -> bool {
+    match url::Url::parse(value) {
+        Ok(url) => matches!(url.scheme(), "http" | "https" | "mailto"),
+        Err(_) => true,
+    }
+}
+
+/// `img[src]` keep-list: http(s), `cid:` references (resolved to `data:` by
+/// [`rewrite_cid_src`]) and raster `data:` image URIs. SVG is excluded on
+/// purpose - unlike the raster types it is active XML content.
+fn allowed_img_src(value: &str) -> bool {
+    match url::Url::parse(value) {
+        Ok(url) => match url.scheme() {
+            "http" | "https" | "cid" => true,
+            "data" => allowed_data_image_src(value),
+            _ => false,
+        },
+        Err(_) => true,
+    }
+}
+
+/// True only for `data:` URIs whose media type is a raster image we render:
+/// png, jpeg, gif or webp. `data:text/html`, `data:image/svg+xml` and every
+/// non-image payload fail the check.
+fn allowed_data_image_src(value: &str) -> bool {
+    let value = value.trim_start();
+    if value.len() < 5 || !value[..5].eq_ignore_ascii_case("data:") {
+        return false;
+    }
+    let meta = value[5..].split(',').next().unwrap_or_default();
+    let mime = meta.split(';').next().unwrap_or_default().trim();
+    matches!(
+        mime.to_ascii_lowercase().as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
+}
 
 pub fn sanitize_html(html: &str) -> String {
     SANITIZER.clean(html).to_string()
@@ -1230,6 +1346,51 @@ pub fn rewrite_cid_src(html: &str, map: &std::collections::HashMap<String, Strin
         .into_owned()
 }
 
+/// Raster image media types a `cid:` attachment may be inlined under as a
+/// `data:` URI - the same set [`allowed_data_image_src`] lets survive on
+/// `img[src]`. Returns the canonical type to embed, or None when the part is
+/// anything else (SVG, HTML, arbitrary octet-stream), in which case the
+/// `cid:` reference is left unresolved rather than inlined.
+pub fn inline_image_mime(mime_type: &str) -> Option<&'static str> {
+    match mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => Some("image/png"),
+        "image/jpeg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Largest single part inlined as a `data:` URI. Checked against file
+/// metadata BEFORE the part is read into memory.
+pub const INLINE_IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// Total raw bytes one inlining pass may embed across all parts.
+pub const INLINE_IMAGES_BUDGET_BYTES: u64 = 15 * 1024 * 1024;
+
+/// Running byte total for one cid:→data: inlining pass. `try_reserve` admits
+/// a part only when it fits the per-image cap and the call budget.
+#[derive(Debug, Default)]
+pub struct InlineImageBudget {
+    used: u64,
+}
+
+impl InlineImageBudget {
+    pub fn try_reserve(&mut self, bytes: u64) -> bool {
+        if bytes > INLINE_IMAGE_MAX_BYTES || self.used + bytes > INLINE_IMAGES_BUDGET_BYTES {
+            return false;
+        }
+        self.used += bytes;
+        true
+    }
+}
+
 #[cfg(test)]
 mod cid_tests {
     use super::{normalize_cid, rewrite_cid_src};
@@ -1260,6 +1421,55 @@ mod cid_tests {
         );
         let out = rewrite_cid_src(r#"<img src="cid:abc@host">"#, &map);
         assert!(out.contains("data:image/gif;base64,BBBB"));
+    }
+
+    #[test]
+    fn inline_image_mime_allowlist() {
+        use super::inline_image_mime;
+        // Raster types survive, normalized to canonical lowercase.
+        for (input, expected) in [
+            ("image/png", Some("image/png")),
+            ("IMAGE/JPEG", Some("image/jpeg")),
+            (" image/gif ", Some("image/gif")),
+            ("image/webp", Some("image/webp")),
+            ("image/png; name=\"logo.png\"", Some("image/png")),
+        ] {
+            assert_eq!(inline_image_mime(input), expected, "input: {input}");
+        }
+        // Everything else is left as an unresolved cid: reference.
+        for input in [
+            "image/svg+xml",
+            "text/html",
+            "application/octet-stream",
+            "application/pdf",
+            "image/bmp",
+            "image",
+            "",
+        ] {
+            assert_eq!(inline_image_mime(input), None, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn inline_image_budget_caps_per_image_and_total() {
+        use super::{INLINE_IMAGE_MAX_BYTES, InlineImageBudget};
+        let mut budget = InlineImageBudget::default();
+        // Over the per-image cap: refused without consuming budget.
+        assert!(!budget.try_reserve(INLINE_IMAGE_MAX_BYTES + 1));
+        // Three 5 MB images exactly fill the 15 MB call budget.
+        for _ in 0..3 {
+            assert!(budget.try_reserve(INLINE_IMAGE_MAX_BYTES));
+        }
+        // Anything more - even a single byte - exceeds the total.
+        assert!(!budget.try_reserve(1));
+        // The total budget, not just the per-image cap, gates admission:
+        // 12 MB used leaves 3 MB, so a 4 MB part is refused.
+        let mut budget = InlineImageBudget::default();
+        for _ in 0..3 {
+            assert!(budget.try_reserve(4 * 1024 * 1024));
+        }
+        assert!(!budget.try_reserve(4 * 1024 * 1024));
+        assert!(budget.try_reserve(3 * 1024 * 1024));
     }
 }
 
