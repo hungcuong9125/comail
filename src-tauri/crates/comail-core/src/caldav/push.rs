@@ -90,9 +90,17 @@ async fn push_row(
         .map(|a| a.email);
     let body = build_put_body(row, self_email.as_deref());
 
+    // RFC 4791: the resource is iCalendar, not the XML default the transport
+    // uses for PROPFIND/REPORT.
     let headers: Vec<(&str, &str)> = match &if_match {
-        Some(etag) => vec![("If-Match", etag.as_str())],
-        None => vec![("If-None-Match", "*")],
+        Some(etag) => vec![
+            ("If-Match", etag.as_str()),
+            ("Content-Type", "text/calendar; charset=utf-8"),
+        ],
+        None => vec![
+            ("If-None-Match", "*"),
+            ("Content-Type", "text/calendar; charset=utf-8"),
+        ],
     };
     let mut resp = t
         .request("PUT", &abs_url, None, &headers, Some(body.clone()))
@@ -550,6 +558,11 @@ mod tests {
             headers[0].get("If-Match").map(String::as_str),
             Some("\"e0\"")
         );
+        assert_eq!(
+            headers[0].get("Content-Type").map(String::as_str),
+            Some("text/calendar; charset=utf-8"),
+            "PUT must declare the iCalendar body type (RFC 4791)"
+        );
         drop(seen);
         drop(headers);
 
@@ -607,6 +620,11 @@ mod tests {
         assert_eq!(
             headers[0].get("If-None-Match").map(String::as_str),
             Some("*")
+        );
+        assert_eq!(
+            headers[0].get("Content-Type").map(String::as_str),
+            Some("text/calendar; charset=utf-8"),
+            "create PUT must declare the iCalendar body type"
         );
         drop(headers);
         let row = db

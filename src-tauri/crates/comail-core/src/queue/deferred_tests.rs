@@ -261,3 +261,32 @@ fn missing_local_uid_defers_instead_of_completing() {
     ));
     assert_eq!(local_remote_location(1, Some(2), Some(3)).unwrap(), (2, 3));
 }
+
+#[test]
+fn smtp_reply_class_decides_send_permanence() {
+    // lettre tags each server reply with its own class: "permanent error
+    // (5xx)" means retrying cannot help and is terminal for ANY code, not
+    // just the 550/553 the substring check used to recognise.
+    for msg in [
+        "permanent error (551): 5.7.1 User not local",
+        "permanent error (552): 5.3.4 Message exceeds fixed size limit",
+        "permanent error (554): 5.7.1 delivery not authorized",
+    ] {
+        assert!(
+            terminal_failure("send", 1, &CoreError::Smtp(msg.into())),
+            "5xx permanent must fail terminally: {msg}"
+        );
+    }
+    // Its 4xx counterpart retries on the existing backoff until the cap.
+    for msg in [
+        "transient error (421): 4.7.0 Try again later",
+        "transient error (451): 4.7.1 Greylisting in action",
+    ] {
+        let error = CoreError::Smtp(msg.into());
+        assert!(!terminal_failure("send", 1, &error), "{msg}");
+        assert!(
+            terminal_failure("send", MAX_ATTEMPTS, &error),
+            "4xx transient still fails at the cap: {msg}"
+        );
+    }
+}

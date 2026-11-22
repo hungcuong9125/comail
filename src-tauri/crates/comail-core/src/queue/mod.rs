@@ -559,8 +559,16 @@ fn needs_fresh_session(error: &CoreError) -> bool {
 }
 
 fn is_permanent(msg: &str) -> bool {
-    // IMAP tagged NO responses and SMTP 5xx are not going to succeed on retry.
-    msg.contains("NO ") || msg.contains("550") || msg.contains("553") || msg.contains("bad ")
+    // IMAP tagged NO responses and SMTP 5xx are not going to succeed on
+    // retry. For lettre replies the message carries lettre's own reply
+    // class - "permanent error (5xx)" is terminal for any code (551/552/554
+    // included), while its "transient error (4xx)" counterpart retries on
+    // the normal backoff until the attempt cap.
+    msg.contains("permanent error (")
+        || msg.contains("NO ")
+        || msg.contains("550")
+        || msg.contains("553")
+        || msg.contains("bad ")
 }
 
 fn is_connection_failure(msg: &str) -> bool {
