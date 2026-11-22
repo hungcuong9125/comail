@@ -13,6 +13,7 @@ use crate::error::{CoreError, Result};
 use crate::events::EventBus;
 use crate::models::{Provider, now_ms};
 use crate::oauth::tokens::TokenProvider;
+use crate::sync::engine::AccountTasks;
 
 use super::http::{DavAuth, HttpTransport};
 use super::sync::sync_account;
@@ -24,25 +25,40 @@ const MAX_ATTEMPTS: i64 = 8;
 pub struct CalTaskHandle {
     pub account_id: i64,
     tx: mpsc::UnboundedSender<()>,
+    /// Shared stop flag + join handle for the poll task.
+    tasks: std::sync::Arc<AccountTasks>,
 }
 
 impl CalTaskHandle {
     pub fn nudge(&self) {
         let _ = self.tx.send(());
     }
+
+    /// Signal the task to stop, then wait for it until `deadline`;
+    /// stragglers are aborted. See [`AccountTasks::stop_and_join`].
+    pub async fn stop_tasks(&self, deadline: tokio::time::Instant) {
+        self.tasks.stop_and_join(deadline).await;
+    }
 }
 
 pub fn spawn(db: Db, bus: EventBus, tokens: TokenProvider, account_id: i64) -> CalTaskHandle {
     let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-    let handle = CalTaskHandle { account_id, tx };
-    tokio::spawn(async move {
+    let tasks = std::sync::Arc::new(AccountTasks::new());
+    let handle = CalTaskHandle {
+        account_id,
+        tx,
+        tasks: tasks.clone(),
+    };
+    let mut stop = tasks.subscribe();
+    tasks.track(tokio::spawn(async move {
         loop {
             let woke = tokio::select! {
+                _ = stop.changed() => break,
                 m = rx.recv() => m.is_some(),
                 _ = tokio::time::sleep(Duration::from_secs(POLL_SECS)) => true,
             };
-            if !woke {
-                break; // handle dropped: account removed / calendar disconnected
+            if !woke || *stop.borrow() {
+                break; // handle dropped / stopped: account removed / disconnected
             }
             // Drain coalesced nudges.
             while rx.try_recv().is_ok() {}
@@ -68,7 +84,7 @@ pub fn spawn(db: Db, bus: EventBus, tokens: TokenProvider, account_id: i64) -> C
             }
         }
         tracing::debug!("caldav task for account {account_id} stopped");
-    });
+    }));
     handle
 }
 

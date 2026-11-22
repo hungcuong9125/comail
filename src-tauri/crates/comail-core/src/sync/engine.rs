@@ -74,6 +74,91 @@ pub enum SyncCmd {
     Shutdown,
 }
 
+/// Stop signal + join handles for one account's background tasks. Every task
+/// spawned for the account receives a `watch::Receiver<bool>` cloned from
+/// `subscribe()` and exits when the flag fires (or when the sender is
+/// dropped, which happens when the owning handle is dropped). The
+/// `JoinHandle`s are kept so teardown can wait for the tasks - bounded - and
+/// abort whatever is still parked in a network call.
+pub struct AccountTasks {
+    stop: tokio::sync::watch::Sender<bool>,
+    joins: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Default for AccountTasks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AccountTasks {
+    pub fn new() -> Self {
+        AccountTasks {
+            stop: tokio::sync::watch::channel(false).0,
+            joins: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A receiver each spawned task selects on at its await points.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
+    /// Register a task's JoinHandle so `stop_and_join` can wait for it.
+    /// Finished handles are reaped here so a long-lived account does not
+    /// grow the list (e.g. backfill-pool workers tracked per round).
+    pub fn track(&self, join: tokio::task::JoinHandle<()>) {
+        let mut joins = self.joins.lock().unwrap();
+        joins.retain(|j| !j.is_finished());
+        joins.push(join);
+    }
+
+    /// Set the shared stop flag. Tasks observe it at their next await point;
+    /// dropping the sender (handle dropped) stops them too.
+    pub fn signal_stop(&self) {
+        self.stop.send_replace(true);
+    }
+
+    /// True once every tracked handle reports finished - including ones that
+    /// had to be aborted.
+    #[doc(hidden)]
+    pub fn is_finished(&self) -> bool {
+        self.joins.lock().unwrap().iter().all(|j| j.is_finished())
+    }
+
+    /// Signal the stop flag, then wait for every tracked task until
+    /// `deadline` (shared across callers so the whole teardown stays
+    /// bounded). A task still running at the deadline - typically parked in
+    /// a connect/TLS handshake to a dead server - is aborted and re-awaited
+    /// so this never returns with work still in flight.
+    pub async fn stop_and_join(&self, deadline: tokio::time::Instant) {
+        self.signal_stop();
+        // A tracked task may register a child while it unwinds (the backfill
+        // pool tracks each worker it spawns), so drain in passes: anything
+        // pushed during one pass is awaited in the next.
+        loop {
+            let mut joins = std::mem::take(&mut *self.joins.lock().unwrap());
+            let mut waited = false;
+            for join in joins.iter_mut() {
+                // A handle already awaited in an earlier pass panics if
+                // polled again; only unfinished ones still need the wait.
+                if join.is_finished() {
+                    continue;
+                }
+                waited = true;
+                if tokio::time::timeout_at(deadline, &mut *join).await.is_err() {
+                    join.abort();
+                    let _ = join.await;
+                }
+            }
+            self.joins.lock().unwrap().append(&mut joins);
+            if !waited {
+                break;
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AccountHandle {
     pub account_id: i64,
@@ -82,7 +167,8 @@ pub struct AccountHandle {
     /// message never waits behind a long bulk-sync cycle on the main actor.
     body_tx: mpsc::UnboundedSender<PriorityFetchCmd>,
     action_tx: mpsc::UnboundedSender<()>,
-    action_stop: tokio::sync::watch::Sender<bool>,
+    /// Shared stop flag + join handles for the account's sync tasks.
+    tasks: Arc<AccountTasks>,
 }
 
 #[derive(Debug)]
@@ -105,7 +191,7 @@ impl AccountHandle {
                 let _ = self.action_tx.send(());
             }
             SyncCmd::Shutdown => {
-                self.action_stop.send_replace(true);
+                self.tasks.signal_stop();
                 let _ = self.tx.send(SyncCmd::Shutdown);
             }
             other => {
@@ -142,6 +228,18 @@ impl AccountHandle {
         .map_err(|_| CoreError::Other("attachment reader stopped".into()))?
         .map_err(CoreError::Other)
     }
+
+    /// Signal every task of this account to stop, then wait for them until
+    /// `deadline`; stragglers are aborted. See [`AccountTasks::stop_and_join`].
+    pub async fn stop_tasks(&self, deadline: tokio::time::Instant) {
+        self.tasks.stop_and_join(deadline).await;
+    }
+
+    /// True once all tracked task handles report finished.
+    #[doc(hidden)]
+    pub fn tasks_finished(&self) -> bool {
+        self.tasks.is_finished()
+    }
 }
 
 #[derive(Clone)]
@@ -158,32 +256,52 @@ pub fn spawn_account(ctx: SyncCtx, config: AccountConfig) -> AccountHandle {
     let (pool_tx, pool_rx) = mpsc::unbounded_channel();
     let (hist_tx, hist_rx) = mpsc::unbounded_channel();
     let (action_tx, action_rx) = mpsc::unbounded_channel();
-    let (action_stop, action_stopped) = tokio::sync::watch::channel(false);
-    let action_lease = mutation_lease(&ctx.paths, config.id, action_stop.clone());
-    tokio::spawn(run_mutation_worker(
+    let tasks = Arc::new(AccountTasks::new());
+    // A replacement spawn for the same account id signals the previous
+    // task set's stop flag, so no two task sets ever share an account.
+    let action_lease = mutation_lease(&ctx.paths, config.id, tasks.stop.clone());
+    tasks.track(tokio::spawn(run_mutation_worker(
         ctx.clone(),
         config.clone(),
         action_rx,
-        action_stopped,
+        tasks.subscribe(),
         action_lease,
-    ));
+    )));
     let handle = AccountHandle {
         account_id: config.id,
         tx,
         body_tx,
         action_tx,
-        action_stop,
+        tasks: tasks.clone(),
     };
-    tokio::spawn(run_actor(
+    tasks.track(tokio::spawn(run_actor(
         ctx.clone(),
         config.clone(),
         rx,
         pool_tx.clone(),
         hist_tx,
-    ));
-    tokio::spawn(run_body_fetcher(ctx.clone(), config.clone(), body_rx));
-    tokio::spawn(run_backfill_pool(ctx.clone(), config.clone(), pool_rx));
-    tokio::spawn(run_history_backfill(ctx, config, hist_rx, pool_tx));
+        tasks.subscribe(),
+    )));
+    tasks.track(tokio::spawn(run_body_fetcher(
+        ctx.clone(),
+        config.clone(),
+        body_rx,
+        tasks.subscribe(),
+    )));
+    tasks.track(tokio::spawn(run_backfill_pool(
+        ctx.clone(),
+        config.clone(),
+        pool_rx,
+        tasks.subscribe(),
+        tasks.clone(),
+    )));
+    tasks.track(tokio::spawn(run_history_backfill(
+        ctx,
+        config,
+        hist_rx,
+        pool_tx,
+        tasks.subscribe(),
+    )));
     handle
 }
 
@@ -262,13 +380,14 @@ mod mutation_worker_tests {
         let (tx, mut sync_rx) = mpsc::unbounded_channel();
         let (body_tx, _body_rx) = mpsc::unbounded_channel();
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
-        let (action_stop, stopped) = tokio::sync::watch::channel(false);
+        let tasks = Arc::new(AccountTasks::new());
+        let stopped = tasks.subscribe();
         let handle = AccountHandle {
             account_id: 1,
             tx,
             body_tx,
             action_tx,
-            action_stop,
+            tasks,
         };
         handle.send(SyncCmd::RunActions);
         assert!(sync_rx.try_recv().is_err());
@@ -283,13 +402,12 @@ mod mutation_worker_tests {
         let (tx, _sync_rx) = mpsc::unbounded_channel();
         let (body_tx, _body_rx) = mpsc::unbounded_channel();
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
-        let (action_stop, _stopped) = tokio::sync::watch::channel(false);
         let handle = AccountHandle {
             account_id: 1,
             tx,
             body_tx,
             action_tx,
-            action_stop,
+            tasks: Arc::new(AccountTasks::new()),
         };
         // Reauth sends SyncNow; a worker paused on auth waits only for a nudge.
         handle.send(SyncCmd::SyncNow { complete: None });
@@ -728,14 +846,21 @@ async fn run_body_fetcher(
     ctx: SyncCtx,
     config: AccountConfig,
     mut rx: mpsc::UnboundedReceiver<PriorityFetchCmd>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let account_id = config.id;
     let mut session: Option<Session> = None;
     let mut deferred = std::collections::VecDeque::new();
     loop {
+        if *stop.borrow() {
+            break;
+        }
         let command = match deferred.pop_front() {
             Some(command) => command,
-            None => match rx.recv().await {
+            None => match tokio::select! {
+                _ = stop.changed() => None,
+                command = rx.recv() => command,
+            } {
                 Some(command) => command,
                 None => break,
             },
@@ -1100,12 +1225,30 @@ fn route_wait_cmd(
     }
 }
 
+/// Receives the next actor command, returning `None` early when the account
+/// is being torn down (the shared stop flag fired or its sender dropped).
+/// `None` routes through [`route_wait_cmd`] exactly like a closed command
+/// channel, so teardown needs no separate protocol.
+async fn recv_cmd(
+    rx: &mut mpsc::UnboundedReceiver<SyncCmd>,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+) -> Option<SyncCmd> {
+    if *stop.borrow_and_update() {
+        return None;
+    }
+    tokio::select! {
+        _ = stop.changed() => None,
+        cmd = rx.recv() => cmd,
+    }
+}
+
 async fn run_actor(
     ctx: SyncCtx,
     config: AccountConfig,
     mut rx: mpsc::UnboundedReceiver<SyncCmd>,
     pool_tx: mpsc::UnboundedSender<()>,
     hist_tx: mpsc::UnboundedSender<()>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let account_id = config.id;
     tracing::debug!(account_id, "sync actor started");
@@ -1122,6 +1265,16 @@ async fn run_actor(
     let mut cycle_due;
 
     loop {
+        if *stop.borrow() {
+            // Account removed/replaced mid-flight; leave before touching
+            // anything else. A straggler past this point still cannot write:
+            // removal waits for this task's JoinHandle (or aborts it) before
+            // the account row and mail directory are deleted.
+            if let Some(session) = session.take() {
+                imap::logout(session).await;
+            }
+            return;
+        }
         // 1. Ensure a connection.
         if session.is_none() {
             match connect(&ctx, &config).await {
@@ -1158,7 +1311,7 @@ async fn run_actor(
                         let _ = waiter.send(Err("authentication required".into()));
                     }
                     // Wait for an external nudge before retrying auth.
-                    match route_wait_cmd(rx.recv().await, &mut sync_waiters) {
+                    match route_wait_cmd(recv_cmd(&mut rx, &mut stop).await, &mut sync_waiters) {
                         WaitStep::Quit => return,
                         _ => continue,
                     }
@@ -1176,7 +1329,7 @@ async fn run_actor(
                     // Backoff, but wake early on commands.
                     let wait = std::time::Duration::from_secs(backoff_secs);
                     backoff_secs = (backoff_secs * 2).min(300);
-                    match tokio::time::timeout(wait, rx.recv()).await {
+                    match tokio::time::timeout(wait, recv_cmd(&mut rx, &mut stop)).await {
                         Err(_) => continue,
                         Ok(cmd) => match route_wait_cmd(cmd, &mut sync_waiters) {
                             WaitStep::Quit => return,
@@ -1322,7 +1475,14 @@ async fn run_actor(
                                 max_secs = max.as_secs(),
                                 "receive: waiting in IDLE for new mail",
                             );
-                            match imap::idle_wait(s, &mut rx, max).await {
+                            let idle_result = tokio::select! {
+                                // Stop fires without going through the
+                                // command channel; the in-flight IDLE future
+                                // (and its session) is dropped here.
+                                _ = stop.changed() => return,
+                                outcome = imap::idle_wait(s, &mut rx, max) => outcome,
+                            };
+                            match idle_result {
                                 Ok((s, outcome)) => {
                                     session = Some(s);
                                     match outcome {
@@ -1391,7 +1551,7 @@ async fn run_actor(
                     // a full cycle so the inbox lands promptly.
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(IDLE_FALLBACK_SECS),
-                        rx.recv(),
+                        recv_cmd(&mut rx, &mut stop),
                     )
                     .await
                     {
@@ -1430,7 +1590,7 @@ async fn run_actor(
                 cycle_due
             };
             loop {
-                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                match tokio::time::timeout_at(deadline, recv_cmd(&mut rx, &mut stop)).await {
                     Err(_) => {
                         // Timer fired: next iteration runs a full cycle.
                         break;
@@ -2662,13 +2822,16 @@ async fn run_history_backfill(
     config: AccountConfig,
     mut rx: mpsc::UnboundedReceiver<()>,
     pool_tx: mpsc::UnboundedSender<()>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let account_id = config.id;
     let mut session: Option<Session> = None;
     loop {
-        if let Ok(None) =
-            tokio::time::timeout(std::time::Duration::from_secs(CYCLE_SECS), rx.recv()).await
-        {
+        let wake = tokio::select! {
+            _ = stop.changed() => return,
+            wake = tokio::time::timeout(std::time::Duration::from_secs(CYCLE_SECS), rx.recv()) => wake,
+        };
+        if let Ok(None) = wake {
             return; // channel closed: account removed / shutdown
         }
         while rx.try_recv().is_ok() {} // coalesce piled-up nudges
@@ -2709,6 +2872,9 @@ async fn run_history_backfill(
             });
 
             for folder in ordered {
+                if *stop.borrow() {
+                    return; // account is being torn down
+                }
                 if folder.role.as_deref() == Some(roles::ALL) && config.provider != Provider::Gmail
                 {
                     continue;
@@ -4203,7 +4369,11 @@ mod content_batch_tests {
             .unwrap();
         // All work is durably deferred: drain completes without connecting or
         // fabricating a generic no-progress protocol failure.
-        drain_missing_bodies(&ctx, &config).await.unwrap();
+        let tasks = Arc::new(AccountTasks::new());
+        let stop = tasks.subscribe();
+        drain_missing_bodies(&ctx, &config, &stop, &tasks)
+            .await
+            .unwrap();
         assert_eq!(content_retry_delay_ms(0), 60_000);
         assert_eq!(content_retry_delay_ms(1), 120_000);
         assert_eq!(content_retry_delay_ms(i64::MAX), 3_600_000);
@@ -4421,17 +4591,21 @@ async fn run_backfill_pool(
     ctx: SyncCtx,
     config: AccountConfig,
     mut rx: mpsc::UnboundedReceiver<()>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    tasks: Arc<AccountTasks>,
 ) {
     let account_id = config.id;
     loop {
-        if let Ok(None) =
-            tokio::time::timeout(std::time::Duration::from_secs(CYCLE_SECS), rx.recv()).await
-        {
+        let wake = tokio::select! {
+            _ = stop.changed() => return,
+            wake = tokio::time::timeout(std::time::Duration::from_secs(CYCLE_SECS), rx.recv()) => wake,
+        };
+        if let Ok(None) = wake {
             return; // channel closed: account removed / shutdown
         }
         // Coalesce nudges that piled up while the previous drain ran.
         while rx.try_recv().is_ok() {}
-        if let Err(e) = drain_missing_bodies(&ctx, &config).await {
+        if let Err(e) = drain_missing_bodies(&ctx, &config, &stop, &tasks).await {
             tracing::warn!(account_id, error = %e, "body backfill: drain failed");
         }
     }
@@ -4457,7 +4631,12 @@ fn background_body_candidates(
 /// parallel connections. Every settled chunk is visited once per drain, even
 /// when concurrent moves/readers make it stale. Real transport failures abort;
 /// content failures keep durable retry deadlines instead of spinning.
-async fn drain_missing_bodies(ctx: &SyncCtx, config: &AccountConfig) -> Result<()> {
+async fn drain_missing_bodies(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    stop: &tokio::sync::watch::Receiver<bool>,
+    tasks: &Arc<AccountTasks>,
+) -> Result<()> {
     use std::collections::{HashSet, VecDeque};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4468,6 +4647,9 @@ async fn drain_missing_bodies(ctx: &SyncCtx, config: &AccountConfig) -> Result<(
     let mut did_work = false;
 
     loop {
+        if *stop.borrow() {
+            return Ok(()); // account teardown: leave queued bodies for next run
+        }
         let folders = ctx
             .db
             .read(move |conn| repo::folders::list(conn, Some(account_id)))
@@ -4532,30 +4714,34 @@ async fn drain_missing_bodies(ctx: &SyncCtx, config: &AccountConfig) -> Result<(
         let workers = cap.min(chunks.len());
         let queue = Arc::new(tokio::sync::Mutex::new(chunks));
         let persisted = Arc::new(AtomicU64::new(0));
-        let mut handles = Vec::with_capacity(workers);
+        // Workers are spawned into the account's task set so teardown can
+        // join or abort them like any other per-account task; this drain
+        // learns their outcomes through the done channel instead of awaiting
+        // their JoinHandles directly (a handle can only be awaited once).
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<Result<()>>();
         for _ in 0..workers {
-            handles.push(tokio::spawn(body_worker(
-                ctx.clone(),
-                config.clone(),
-                queue.clone(),
-                skip.clone(),
-                persisted.clone(),
-            )));
-        }
-        let mut worker_error = None;
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    if worker_error.is_none() {
-                        worker_error = Some(error);
-                    }
+            let done_tx = done_tx.clone();
+            tasks.track(tokio::spawn({
+                let ctx = ctx.clone();
+                let config = config.clone();
+                let queue = queue.clone();
+                let skip = skip.clone();
+                let persisted = persisted.clone();
+                let mut stop = stop.clone();
+                async move {
+                    let result = body_worker(ctx, config, queue, skip, persisted, &mut stop).await;
+                    let _ = done_tx.send(result);
                 }
+            }));
+        }
+        drop(done_tx);
+        let mut worker_error = None;
+        while let Some(result) = done_rx.recv().await {
+            match result {
+                Ok(()) => {}
                 Err(error) => {
                     if worker_error.is_none() {
-                        worker_error = Some(CoreError::Other(format!(
-                            "body worker task failed: {error}"
-                        )));
+                        worker_error = Some(error);
                     }
                 }
             }
@@ -4594,6 +4780,7 @@ async fn body_worker(
     queue: Arc<tokio::sync::Mutex<std::collections::VecDeque<BodyChunk>>>,
     skip: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
     persisted: Arc<std::sync::atomic::AtomicU64>,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let account_id = config.id;
     let mut session = match connect(&ctx, &config).await {
@@ -4605,6 +4792,9 @@ async fn body_worker(
     };
     let mut selected: Option<(String, Option<i64>)> = None;
     loop {
+        if *stop.borrow() {
+            return Ok(()); // account teardown: unfinished chunks stay queued
+        }
         let chunk = queue.lock().await.pop_front();
         let Some(chunk) = chunk else { break };
         let chunk_started = std::time::Instant::now();
