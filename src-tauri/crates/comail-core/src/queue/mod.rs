@@ -42,6 +42,7 @@ pub async fn execute_due(
     ctx: &SyncCtx,
     config: &AccountConfig,
     session: &mut Session,
+    stopped: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<ActionSliceResult> {
     let account_id = config.id;
     let started = Instant::now();
@@ -54,8 +55,9 @@ pub async fn execute_due(
     let mut due = due.into_iter().peekable();
     while let Some(first) = due.next() {
         // This is a cooperative budget: never abandon an action midway through
-        // an IMAP/SMTP command, but do not start another after the slice expires.
-        if started.elapsed() >= MAX_SLICE_DURATION {
+        // an IMAP/SMTP command, but do not start another after the slice
+        // expires or the account's task set is being torn down.
+        if started.elapsed() >= MAX_SLICE_DURATION || *stopped.borrow() {
             break;
         }
 
@@ -76,7 +78,7 @@ pub async fn execute_due(
                 let tx = conn.transaction()?;
                 let mut claimed = Vec::new();
                 for action in group {
-                    if repo::actions::try_claim(&tx, action.id)? {
+                    if repo::actions::try_claim(&tx, action.id, account_id)? {
                         if action.kind == crate::trash::KIND {
                             resume_delete_budget(&tx, action.id, now_ms())?;
                         }
@@ -104,7 +106,7 @@ pub async fn execute_due(
         } else {
             execute_one(ctx, config, session, &group[0]).await
         };
-        record_outcomes(ctx, &group, &outcome).await?;
+        record_outcomes(ctx, &group, &outcome, account_id).await?;
         // Persist every claimed action's outcome before abandoning the stream.
         if let Err(error) = outcome
             && (matches!(error, CoreError::NeedsReauth | CoreError::Auth(_))
@@ -128,11 +130,12 @@ async fn record_outcomes(
     ctx: &SyncCtx,
     group: &[repo::actions::PendingAction],
     outcome: &Result<()>,
+    account_id: i64,
 ) -> Result<()> {
-    let account_id = group
-        .first()
-        .map(|action| action.account_id)
-        .unwrap_or_default();
+    // `expected_account` guards every write below: this task may have
+    // outlived its account's teardown, and pending_actions.id is recycled,
+    // so an action id read before removal can now name a DIFFERENT account's
+    // action. Each write closure first proves the row is still ours.
     for action in group {
         let action_id = action.id;
         // A batch may confirm already-absent UIDs before a later target
@@ -168,6 +171,9 @@ async fn record_outcomes(
             let result = ctx
                 .db
                 .write(move |conn| {
+                    if !repo::actions::is_owned_by(conn, action_id, account_id)? {
+                        return Ok(None);
+                    }
                     if auth_paused {
                         record_delete_auth_pause(conn, action_id, now_ms(), &message)
                     } else {
@@ -201,7 +207,11 @@ async fn record_outcomes(
         match outcome {
             Ok(()) => {
                 ctx.db
-                    .write(move |conn| repo::actions::set_state(conn, action_id, "done", None))
+                    .write(move |conn| {
+                        repo::actions::set_state_for_account(
+                            conn, action_id, account_id, "done", None,
+                        )
+                    })
                     .await?;
                 ctx.bus.emit(CoreEvent::ActionState {
                     action_id,
@@ -222,6 +232,9 @@ async fn record_outcomes(
                 let msg = "authentication required".to_string();
                 ctx.db
                     .write(move |conn| {
+                        if !repo::actions::is_owned_by(conn, action_id, account_id)? {
+                            return Ok(());
+                        }
                         repo::actions::bump_attempt(conn, action_id, now_ms() + 60_000, &msg)
                     })
                     .await?;
@@ -271,6 +284,9 @@ async fn record_outcomes(
                         .flatten();
                     ctx.db
                         .write(move |conn| {
+                            if !repo::actions::is_owned_by(conn, action_id, account_id)? {
+                                return Ok(());
+                            }
                             let tx = conn.transaction()?;
                             repo::actions::set_state(&tx, action_id, "failed", Some(&m))?;
                             rollback_failed_move(&tx, action_id)?;
@@ -298,6 +314,9 @@ async fn record_outcomes(
                     let m = msg.clone();
                     ctx.db
                         .write(move |conn| {
+                            if !repo::actions::is_owned_by(conn, action_id, account_id)? {
+                                return Ok(());
+                            }
                             repo::actions::bump_attempt(conn, action_id, now_ms() + delay, &m)
                         })
                         .await?;
@@ -1425,7 +1444,7 @@ fn finalize_sent_draft(
 }
 
 /// Tiny extension-based MIME guess for outgoing attachments.
-fn mime_guess_from_name(name: &str) -> String {
+pub(crate) fn mime_guess_from_name(name: &str) -> String {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "pdf" => "application/pdf",
@@ -1477,7 +1496,7 @@ mod tests {
                         &serde_json::json!({}),
                         None,
                     )?;
-                    assert!(repo::actions::try_claim(conn, id)?);
+                    assert!(repo::actions::try_claim(conn, id, 1)?);
                     group.push(repo::actions::get(conn, id)?.unwrap());
                 }
                 // The remote batch confirmed only its first target absent.
@@ -1514,7 +1533,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            record_outcomes(&ctx, &group, &Err(error)).await.unwrap();
+            record_outcomes(&ctx, &group, &Err(error), 1).await.unwrap();
             let ids = (group[0].id, group[1].id, group[2].id);
             let states = ctx
                 .db
@@ -1561,7 +1580,7 @@ mod tests {
                             &serde_json::json!({}),
                             None,
                         )?;
-                        assert!(repo::actions::try_claim(conn, id)?);
+                        assert!(repo::actions::try_claim(conn, id, 1)?);
                         Ok(repo::actions::get(conn, id)?.unwrap())
                     })
                     .collect::<Result<Vec<_>>>()
@@ -1575,7 +1594,7 @@ mod tests {
             tokens: crate::oauth::tokens::TokenProvider::new(),
         };
         let mut events = ctx.bus.subscribe();
-        record_outcomes(&ctx, &group, &Err(CoreError::NeedsReauth))
+        record_outcomes(&ctx, &group, &Err(CoreError::NeedsReauth), 1)
             .await
             .unwrap();
         for (action, expected) in group.into_iter().zip(["paused", "paused", "pending"]) {

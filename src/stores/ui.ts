@@ -110,6 +110,11 @@ export interface ComposerState {
     bodyHtml?: string;
     attachments?: DraftAttachment[];
   };
+  /** Composer session nonce attachment tokens are bound to. Carried through
+   *  an undo-send reopen so a draft recreated from that session can adopt
+   *  the staged files it produced; fresh composes leave it unset and the
+   *  Composer mints one. */
+  composerNonce?: string;
 }
 
 /** What Z undoes next. */

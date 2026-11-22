@@ -4,6 +4,7 @@
 pub mod accounts;
 pub mod addr;
 pub mod ai;
+pub mod approval;
 pub mod autolabel;
 pub mod avatars;
 pub mod caldav;
@@ -230,6 +231,10 @@ pub struct Core {
     /// share one remote fetch and cannot race the same `.download.part` file.
     attachment_locks:
         Arc<tokio::sync::Mutex<HashMap<i64, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+    /// Serializes account creation against removal: SQLite recycles INTEGER
+    /// PRIMARY KEY values, so an add must wait for a remove's post-commit
+    /// file deletion before it can land on a recycled id.
+    account_lifecycle: Arc<tokio::sync::Mutex<()>>,
     embed: Arc<embed::EmbedState>,
     /// Fired by `cancel_oauth` to abort a pending browser sign-in (the
     /// loopback wait otherwise blocks the UI until its 5-minute timeout).
@@ -242,6 +247,10 @@ pub struct Core {
     /// Serializes AI routing passes so the background router and an inline
     /// re-sort never classify the same 'pending' threads twice.
     ai_router_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Session registry of user-approved local files attachable to drafts
+    /// (see `approval`). Only trusted Rust paths mint approvals; `save_draft`
+    /// consumes their tokens.
+    approvals: Arc<approval::AttachmentApprovals>,
     /// Local MCP server for AI clients (see `mcp`).
     mcp: Arc<mcp::McpManager>,
 }
@@ -268,17 +277,19 @@ impl Core {
             cal_handles: Arc::new(RwLock::new(HashMap::new())),
             contacts_handles: Arc::new(RwLock::new(HashMap::new())),
             attachment_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            account_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             embed: Arc::new(embed::EmbedState::new()),
             oauth_cancel: Arc::new(tokio::sync::Notify::new()),
             ui_ready: Arc::new(tokio::sync::Notify::new()),
             ai_router_lock: Arc::new(tokio::sync::Mutex::new(())),
+            approvals: Arc::new(approval::AttachmentApprovals::default()),
             mcp: Arc::new(mcp::McpManager::default()),
         };
 
         // Make saved OAuth app registrations available before any actor
-        // needs a token refresh.
-        let settings = core.db.read(|conn| repo::settings::get(conn)).await?;
-        apply_oauth_settings(&settings);
+        // needs a token refresh, moving pre-keyring inline client secrets
+        // into the OS keyring first (kept in the row while it is unavailable).
+        core.migrate_oauth_client_secrets().await;
 
         // Recover any actions orphaned mid-flight by a previous crash/kill, so a
         // send that was executing when the app died retries instead of sticking
@@ -363,6 +374,52 @@ impl Core {
                     _ = core.ui_ready.notified() => {}
                     _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
                 }
+                // Resume account removals interrupted mid-flight (crash/kill
+                // between the durable marker and the delete commit, or a
+                // repair that failed and kept its marker) - strictly before
+                // listing configs, so a marked account never starts syncing
+                // again. This runs in the deferred task, not inline in
+                // start(), so a large interrupted removal does not hold the
+                // Tauri setup blocking the first window; marked accounts are
+                // already hidden from accounts::list. On success
+                // remove_account clears the marker itself; on failure its
+                // error path already repaired the index, and we do NOT call
+                // restore_account_tasks here - the spawn loop below picks the
+                // account back up (a still-marked account is filtered out of
+                // list_configs and stays idle for the next start's resume).
+                for account_id in core
+                    .db
+                    .read(|conn| repo::accounts::removal_markers(conn))
+                    .await
+                    .unwrap_or_default()
+                {
+                    let exists = core
+                        .db
+                        .read(move |conn| Ok(repo::accounts::get(conn, account_id)?.is_some()))
+                        .await
+                        .unwrap_or(false);
+                    if !exists {
+                        // Marker without an account row cannot happen (it is
+                        // cleared in the same commit as the delete) - sweep
+                        // it anyway.
+                        let _ = core
+                            .db
+                            .write(move |conn| repo::accounts::unmark_removing(conn, account_id))
+                            .await;
+                        continue;
+                    }
+                    match core.remove_account_inner(account_id, false).await {
+                        Ok(()) => {
+                            tracing::info!(account_id, "resumed interrupted account removal")
+                        }
+                        Err(error) => tracing::warn!(
+                            account_id,
+                            %error,
+                            "resumed account removal failed; account stays usable, marker kept"
+                        ),
+                    }
+                }
+                sweep_removal_tombstones(&core.paths).await;
                 let configs = match core
                     .db
                     .read(|conn| repo::accounts::list_configs(conn))
@@ -535,7 +592,11 @@ impl Core {
 
     async fn spawn_actor(&self, cfg: AccountConfig) {
         let handle = spawn_account(self.sync_ctx(), cfg);
-        self.handles.write().await.insert(handle.account_id, handle);
+        // A respawn stops whatever the previous task set was still doing;
+        // Shutdown takes the same stop path account removal uses.
+        if let Some(old) = self.handles.write().await.insert(handle.account_id, handle) {
+            old.send(SyncCmd::Shutdown);
+        }
     }
 
     async fn spawn_cal_task(&self, account_id: i64) {
@@ -640,6 +701,9 @@ impl Core {
         }
 
         let a = args.clone();
+        // The insert may land on a recycled id; it must wait for a removal of
+        // the previous owner to finish deleting its files.
+        let _lifecycle = self.account_lifecycle.lock().await;
         let id = self
             .db
             .write(move |conn| {
@@ -721,6 +785,8 @@ impl Core {
 
         let email = outcome.email.clone();
         let name = outcome.name.clone();
+        // Same recycled-id guard as add_account_password.
+        let _lifecycle = self.account_lifecycle.lock().await;
         let id = self
             .db
             .write(move |conn| {
@@ -874,45 +940,344 @@ impl Core {
     }
 
     pub async fn remove_account(&self, account_id: i64) -> Result<()> {
-        if let Some(h) = self.handles.write().await.remove(&account_id) {
+        self.remove_account_inner(account_id, true).await
+    }
+
+    /// `restore_on_failure`: on a pre-commit error the repair runs either way,
+    /// but the task set is only restarted when `true`. Start-up passes `false`
+    /// because the account spawn loop that follows resumes the account itself.
+    async fn remove_account_inner(&self, account_id: i64, restore_on_failure: bool) -> Result<()> {
+        // Detach every per-account entry point first so nothing new can be
+        // scheduled for this id while teardown runs. (attachment_locks is
+        // keyed by attachment id, not account id - nothing to evict here.)
+        let handle = self.handles.write().await.remove(&account_id);
+        let cal = self.cal_handles.write().await.remove(&account_id);
+        let contacts = self.contacts_handles.write().await.remove(&account_id);
+
+        // Ask the sync actor for a clean IMAP logout; Shutdown also fires the
+        // shared stop flag every other task observes at its await points.
+        // Then wait - bounded - and abort whatever is still parked in a
+        // network call (except the mutation worker, which must settle its
+        // in-flight action rather than be cancelled mid-command).
+        if let Some(h) = &handle {
             h.send(SyncCmd::Shutdown);
         }
-        self.cal_handles.write().await.remove(&account_id);
-        self.contacts_handles.write().await.remove(&account_id);
-        // Credential deletion and token-cache clearing happen atomically
-        // under the account's refresh lock: a grant still in flight completes
-        // first and its writes are erased by the purge, and a grant queued
-        // behind it finds no refresh token — no rotated token can be written
-        // back into the keyring and no cache entry resurrected for a removed
-        // account (account ids are recycled).
-        self.tokens.purge(account_id).await;
-        let staged_paths = self
-            .db
-            .write(move |conn| {
-                // Unwind address-book names before the cascade drops the cards.
-                repo::carddav::delete_config(conn, account_id)?;
-                // The account cascade drops draft_attachments rows; collect
-                // their staged paths first so the files can go with them.
-                let staged: Vec<String> = {
-                    let mut stmt = conn.prepare(
-                        "SELECT da.file_path FROM draft_attachments da
+        let deadline = tokio::time::Instant::now() + REMOVE_ACCOUNT_STOP_TIMEOUT;
+        if let Some(h) = &handle {
+            h.stop_tasks(deadline).await;
+        }
+        if let Some(h) = &cal {
+            h.stop_tasks(deadline).await;
+        }
+        if let Some(h) = &contacts {
+            h.stop_tasks(deadline).await;
+        }
+
+        // Everything up to the delete commit is reversible: on any failure,
+        // repair the index, put the task set back exactly the way startup
+        // would, and leave the account usable - and the removal retryable.
+        let removal = async {
+            // Durable marker BEFORE the first destructive step. The FTS
+            // sweep commits per batch below, so without a marker a crash or
+            // a rollback would leave the account's search index silently
+            // half-destroyed. With it: a failed removal repairs the index
+            // before clearing the marker, and a killed one is resumed at
+            // start-up (Core::start reads removal_markers before spawning
+            // any account task). `list` hides marked accounts meanwhile.
+            self.db
+                .write(move |conn| repo::accounts::mark_removing(conn, account_id))
+                .await?;
+
+            // Writer-thread barrier: a task aborted inside `db.write` may
+            // already have queued its closure. The writer runs jobs FIFO, so
+            // this no-op returning proves every straggler write landed -
+            // before the delete, where the cascade still erases it - and none
+            // can sneak in behind it to be attributed to a recycled id.
+            self.removal_barrier().await?;
+
+            // Pre-commit FTS sweep in many small transactions. Inside one
+            // transaction the batching buys nothing - the writer is held for
+            // the whole delete either way (measured: 21 s for 100k messages
+            // in a debug build). Split per batch, other writer jobs interleave
+            // between `db.write` calls and the UI stays responsive. The
+            // marker above is what makes committed batches safe: any failure
+            // from here on re-indexes what was swept.
+            loop {
+                let swept = self
+                    .db
+                    .write(move |conn| repo::accounts::sweep_fts_batch(conn, account_id))
+                    .await?;
+                if swept < repo::accounts::FTS_DELETE_BATCH as usize {
+                    break;
+                }
+            }
+
+            // The id-recycle window: SQLite hands a freed INTEGER PRIMARY
+            // KEY to the next inserted account, so from the commit until the
+            // account's directories are renamed aside, account creation must
+            // not run. Task teardown and the sweep stay outside the lock -
+            // while the account row still exists an added account simply
+            // gets a different id - which keeps the hold to the measured
+            // ~1.6 s cascade + a few renames instead of the whole teardown.
+            let _lifecycle = self.account_lifecycle.lock().await;
+            let (staged, message_ids) = self
+                .db
+                .write(move |conn| {
+                    let tx = conn.transaction()?;
+                    // Unwind address-book names before the cascade drops the cards.
+                    repo::carddav::delete_config(&tx, account_id)?;
+                    // The account cascade drops draft_attachments rows; collect
+                    // their staged paths first so the files can go with them.
+                    let staged: Vec<String> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT da.file_path FROM draft_attachments da
                          JOIN messages m ON m.id = da.draft_id
                          WHERE m.account_id = ?1",
-                    )?;
-                    stmt.query_map(rusqlite::params![account_id], |r| r.get::<_, String>(0))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?
-                };
-                repo::accounts::delete(conn, account_id)?;
-                Ok(staged)
-            })
-            .await?;
-        // Root-confined like every staged-path delete: rows pointing outside
-        // the staging root are ignored, and nothing is unlinked until the
-        // account delete has succeeded.
-        remove_staged_draft_files(&self.paths.draft_attachments_dir(), &staged_paths).await;
-        let _ = tokio::fs::remove_dir_all(self.paths.mail_dir(account_id)).await;
-        let _ = tokio::fs::remove_dir_all(self.paths.attachments_dir(account_id)).await;
+                        )?;
+                        stmt.query_map(rusqlite::params![account_id], |r| r.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    // The account's message ids, for evicting its vectors from
+                    // the in-memory index after commit (it is not FK-covered).
+                    let message_ids: Vec<i64> = {
+                        let mut stmt =
+                            tx.prepare("SELECT id FROM messages WHERE account_id = ?1")?;
+                        stmt.query_map(rusqlite::params![account_id], |r| r.get::<_, i64>(0))?
+                            .collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    repo::accounts::delete(&tx, account_id)?;
+                    // Marker clears in the same commit: it can never point
+                    // at a successfully deleted account, and a rolled-back
+                    // removal keeps it for the repair/resume paths.
+                    repo::accounts::unmark_removing(&tx, account_id)?;
+                    #[cfg(test)]
+                    if REMOVE_FAIL_TX.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        return Err(CoreError::Other("injected delete failure".into()));
+                    }
+                    tx.commit()?;
+                    Ok((staged, message_ids))
+                })
+                .await?;
+            // Rename the account's directories to unique tombstones while the
+            // lifecycle lock is still held - milliseconds of work - so the
+            // slow recursive deletes below can run AFTER the lock is released
+            // without a recycled account id ever seeing its fresh dirs
+            // deleted. Staged draft dirs get the same treatment: they are
+            // random per-file sub-directories under the shared staging
+            // root, so they cannot collide by name - tombstoning guards
+            // the same id-recycling window anyway. Leftover tombstones
+            // are swept at start-up.
+            let tombstones = self.tombstone_account_dirs(account_id, &staged).await;
+            #[cfg(test)]
+            if REMOVE_PAUSE_FOR_ADD.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                REMOVE_RESUME_GATE.notified().await;
+            }
+            // Every step keyed by the account id (or by recyclable message
+            // ids) finishes while the lock is still held: the commit ran
+            // already, so these are final, and a queued add that recycles the
+            // id can only run after this section - it can never lose its own
+            // credentials or vectors to a stale cleanup.
+            // Credential deletion and token-cache clearing happen atomically
+            // under the account's refresh lock: a grant still in flight
+            // completes first and its writes are erased by the purge, and a
+            // grant queued behind it finds no refresh token - no rotated
+            // token can be written back into the keyring and no cache entry
+            // resurrected for a removed account.
+            self.tokens.purge(account_id).await;
+            // The persisted vectors cascaded with the messages; evict the
+            // account's copies from the in-memory index too, before any
+            // recycled message id can be repopulated.
+            if !message_ids.is_empty() {
+                let removed: std::collections::HashSet<i64> = message_ids.iter().copied().collect();
+                self.embed
+                    .index
+                    .write()
+                    .await
+                    .retain(|mid| !removed.contains(&mid));
+            }
+            // `_lifecycle` drops here: only work on names that cannot be
+            // reused (the tombstoned directories) runs after the release.
+            Ok(tombstones)
+        }
+        .await;
+        let tombstones = match removal {
+            Ok(out) => out,
+            Err(error) => {
+                // Pre-commit failure or a rolled-back transaction: the
+                // account row and all of its data are intact, and credentials
+                // have NOT been purged - that only happens past the commit.
+                // First rebuild every FTS row the sweep removed - a surviving
+                // account must never keep a silently broken search index -
+                // then restart the task set so the account keeps working and
+                // a retried removal sees a normal state. If repair itself
+                // fails the marker stays set: the account is still usable,
+                // and the next start-up resumes the removal the user asked
+                // for.
+                if let Err(repair_error) = self.repair_search_index(account_id).await {
+                    tracing::warn!(
+                        account_id,
+                        error = %repair_error,
+                        "rolled-back removal could not rebuild the search index; \
+                         marker kept so start-up finishes the removal"
+                    );
+                }
+                if restore_on_failure {
+                    self.restore_account_tasks(account_id).await;
+                }
+                return Err(error);
+            }
+        };
+
+        // Point of no return passed; only work on names that cannot be
+        // reused (the tombstoned directories) runs past this point - the
+        // lock is already released, so account adds proceed while the slow
+        // recursive deletes drain.
+        for dir in tombstones {
+            let _ = tokio::fs::remove_dir_all(dir).await;
+        }
         Ok(())
+    }
+
+    /// Rename every on-disk directory belonging to the account to a unique
+    /// sibling tombstone (`<name>.removing-<account>-<nanos>`) and return the
+    /// tombstone paths for deletion by the caller. Runs under the lifecycle
+    /// lock after the delete commit: renaming is O(1) per dir, so an added
+    /// account that recycles the id creates fresh dirs untouched by the slow
+    /// `remove_dir_all` of these tombstones afterwards.
+    async fn tombstone_account_dirs(
+        &self,
+        account_id: i64,
+        staged_paths: &[String],
+    ) -> Vec<std::path::PathBuf> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let token = format!("{account_id}-{nanos}");
+        let mut out = Vec::new();
+        for dir in [
+            self.paths.mail_dir(account_id),
+            self.paths.attachments_dir(account_id),
+        ] {
+            if let Some(t) = tombstone_dir(&dir, &token).await {
+                out.push(t);
+            }
+        }
+        // Staged draft attachments: confine to the staging root exactly like
+        // remove_staged_draft_files, then tombstone each per-file directory
+        // (random uuid sub-dirs) - ids recycle, so a later staged file
+        // could land in one.
+        let root = self.paths.draft_attachments_dir();
+        if let Ok(root) = tokio::fs::canonicalize(&root).await {
+            let mut dirs = std::collections::HashSet::new();
+            for path in staged_paths {
+                let Ok(canon) = tokio::fs::canonicalize(path).await else {
+                    continue;
+                };
+                if !canon.starts_with(&root) {
+                    tracing::warn!(
+                        path,
+                        "refusing to remove attachment outside draft staging area"
+                    );
+                    continue;
+                }
+                if let Some(dir) = canon.parent()
+                    && dir != root
+                    && dir.starts_with(&root)
+                {
+                    dirs.insert(dir.to_path_buf());
+                }
+            }
+            for dir in dirs {
+                if let Some(t) = tombstone_dir(&dir, &token).await {
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+
+    /// Rebuild every `messages_fts` row the pre-commit sweep removed - the
+    /// repair half of the durable removal marker. Batched like the sweep so
+    /// the writer stays responsive; on success the marker is cleared, on
+    /// failure it stays set for the start-up resume.
+    async fn repair_search_index(&self, account_id: i64) -> Result<()> {
+        loop {
+            let n = self
+                .db
+                .write(move |conn| {
+                    repo::search::reindex_missing_batch(
+                        conn,
+                        account_id,
+                        repo::accounts::FTS_DELETE_BATCH,
+                    )
+                })
+                .await?;
+            if n < repo::accounts::FTS_DELETE_BATCH as usize {
+                break;
+            }
+        }
+        self.db
+            .write(move |conn| repo::accounts::unmark_removing(conn, account_id))
+            .await
+    }
+
+    /// One no-op job on the single writer thread; see the barrier comment at
+    /// the call site in `remove_account`.
+    async fn removal_barrier(&self) -> Result<()> {
+        #[cfg(test)]
+        if REMOVE_FAIL_BARRIER.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(CoreError::Other("injected barrier failure".into()));
+        }
+        self.db.write(|_| Ok(())).await
+    }
+
+    /// Restart the task set `remove_account` detached, for the rollback path:
+    /// the sync actor plus the calendar and contacts tasks when their config
+    /// rows still exist - the same selection startup makes (list_configs +
+    /// all_configs rows), per account.
+    async fn restore_account_tasks(&self, account_id: i64) {
+        if let Ok(Some(cfg)) = self
+            .db
+            .read(move |conn| repo::accounts::get_config(conn, account_id))
+            .await
+        {
+            self.spawn_actor(cfg).await;
+        }
+        if self
+            .db
+            .read(move |conn| repo::caldav::get_config(conn, account_id))
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|cfg| cfg.enabled)
+        {
+            self.spawn_cal_task(account_id).await;
+        }
+        if self
+            .db
+            .read(move |conn| repo::carddav::get_config(conn, account_id))
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|cfg| cfg.enabled)
+        {
+            self.spawn_contacts_task(account_id).await;
+        }
+    }
+
+    /// Account sync handle, if the account's tasks are running. Test hook for
+    /// asserting the shared task set is actually finished after removal.
+    #[doc(hidden)]
+    pub async fn debug_handle(&self, account_id: i64) -> Option<AccountHandle> {
+        self.handles.read().await.get(&account_id).cloned()
+    }
+
+    /// Shared embedding state; test hook so integration tests can push into
+    /// and inspect the live vector index without loading a model.
+    #[doc(hidden)]
+    pub fn embed_state(&self) -> Arc<embed::EmbedState> {
+        self.embed.clone()
     }
 
     pub async fn sync_now(&self, account_id: Option<i64>) -> Result<()> {
@@ -1593,36 +1958,350 @@ impl Core {
 
     // ---------- compose ----------
 
-    pub async fn save_draft(&self, args: SaveDraftArgs) -> Result<i64> {
+    /// Mint approval tokens for local files a trusted Rust path approved -
+    /// the native file dialog (`pick_draft_attachments`) or internal code
+    /// that generated the file itself (e.g. a calendar invite). The webview
+    /// cannot call this: there is no command that takes a path to approve.
+    /// `nonce` binds the tokens to the composer session that asked.
+    pub fn approve_attachment_sources(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+        nonce: Option<String>,
+    ) -> Result<Vec<ApprovedAttachment>> {
+        self.approvals.approve(paths, nonce)
+    }
+
+    /// [`approve_attachment_sources`] bounded by the caller's draft totals:
+    /// candidates that would push the draft past its attachment limits are
+    /// not minted and come back as `skipped` (display name + reason).
+    pub fn approve_attachment_sources_bounded(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+        nonce: Option<String>,
+        current_count: usize,
+        current_bytes: u64,
+    ) -> Result<(Vec<ApprovedAttachment>, Vec<SkippedDrop>)> {
+        let mut budget = approval::AttachmentBudget {
+            count: current_count,
+            bytes: current_bytes,
+        };
+        self.approvals.approve_budgeted(paths, nonce, &mut budget)
+    }
+
+    /// Record paths the OS reports as dropped on a window. Called from the
+    /// Rust webview-event handler only; this is what turns a drop into a
+    /// real user gesture the webview can then exchange via
+    /// `claim_dropped_attachments`.
+    pub fn record_os_drop(&self, paths: &[std::path::PathBuf]) {
+        self.approvals.record_drop(paths);
+    }
+
+    /// Exchange OS-observed drop paths for approval tokens. Every path must
+    /// be one the Rust drop handler already saw; observed-but-unusable
+    /// entries and ones that would exceed the draft's attachment limits
+    /// come back in `skipped` so the UI can report them.
+    pub fn claim_dropped_attachments(
+        &self,
+        paths: &[String],
+        nonce: Option<String>,
+        current_count: usize,
+        current_bytes: u64,
+    ) -> Result<crate::models::DropClaim> {
+        let mut budget = approval::AttachmentBudget {
+            count: current_count,
+            bytes: current_bytes,
+        };
+        self.approvals.claim_drops(paths, nonce, Some(&mut budget))
+    }
+
+    /// Release approval tokens the composer will not spend: a removed
+    /// chip, an unticked forward set, or a closed composer. Frees their
+    /// `pending_bytes` immediately; nonce-bound, and in-flight tokens are
+    /// untouched.
+    pub fn release_attachment_tokens(&self, tokens: &[String], nonce: Option<String>) {
+        self.approvals.release(tokens, &nonce);
+    }
+
+    /// Resolve a received attachment to an approval token so a forward can
+    /// carry it: the bytes come from the app's own attachment cache via
+    /// `get_attachment` (downloading over IMAP if needed) - done here,
+    /// outside `save_draft`, so a failing download fails just this chip,
+    /// never the whole draft save. The token stages the copy under the
+    /// original attachment's filename, not the cache file's.
+    /// `current_count`/`current_bytes` are the draft's present attachment
+    /// totals (composer-supplied, advisory): a prepared file that would
+    /// exceed the per-draft bounds is refused here rather than at save.
+    pub async fn prepare_forward_attachment(
+        &self,
+        attachment_id: i64,
+        nonce: Option<String>,
+        current_count: usize,
+        current_bytes: u64,
+    ) -> Result<ApprovedAttachment> {
+        let (raw_name, mime_type) = self
+            .db
+            .read(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT filename, mime_type FROM attachments WHERE id = ?1",
+                        rusqlite::params![attachment_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, Option<String>>(0)?,
+                                r.get::<_, Option<String>>(1)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                row.ok_or_else(|| CoreError::NotFound("attachment".into()))
+            })
+            .await?;
+        let mut filename = raw_name
+            .map(|n| display_filename(&crate::mime::decode_encoded_words(&n)))
+            .unwrap_or_else(|| format!("attachment-{attachment_id}"));
+        // Body parts may carry no filename; give the staged copy the same
+        // extension fix `get_attachment` applies (an invite becomes *.ics,
+        // not a bare name).
+        if std::path::Path::new(&filename).extension().is_none()
+            && let Some(ext) = mime_type.as_deref().and_then(ext_for_mime)
+        {
+            filename.push('.');
+            filename.push_str(ext);
+        }
+        let cached = self.get_attachment(attachment_id).await?;
+        // Bound the bytes a session can queue as unconsumed forwards so a
+        // prepare->save loop cannot grow disk usage without bound, and
+        // refuse early when the file would exceed the per-draft limits.
+        let size = std::fs::metadata(&cached).map(|m| m.len()).unwrap_or(0);
+        if self.approvals.pending_bytes(&nonce).saturating_add(size) > MAX_SESSION_PREPARED_BYTES {
+            return Err(CoreError::ActionRejected(format!(
+                "attachment {filename}: prepared forwards pending for this draft exceed {} MB",
+                MAX_SESSION_PREPARED_BYTES / (1024 * 1024)
+            )));
+        }
+        if !(approval::AttachmentBudget {
+            count: current_count,
+            bytes: current_bytes,
+        })
+        .room_for(size)
+        {
+            return Err(CoreError::ActionRejected(format!(
+                "attachment {filename}: {}",
+                approval::AttachmentBudget::over_limit_reason()
+            )));
+        }
+        self.approvals
+            .approve_named(std::path::PathBuf::from(&cached), &filename, nonce)
+    }
+
+    /// The session approval registry (integration tests drive it directly).
+    #[doc(hidden)]
+    pub fn attachment_approvals(&self) -> &approval::AttachmentApprovals {
+        &self.approvals
+    }
+
+    /// Resolve one `save_draft` attachment entry. `owned` maps this draft's
+    /// existing canonical staged paths to their stored display names;
+    /// `budget` counts what the draft will hold after this save - `Staged`
+    /// entries always join it (they are already the draft's content), while
+    /// a `Token` that would exceed the per-draft bounds is refused
+    /// per-entry instead of failing the whole save. A resolved `Token` is
+    /// checked out here and tracked on `tokens`, so a failed save rolls the
+    /// checkout back.
+    async fn resolve_draft_attachment(
+        &self,
+        staging_root: &std::path::Path,
+        att: &DraftAttachmentIn,
+        draft_id: Option<i64>,
+        owned: &HashMap<String, String>,
+        nonce: &Option<String>,
+        tokens: &mut approval::TokenGuard<'_>,
+        budget: &mut approval::AttachmentBudget,
+    ) -> Result<ResolvedAttachment> {
+        match att {
+            DraftAttachmentIn::Token { token } => {
+                let approval = self.approvals.checkout(token, nonce)?;
+                // Per-entry bound check BEFORE the copy: a file that would
+                // push the draft over its limits is refused, the checkout
+                // rolls straight back, and the rest of the draft saves.
+                let size = tokio::fs::metadata(&approval.canonical_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(approval.size);
+                if !budget.room_for(size) {
+                    self.approvals.rollback(std::slice::from_ref(token));
+                    return Ok(ResolvedAttachment::Refused {
+                        reason: format!(
+                            "attachment {}: {}",
+                            approval.filename,
+                            approval::AttachmentBudget::over_limit_reason()
+                        ),
+                    });
+                }
+                tokens.track(token);
+                let staged = stage_approved_attachment(staging_root, &approval).await?;
+                budget.consume(size);
+                tokens.track_fresh(std::path::PathBuf::from(&staged.path));
+                Ok(ResolvedAttachment::Staged(staged))
+            }
+            DraftAttachmentIn::Staged {
+                file_path,
+                filename,
+            } => {
+                // A staged path is only valid echoed back for a draft that
+                // already references it, or adopted by the composer session
+                // that produced it (draft deleted and recreated). Binding
+                // the claim this way means a staged path can never be
+                // claimed by guessing it, and a path outside staging is
+                // refused outright.
+                let canon = tokio::fs::canonicalize(file_path)
+                    .await
+                    .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
+                if !canon.starts_with(staging_root) {
+                    return Err(CoreError::ActionRejected(format!(
+                        "attachment {filename}: not an approved attachment source"
+                    )));
+                }
+                let canon_str = canon.to_string_lossy().into_owned();
+                // Existing staged content counts toward the draft's totals
+                // (a new token entry must fit around it) but is never itself
+                // refused: a draft already over the limits from before this
+                // change stays savable - only ADDING is refused.
+                let size = tokio::fs::metadata(&canon)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let resolved = if draft_id.is_some() {
+                    match owned.get(&canon_str) {
+                        Some(name) => Ok(ResolvedAttachment::Staged(StagedAttachment {
+                            path: canon_str,
+                            filename: name.clone(),
+                        })),
+                        None => Err(CoreError::ActionRejected(format!(
+                            "attachment {filename}: does not belong to this draft"
+                        ))),
+                    }
+                } else if self.approvals.produced_by(&canon, nonce)
+                    && !self.staged_path_referenced(&canon_str).await?
+                {
+                    // Same-session adoption: this composer session produced
+                    // the staged copy for a draft that no longer exists, so
+                    // the recreated draft may keep it rather than restage.
+                    // The DB check is the real guard: produced is a session
+                    // cache, but adoption may only take a file no live
+                    // draft references - a staged file is owned by at most
+                    // one draft at a time.
+                    Ok(ResolvedAttachment::Staged(StagedAttachment {
+                        path: canon_str,
+                        filename: display_filename(filename),
+                    }))
+                } else {
+                    Err(CoreError::ActionRejected(format!(
+                        "attachment {filename}: only files already attached to this draft may be re-used"
+                    )))
+                }?;
+                budget.consume(size);
+                Ok(resolved)
+            }
+        }
+    }
+
+    /// Whether ANY `draft_attachments` row (any draft) references this
+    /// canonical staged path. Enforces the invariant every cleanup path
+    /// assumes: a staged file is referenced by at most one draft.
+    async fn staged_path_referenced(&self, canon_str: &str) -> Result<bool> {
+        let canon_str = canon_str.to_string();
+        self.db
+            .read(move |conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM draft_attachments WHERE file_path = ?1",
+                    rusqlite::params![canon_str],
+                    |r| r.get(0),
+                )?;
+                Ok(count > 0)
+            })
+            .await
+    }
+
+    pub async fn save_draft(&self, args: SaveDraftArgs) -> Result<SaveDraftResult> {
         // Stage every attachment into an app-managed dir up front, so the paths
         // persisted to `draft_attachments` (and later read at dispatch) are
         // always files the app itself copied - never an arbitrary path handed
         // in by the frontend. Snapshotting here also fixes the sent bytes at
         // compose time rather than whatever the source file becomes later.
         let staging_root = self.paths.draft_attachments_dir();
-        let mut staged: Vec<crate::models::DraftAttachmentIn> =
+        tokio::fs::create_dir_all(&staging_root).await?;
+        let staging_root = tokio::fs::canonicalize(&staging_root).await?;
+        // Canonical staged paths this draft already owns -> stored display
+        // name. `Staged` claims bind to this map; anything else must arrive
+        // as a Token or a Forward reference.
+        let owned: HashMap<String, String> = match args.draft_id {
+            Some(draft_id) => {
+                self.db
+                    .read(move |conn| {
+                        let mut stmt = conn.prepare(
+                            "SELECT file_path, filename FROM draft_attachments WHERE draft_id = ?1",
+                        )?;
+                        let rows = stmt
+                            .query_map(rusqlite::params![draft_id], |r| {
+                                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        Ok(rows
+                            .into_iter()
+                            .map(|(p, name)| {
+                                (
+                                    std::path::PathBuf::from(&p)
+                                        .canonicalize()
+                                        .map(|c| c.to_string_lossy().into_owned())
+                                        .unwrap_or(p),
+                                    name,
+                                )
+                            })
+                            .collect())
+                    })
+                    .await?
+            }
+            None => HashMap::new(),
+        };
+        let mut staged: Vec<StagedAttachment> = Vec::with_capacity(args.attachments.len());
+        // Per-request-entry outcomes (staged ref or per-entry refusal),
+        // aligned by index - request order IS the mapping back to chips.
+        let mut saved_attachments: Vec<SavedAttachment> =
             Vec::with_capacity(args.attachments.len());
-        // Copies this call created; removed if the save is rejected (they are
-        // referenced by nothing until the transaction commits).
-        let mut fresh_paths: Vec<String> = Vec::new();
+        // What the draft will hold once this save commits; starts empty and
+        // each accepted entry contributes its count/bytes.
+        let mut budget = approval::AttachmentBudget { count: 0, bytes: 0 };
+        // Tokens checked out and staged copies written so far: consumed on
+        // commit; the guard's drop rolls tokens back AND deletes the copies
+        // on any failure, abort or dropped future.
+        let mut tokens = approval::TokenGuard::new(&self.approvals, staging_root.clone());
         for att in &args.attachments {
-            match stage_draft_attachment(&staging_root, &att.file_path, &att.filename).await {
-                Ok(staged_file) => {
-                    if staged_file.fresh {
-                        fresh_paths.push(staged_file.path.clone());
-                    }
-                    staged.push(crate::models::DraftAttachmentIn {
-                        file_path: staged_file.path,
-                        filename: att.filename.clone(),
+            match self
+                .resolve_draft_attachment(
+                    &staging_root,
+                    att,
+                    args.draft_id,
+                    &owned,
+                    &args.composer_nonce,
+                    &mut tokens,
+                    &mut budget,
+                )
+                .await?
+            {
+                ResolvedAttachment::Staged(staged_file) => {
+                    saved_attachments.push(SavedAttachment::Staged {
+                        file_path: staged_file.path.clone(),
+                        filename: staged_file.filename.clone(),
                     });
+                    staged.push(staged_file);
                 }
-                Err(e) => {
-                    remove_staged_draft_files(&staging_root, &fresh_paths).await;
-                    return Err(e);
+                ResolvedAttachment::Refused { reason } => {
+                    saved_attachments.push(SavedAttachment::Refused { reason });
                 }
             }
         }
-        let new_paths: HashSet<String> = staged.iter().map(|a| a.file_path.clone()).collect();
+        let new_paths: HashSet<String> = staged.iter().map(|a| a.path.clone()).collect();
         let result = self
             .db
             .write(move |conn| {
@@ -1742,9 +2421,24 @@ impl Core {
                     rusqlite::params![draft_id],
                 )?;
                 for att in &staged {
+                    // A staged file may be referenced by at most one draft:
+                    // every cleanup path deletes files the saving draft
+                    // stops referencing, so sharing one staged path would
+                    // silently break whichever draft is re-saved first.
+                    let shared: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM draft_attachments WHERE file_path = ?1 AND draft_id != ?2",
+                        rusqlite::params![att.path, draft_id],
+                        |r| r.get(0),
+                    )?;
+                    if shared > 0 {
+                        return Err(CoreError::ActionRejected(format!(
+                            "attachment {}: already attached to another draft",
+                            att.filename
+                        )));
+                    }
                     tx.execute(
                         "INSERT INTO draft_attachments (draft_id, file_path, filename) VALUES (?1,?2,?3)",
-                        rusqlite::params![draft_id, att.file_path, att.filename],
+                        rusqlite::params![draft_id, att.path, att.filename],
                     )?;
                 }
                 tx.execute(
@@ -1760,14 +2454,16 @@ impl Core {
                 Ok((draft_id, thread_id, old_paths))
             })
             .await;
-        let (draft_id, thread_id, old_paths) = match result {
-            Ok(v) => v,
-            Err(e) => {
-                // Rejected save: the freshly staged copies belong to no draft.
-                remove_staged_draft_files(&staging_root, &fresh_paths).await;
-                return Err(e);
-            }
-        };
+        let (draft_id, thread_id, old_paths) = result?;
+        // Committed: the tokens are spent for real now, and the staged
+        // paths this save freshly created are recorded against this
+        // composer session so a deleted-and-recreated draft can adopt them
+        // later. Only fresh copies count - recording echoed `Staged` refs
+        // would let a save "produce" (and later adopt) a file another live
+        // draft already owns.
+        let fresh_paths = tokens.commit();
+        self.approvals
+            .record_produced(&fresh_paths, &args.composer_nonce);
         // Committed: drop staged files the draft no longer references (e.g. an
         // attachment removed between saves). Old paths come from the DB and
         // may not be canonical (staging canonicalises on the way in), so the
@@ -1789,7 +2485,10 @@ impl Core {
                 thread_ids: vec![thread_id],
             });
         }
-        Ok(draft_id)
+        Ok(SaveDraftResult {
+            draft_id,
+            attachments: saved_attachments,
+        })
     }
 
     /// Load the complete editable state for a saved draft. Message detail omits
@@ -1827,6 +2526,7 @@ impl Core {
                                     mode: row.get(7)?,
                                     in_reply_to_message_id: row.get(8)?,
                                     attachments: Vec::new(),
+                                    composer_nonce: None,
                                 },
                                 is_draft,
                             ))
@@ -1844,7 +2544,7 @@ impl Core {
                 )?;
                 draft.0.attachments = stmt
                     .query_map(rusqlite::params![draft_id], |row| {
-                        Ok(crate::models::DraftAttachmentIn {
+                        Ok(crate::models::DraftAttachmentIn::Staged {
                             file_path: row.get(0)?,
                             filename: row.get(1)?,
                         })
@@ -1998,11 +2698,41 @@ impl Core {
             .unwrap_or_else(|| now_ms() + settings.undo_send_seconds * 1000);
 
         let draft_id = args.draft_id;
+        let expected = args.expected_attachments;
         let (action_id, account_id) = self
             .db
             .write(move |conn| {
                 let row = repo::messages::get_row(conn, draft_id)?
                     .ok_or_else(|| CoreError::NotFound("draft".into()))?;
+                // Backstop for the composer's send gate: when the caller
+                // states which staged files it believes the draft holds,
+                // refuse to queue a draft whose real rows differ - the mail
+                // that goes out must be the one the composer showed.
+                if let Some(expected) = &expected {
+                    let mut actual: Vec<String> = {
+                        let mut stmt = conn.prepare(
+                            "SELECT file_path FROM draft_attachments WHERE draft_id = ?1",
+                        )?;
+                        stmt.query_map(rusqlite::params![draft_id], |r| {
+                            r.get::<_, String>(0)
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    let canon = |p: &String| {
+                        std::fs::canonicalize(p)
+                            .map(|c| c.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| p.clone())
+                    };
+                    actual = actual.iter().map(canon).collect();
+                    let mut want: Vec<String> = expected.iter().map(canon).collect();
+                    actual.sort();
+                    want.sort();
+                    if actual != want {
+                        return Err(CoreError::ActionRejected(
+                            "the draft's attachments changed since it was last saved; save again and retry".into(),
+                        ));
+                    }
+                }
                 let payload = serde_json::json!({ "draftId": draft_id });
                 let aid = repo::actions::enqueue(
                     conn,
@@ -2140,6 +2870,17 @@ impl Core {
                 safe_name.push_str(ext);
             }
         }
+        // This path is not part of the account's tracked task set (the UI
+        // spawns it directly), so the account may have been removed while the
+        // remote fetch ran. Re-check before touching its directories - a late
+        // create_dir_all must never resurrect a removed account's folder.
+        let account_gone = !self
+            .db
+            .read(move |conn| Ok(repo::accounts::get(conn, row.account_id)?.is_some()))
+            .await?;
+        if account_gone {
+            return Err(CoreError::NotFound("account".into()));
+        }
         let dir = self
             .paths
             .attachments_dir(row.account_id)
@@ -2157,6 +2898,22 @@ impl Core {
         // final file without the flag.
         quarantine::mark(&partial)?;
         tokio::fs::rename(&partial, &path).await?;
+        // The remote fetch can outlive the account: the pre-write existence
+        // check above narrows the window but cannot close it (removal is not
+        // atomic with this untracked task). Re-check once more and clean up
+        // what was just created so a removed account's directories do not
+        // resurrect on disk.
+        let account_gone = !self
+            .db
+            .read(move |conn| Ok(repo::accounts::get(conn, row.account_id)?.is_some()))
+            .await?;
+        if account_gone {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            // `remove_dir` (not _all) only succeeds when this account dir is
+            // otherwise empty - never touches a live account's contents.
+            let _ = tokio::fs::remove_dir(self.paths.attachments_dir(row.account_id)).await;
+            return Err(CoreError::NotFound("account".into()));
+        }
 
         let path_str = path.to_string_lossy().to_string();
         let p = path_str.clone();
@@ -3377,12 +4134,36 @@ impl Core {
         body_text: String,
         ics: &str,
     ) -> Result<()> {
-        let tmp_dir = self.paths.data_dir.join("tmp");
+        // A unique temp DIR keeps the name recipients see `invite.ics`
+        // without clobbering a sibling call's file.
+        let tmp_dir = self
+            .paths
+            .data_dir
+            .join("tmp")
+            .join(crate::mime::rand_token());
         tokio::fs::create_dir_all(&tmp_dir).await?;
-        let tmp_path = tmp_dir.join(format!("invite-{}.ics", crate::mime::rand_token()));
-        tokio::fs::write(&tmp_path, ics.as_bytes()).await?;
+        let tmp_path = tmp_dir.join("invite.ics");
+        let cleanup = async |_: ()| {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            let _ = tokio::fs::remove_dir(&tmp_dir).await;
+        };
+        if let Err(e) = tokio::fs::write(&tmp_path, ics.as_bytes()).await {
+            cleanup(()).await;
+            return Err(e.into());
+        }
 
-        let draft_id = self
+        // The invite is Rust-generated content, so it gets an approval token
+        // like a picked file; `save_draft` no longer takes raw paths.
+        let token = match self.approve_attachment_sources(vec![tmp_path.clone()], None) {
+            Ok(mut approved) if !approved.is_empty() => approved.remove(0).token,
+            _ => {
+                cleanup(()).await;
+                return Err(CoreError::Other(
+                    "could not approve generated invite".into(),
+                ));
+            }
+        };
+        let saved = self
             .save_draft(SaveDraftArgs {
                 draft_id: None,
                 account_id,
@@ -3394,17 +4175,24 @@ impl Core {
                 body_html: None,
                 mode: "new".into(),
                 in_reply_to_message_id: None,
-                attachments: vec![DraftAttachmentIn {
-                    file_path: tmp_path.to_string_lossy().into_owned(),
-                    filename: "invite.ics".into(),
-                }],
+                attachments: vec![DraftAttachmentIn::Token { token }],
+                composer_nonce: None,
             })
-            .await?;
+            .await;
+        let draft_id = match saved {
+            Ok(result) => result.draft_id,
+            Err(e) => {
+                cleanup(()).await;
+                return Err(e);
+            }
+        };
         // The draft staged its own copy; the temp file can go.
-        let _ = tokio::fs::remove_file(&tmp_path).await;
+        cleanup(()).await;
         self.queue_send(QueueSendArgs {
             draft_id,
             send_at: None,
+
+            expected_attachments: None,
         })
         .await?;
         Ok(())
@@ -3641,8 +4429,10 @@ impl Core {
 
     pub async fn set_ai_key(&self, api_key: String) -> Result<()> {
         if api_key.trim().is_empty() {
-            credentials::delete_all(0);
-            return Ok(());
+            // Exactly this slot — `delete_all(0)` would wipe every app-level
+            // secret (OAuth client secrets, MCP token, decision keys) in the
+            // insecure-file backend and nothing at all in the real keyring.
+            return credentials::try_delete_async(0, Slot::AiApiKey).await;
         }
         credentials::store_async(0, Slot::AiApiKey, api_key.trim().to_string()).await
     }
@@ -3657,11 +4447,7 @@ impl Core {
         };
         let key = api_key.trim().to_string();
         if key.is_empty() {
-            let slot = slot();
-            tokio::task::spawn_blocking(move || credentials::delete(0, slot))
-                .await
-                .map_err(|e| CoreError::Other(e.to_string()))?;
-            return Ok(());
+            return credentials::try_delete_async(0, slot()).await;
         }
         credentials::store_async(0, slot(), key).await
     }
@@ -5775,12 +6561,113 @@ impl Core {
         avatars::resolve(&self.paths.data_dir, email).await
     }
 
+    /// Move client secrets stored inline by pre-keyring builds into the OS
+    /// keyring, then refresh the resolver from the stored row. Best-effort
+    /// and idempotent: a keyring failure leaves the row untouched (the
+    /// secret keeps working through the resolver's legacy fallback) and the
+    /// move retries on the next start or settings save.
+    pub async fn migrate_oauth_client_secrets(&self) {
+        let mut settings = match self.db.read(|conn| repo::settings::get(conn)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "oauth: cannot load settings for client-secret migration");
+                return;
+            }
+        };
+        let mut fresh = Vec::with_capacity(2);
+        if let Some(state) = migrate_oauth_secret(
+            &self.db,
+            Provider::Gmail,
+            &mut settings.google_client_secret,
+        )
+        .await
+        {
+            fresh.push((Provider::Gmail, state));
+        }
+        if let Some(state) = migrate_oauth_secret(
+            &self.db,
+            Provider::Microsoft,
+            &mut settings.ms_client_secret,
+        )
+        .await
+        {
+            fresh.push((Provider::Microsoft, state));
+        }
+        apply_oauth_settings(&settings, &fresh).await;
+    }
+
+    /// Store (or, when empty, forget) the OAuth client secret for "gmail" |
+    /// "google" | "microsoft". Like the AI key it lives in the OS keyring
+    /// under account id 0; the settings row only ever carries a presence flag.
+    pub async fn set_oauth_client_secret(&self, provider: String, secret: String) -> Result<()> {
+        let provider = match provider.as_str() {
+            "gmail" | "google" => Provider::Gmail,
+            "microsoft" => Provider::Microsoft,
+            other => {
+                return Err(CoreError::Other(format!("unknown oauth provider: {other}")));
+            }
+        };
+        let Some(slot) = oauth::providers::client_secret_slot(provider) else {
+            return Err(CoreError::Other("provider does not use oauth".into()));
+        };
+        // Serialize against in-flight re-probes and migrations: the epoch
+        // bump this write produces makes their stale results uncommittable.
+        let _write = oauth::providers::secret_write_lock(provider).lock().await;
+        let secret = secret.trim().to_string();
+        let state = if secret.is_empty() {
+            // A delete failure surfaces: without it the row copy would still
+            // be stripped below and the UI would report a clear that did not
+            // happen.
+            credentials::try_delete_async(0, slot).await?;
+            oauth::providers::SecretState::Unset
+        } else {
+            credentials::store_async(0, slot, secret.clone()).await?;
+            oauth::providers::SecretState::Value(secret)
+        };
+        // Any legacy row copy is now redundant: a clear must not leave it
+        // serving sign-ins, and a successful set means the keyring holds it.
+        // If this fails the command errors — and the next startup migration
+        // still cannot clobber the newer keyring value with the stale row
+        // copy (the keyring wins when both hold a value).
+        let key = oauth_secret_json_key(provider);
+        self.db
+            .write(move |conn| repo::settings::strip_legacy_secret_key(conn, key))
+            .await?;
+        // The flag is known exactly even with no client ID saved yet —
+        // `apply` drops empty-id entries, which would skip the update.
+        let present = !matches!(state, oauth::providers::SecretState::Unset);
+        oauth::providers::set_secret_presence(provider, present);
+        // Refresh the resolver so a cleared secret stops being served and
+        // the legacy fallback mirrors what the row still carries.
+        let settings = self.db.read(|conn| repo::settings::get(conn)).await?;
+        apply_oauth_settings(&settings, &[(provider, state)]).await;
+        Ok(())
+    }
+
+    /// Settings for internal callers (MCP, notifications, the host shell):
+    /// the stored row with no IPC-only presence flags and no keyring access.
+    /// The Tauri `get_settings` command is the IPC shape.
+    pub async fn settings(&self) -> Result<Settings> {
+        let mut settings = self.db.read(|conn| repo::settings::get(conn)).await?;
+        // `skip_serializing` keeps these off the wire; clear them anyway so
+        // no in-memory copy travels with the returned struct.
+        settings.google_client_secret.clear();
+        settings.ms_client_secret.clear();
+        Ok(settings)
+    }
+
     pub async fn get_settings(&self) -> Result<Settings> {
-        self.db.read(|conn| repo::settings::get(conn)).await
+        let mut settings = self.settings().await?;
+        // Presence only, from the resolver's in-memory cache — no keyring
+        // access on this path (it is called on every MCP request and
+        // notification). An unmigrated inline copy still counts as "set": it
+        // can sign in.
+        settings.has_google_client_secret = oauth::providers::has_client_secret(Provider::Gmail);
+        settings.has_ms_client_secret = oauth::providers::has_client_secret(Provider::Microsoft);
+        Ok(settings)
     }
 
     pub async fn set_settings(&self, settings: Settings) -> Result<()> {
-        apply_oauth_settings(&settings);
         self.db
             .write(move |conn| {
                 // New category guidance invalidates cached sender verdicts.
@@ -5793,6 +6680,12 @@ impl Core {
                 repo::settings::set(conn, &settings)
             })
             .await?;
+        // The resolver must mirror the stored row — never the inbound IPC
+        // object (which carries no secrets): this keeps the legacy fallback
+        // pointing at a pending row copy while the keyring is unavailable,
+        // and retries that migration. Inline secrets in the write itself are
+        // ignored — only this migration moves row → keyring.
+        self.migrate_oauth_client_secrets().await;
         // Start/stop/move the MCP server if its settings changed.
         if let Err(e) = self.mcp_apply_settings().await {
             tracing::warn!("mcp: apply settings failed: {e}");
@@ -6042,51 +6935,133 @@ fn safe_filename(name: &str) -> String {
     }
 }
 
+/// Per-draft attachment bounds, consistent with what mail providers accept
+/// (e.g. ~150 MB total message size): generous for real use, small enough
+/// that a misbehaving caller cannot fill the disk via repeated staging.
+/// Enforced at mint (`pick`/`claim`/`prepare`) as UX guidance and at
+/// `save_draft` per entry as the authoritative check.
+pub(crate) const MAX_DRAFT_ATTACHMENTS: usize = 100;
+pub(crate) const MAX_DRAFT_ATTACHMENT_BYTES: u64 = 150 * 1024 * 1024;
+/// Total source bytes of not-yet-consumed prepared forwards one composer
+/// session may queue. Each staged copy is per-draft capped already; this
+/// caps the in-flight queue so a prepare->save loop cannot grow it.
+const MAX_SESSION_PREPARED_BYTES: u64 = 512 * 1024 * 1024;
+
 /// One file staged into the draft-attachment staging area.
 struct StagedAttachment {
     /// Canonicalised absolute path of the staged copy.
     path: String,
-    /// True when this call created the copy; false when the source was
-    /// already inside the staging root and nothing was written.
-    fresh: bool,
+    /// Display name persisted next to the path.
+    filename: String,
 }
 
-/// Copy a composer-picked file into the app-managed draft-attachment staging
-/// area and return the staged absolute path. A path already inside the staging
-/// root (a reloaded draft round-tripping its own staged path) is returned
-/// unchanged.
+/// The resolution of one `save_draft` request entry: either it became (or
+/// already was) a staged file, or it was refused per-entry with a reason
+/// the caller shows on that chip - a refusal never fails the whole save.
+enum ResolvedAttachment {
+    Staged(StagedAttachment),
+    Refused { reason: String },
+}
+
+/// Copy an already-canonical source file into the app-managed
+/// draft-attachment staging area and return the staged absolute path.
+/// `root` must already be canonicalised.
 ///
-/// What this does and does not guarantee: dispatch only ever reads files
-/// under the staging root, so a `draft_attachments` row cannot point SMTP at
-/// an arbitrary path. But any *readable* path the frontend hands to
-/// `save_draft` is still copied into staging and mailed - picking files is a
-/// user gesture the renderer is trusted with, so this is not a boundary
-/// against a compromised renderer exfiltrating files it can read.
-async fn stage_draft_attachment(
+/// What this guarantees: dispatch only ever reads files under the staging
+/// root, so a `draft_attachments` row cannot point SMTP at an arbitrary
+/// path. Who may reach this function is the security boundary: callers are
+/// `save_draft`'s resolution of approval tokens (user picked/dropped the
+/// file), forward references (bytes from the app's own attachment cache) and
+/// staged-file re-use bound to the owning draft - never a raw path from the
+/// webview.
+async fn stage_copy_into(
     root: &std::path::Path,
-    src: &str,
+    canon_src: &std::path::Path,
     filename: &str,
 ) -> Result<StagedAttachment> {
-    tokio::fs::create_dir_all(root).await?;
-    let root = tokio::fs::canonicalize(root).await?;
-    let canon_src = tokio::fs::canonicalize(src)
-        .await
-        .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
-    if canon_src.starts_with(&root) {
-        // Already staged (e.g. re-saving a draft reloaded from the DB).
-        return Ok(StagedAttachment {
-            path: canon_src.to_string_lossy().into_owned(),
-            fresh: false,
-        });
-    }
     let sub = root.join(crate::mime::rand_token());
     tokio::fs::create_dir_all(&sub).await?;
     let dst = sub.join(safe_filename(filename));
-    tokio::fs::copy(&canon_src, &dst).await?;
+    tokio::fs::copy(canon_src, &dst).await?;
     Ok(StagedAttachment {
         path: dst.to_string_lossy().into_owned(),
-        fresh: true,
+        filename: filename.to_string(),
     })
+}
+
+/// Stage a file the user approved through the token registry. Re-validates
+/// at use time: the source must still exist, still canonicalise to the path
+/// recorded at approval (a symlink swapped in after the pick would resolve
+/// elsewhere and must not redirect the copy), and still be a regular file -
+/// directories, devices and FIFOs are refused even though the registry also
+/// skips them at mint time.
+async fn stage_approved_attachment(
+    root: &std::path::Path,
+    approval: &approval::Approval,
+) -> Result<StagedAttachment> {
+    let canon_now = tokio::fs::canonicalize(&approval.canonical_path)
+        .await
+        .map_err(|e| CoreError::Other(format!("attachment {}: {e}", approval.filename)))?;
+    if canon_now != approval.canonical_path {
+        return Err(CoreError::ActionRejected(format!(
+            "attachment {}: the file changed since it was picked",
+            approval.filename
+        )));
+    }
+    let meta = tokio::fs::metadata(&canon_now)
+        .await
+        .map_err(|e| CoreError::Other(format!("attachment {}: {e}", approval.filename)))?;
+    if !meta.file_type().is_file() {
+        return Err(CoreError::ActionRejected(format!(
+            "attachment {}: not a file",
+            approval.filename
+        )));
+    }
+    stage_copy_into(root, &canon_now, &approval.filename).await
+}
+
+/// Rename `dir` to a sibling `<name>.removing-<token>` and return the new
+/// path; `None` when it does not exist. A fallback `remove_dir_all` covers
+/// exotic rename failures so the caller never leaves a live directory in
+/// place that a recycled id could inherit.
+async fn tombstone_dir(dir: &std::path::Path, token: &str) -> Option<std::path::PathBuf> {
+    let target = dir.parent()?.join(format!(
+        "{}.removing-{token}",
+        dir.file_name()?.to_string_lossy()
+    ));
+    match tokio::fs::rename(dir, &target).await {
+        Ok(()) => Some(target),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "tombstone rename failed; deleting in place");
+            let _ = tokio::fs::remove_dir_all(dir).await;
+            None
+        }
+    }
+}
+
+/// Delete leftover `*.removing-*` directories under the mail, attachments and
+/// draft-staging roots - the tail of a removal killed between commit and
+/// post-commit cleanup.
+async fn sweep_removal_tombstones(paths: &Paths) {
+    for parent in [
+        paths.mail_dir(0).parent().map(|p| p.to_path_buf()),
+        paths.attachments_dir(0).parent().map(|p| p.to_path_buf()),
+        Some(paths.draft_attachments_dir()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mut entries = match tokio::fs::read_dir(&parent).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_name().to_string_lossy().contains(".removing-") {
+                let _ = tokio::fs::remove_dir_all(entry.path()).await;
+            }
+        }
+    }
 }
 
 /// Delete staged attachment files, but only paths that canonicalise inside
@@ -6225,18 +7200,160 @@ fn invite_body_text(args: &CreateEventArgs) -> String {
     out
 }
 
-/// Push user-entered OAuth app registrations into the resolver.
-fn apply_oauth_settings(settings: &Settings) {
-    oauth::providers::set_configured(
-        Provider::Gmail,
-        &settings.google_client_id,
-        &settings.google_client_secret,
-    );
-    oauth::providers::set_configured(
-        Provider::Microsoft,
-        &settings.ms_client_id,
-        &settings.ms_client_secret,
-    );
+/// Push user-entered OAuth app registrations into the resolver: client ids,
+/// keyring secret states, and a legacy inline copy — the last always derived
+/// from the stored ROW, never the inbound IPC object, so the fallback
+/// survives settings writes while the keyring is unavailable. `fresh`
+/// carries secret states a migration or `set_oauth_client_secret` just
+/// produced; the other provider keeps its cached state (probed once from the
+/// keyring when the resolver first sees it, never on the grant path).
+async fn apply_oauth_settings(
+    settings: &Settings,
+    fresh: &[(Provider, oauth::providers::SecretState)],
+) {
+    for (provider, id, legacy_field) in [
+        (
+            Provider::Gmail,
+            &settings.google_client_id,
+            &settings.google_client_secret,
+        ),
+        (
+            Provider::Microsoft,
+            &settings.ms_client_id,
+            &settings.ms_client_secret,
+        ),
+    ] {
+        let secret = match fresh.iter().find(|(p, _)| *p == provider) {
+            Some((_, state)) => state.clone(),
+            None => match oauth::providers::cached_secret_state(provider) {
+                // A stale Unavailable gets a fresh probe on every save — a
+                // user action is a fine moment to notice an unlocked keychain.
+                Some(oauth::providers::SecretState::Unavailable) if !id.trim().is_empty() => {
+                    oauth::providers::probe_secret(provider).await
+                }
+                Some(state) => state,
+                None if !id.trim().is_empty() => oauth::providers::probe_secret(provider).await,
+                None => {
+                    // No client ID either: probe once anyway so a secret
+                    // stored before its ID still reports "stored" — the
+                    // recorded flag then suppresses further probes.
+                    if !oauth::providers::presence_known(provider) {
+                        let state = oauth::providers::probe_secret(provider).await;
+                        oauth::providers::set_secret_presence(
+                            provider,
+                            matches!(state, oauth::providers::SecretState::Value(_)),
+                        );
+                    }
+                    oauth::providers::SecretState::Unset
+                }
+            },
+        };
+        oauth::providers::set_configured(provider, id, legacy_inline(legacy_field), secret);
+    }
+}
+
+/// A still-unmigrated inline secret, trimmed; `None` when empty.
+fn legacy_inline(s: &str) -> Option<&str> {
+    let t = s.trim();
+    (!t.is_empty()).then_some(t)
+}
+
+/// The settings-row key one provider's retired inline secret sits under.
+fn oauth_secret_json_key(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Gmail => repo::settings::GOOGLE_CLIENT_SECRET_KEY,
+        Provider::Microsoft => repo::settings::MS_CLIENT_SECRET_KEY,
+        Provider::Imap => "",
+    }
+}
+
+/// Move one retired inline client secret into the OS keyring. Returns the
+/// secret state to cache, or `None` when the field was empty (nothing to
+/// migrate — the caller reuses the cached state or probes once).
+///
+/// The keyring wins when both places hold a value: a keyring entry can only
+/// have been written by `set_oauth_client_secret` or an earlier migration,
+/// which is by construction newer than a row copy — including one a failed
+/// strip left behind. Otherwise: write, then prove the keyring returns the
+/// same value before the settings copy is dropped — a crash in between
+/// leaves the secret recoverable from at least one location. On any keyring
+/// failure the row keeps the secret (the resolver still serves it as the
+/// legacy fallback) and the move is retried on the next start or save.
+async fn migrate_oauth_secret(
+    db: &Db,
+    provider: Provider,
+    field: &mut String,
+) -> Option<oauth::providers::SecretState> {
+    let slot = oauth::providers::client_secret_slot(provider)?;
+    let value = field.trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+    // Serialize the keyring write against set_oauth_client_secret and
+    // re-probe commits, all under the same per-provider guard.
+    let _write = oauth::providers::secret_write_lock(provider).lock().await;
+    let state = match credentials::try_load_async(0, slot).await {
+        Ok(Some(existing)) => {
+            if existing != value {
+                tracing::info!(
+                    ?provider,
+                    "oauth: keyring already holds a different client secret; discarding stale settings copy"
+                );
+            }
+            oauth::providers::SecretState::Value(existing)
+        }
+        Ok(None) => match credentials::store_async(0, slot, value.clone()).await {
+            Ok(()) => match credentials::try_load_async(0, slot).await {
+                Ok(Some(back)) if back == value => oauth::providers::SecretState::Value(back),
+                Ok(_) => {
+                    tracing::warn!(
+                        ?provider,
+                        "oauth: client secret keyring read-back mismatch; keeping settings copy"
+                    );
+                    oauth::providers::SecretState::Unavailable
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        ?provider,
+                        error = %e,
+                        "oauth: client secret keyring read-back failed; keeping settings copy"
+                    );
+                    oauth::providers::SecretState::Unavailable
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    ?provider,
+                    error = %e,
+                    "oauth: OS keyring unavailable; client secret stays in settings until next start"
+                );
+                oauth::providers::SecretState::Unavailable
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                ?provider,
+                error = %e,
+                "oauth: OS keyring unavailable; client secret stays in settings until next start"
+            );
+            oauth::providers::SecretState::Unavailable
+        }
+    };
+    if matches!(state, oauth::providers::SecretState::Value(_)) {
+        field.clear();
+        let key = oauth_secret_json_key(provider);
+        if let Err(e) = db
+            .write(move |conn| repo::settings::strip_legacy_secret_key(conn, key))
+            .await
+        {
+            tracing::warn!(
+                ?provider,
+                error = %e,
+                "oauth: stripping migrated client secret from settings failed; retried next start"
+            );
+        }
+    }
+    Some(state)
 }
 
 /// Which mail an automation pass looks at.
@@ -6264,6 +7381,30 @@ fn valid_automation_route(conn: &rusqlite::Connection, target: &str) -> Result<b
 
 /// Upper bound for one manual Inbox pass, shared by every account in the request.
 const SYNC_NOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+/// How long account removal waits for the account's tasks to unwind before
+/// aborting whatever is still running. Tasks observe the shared stop flag at
+/// their await points and exit in milliseconds; the bound only bites for a
+/// task parked in a network call (e.g. a connect to a dead server), which
+/// then cannot hold deletion hostage.
+const REMOVE_ACCOUNT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Test-only failure injection for `remove_account`'s pre-commit phase:
+/// make the writer-thread barrier report a failure, or roll the delete
+/// transaction back after `repo::accounts::delete` has run.
+#[cfg(test)]
+static REMOVE_FAIL_BARRIER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static REMOVE_FAIL_TX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Test-only gate: when `REMOVE_PAUSE_FOR_ADD` is set, a removal holds the
+/// lifecycle lock inside its locked section (post-commit, pre-cleanup) until
+/// `REMOVE_RESUME_GATE` fires - lets a test queue an account add behind the
+/// removal to prove id-keyed cleanup is ordered before the lock is released.
+#[cfg(test)]
+static REMOVE_PAUSE_FOR_ADD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static REMOVE_RESUME_GATE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// Wait for every account's foreground Inbox pass at once. The passes already
 /// run concurrently (one actor per account); this waits on them concurrently
@@ -6544,10 +7685,12 @@ mod ask_scope_tests {
             cal_handles: Arc::new(RwLock::new(HashMap::new())),
             contacts_handles: Arc::new(RwLock::new(HashMap::new())),
             attachment_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            account_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             embed: Arc::new(embed::EmbedState::new()),
             oauth_cancel: Arc::new(tokio::sync::Notify::new()),
             ui_ready: Arc::new(tokio::sync::Notify::new()),
             ai_router_lock: Arc::new(tokio::sync::Mutex::new(())),
+            approvals: Arc::new(approval::AttachmentApprovals::default()),
             mcp: Arc::new(mcp::McpManager::default()),
         };
         (core, root)
@@ -7109,6 +8252,343 @@ fn revert_action(
     }
     tx.commit()?;
     Ok(thread_id)
+}
+
+#[cfg(test)]
+mod remove_account_failpoint_tests {
+    use super::*;
+    use crate::db::testutil;
+
+    /// Serialises this module's tests: the failpoint flags are one-shot
+    /// globals and `COMAIL_CREDENTIALS_INSECURE_FILE` is process-wide, so two
+    /// of these running at once would steal each other's injections.
+    async fn failpoint_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
+    /// A minimal `Core` over a fresh tempdir DB, with the account's full task
+    /// set running (sync actor + caldav + carddav) and a stored credential -
+    /// the state `remove_account` must restore on every pre-commit failure.
+    async fn test_core() -> (Core, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::for_tests(root.path());
+        paths.ensure().unwrap();
+        // The shared per-process file convention the OAuth tests use; the
+        // account id keeps the entry isolated from theirs.
+        unsafe {
+            std::env::set_var(
+                "COMAIL_CREDENTIALS_INSECURE_FILE",
+                std::env::temp_dir().join(format!(
+                    "comail-tokens-test-creds-{}.json",
+                    std::process::id()
+                )),
+            )
+        };
+        let core = Core {
+            db: Db::open(&paths.db_file()).unwrap(),
+            bus: EventBus::new(),
+            paths: Arc::new(paths),
+            tokens: TokenProvider::new(),
+            handles: Arc::new(RwLock::new(HashMap::new())),
+            cal_handles: Arc::new(RwLock::new(HashMap::new())),
+            contacts_handles: Arc::new(RwLock::new(HashMap::new())),
+            attachment_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            account_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            embed: Arc::new(embed::EmbedState::new()),
+            oauth_cancel: Arc::new(tokio::sync::Notify::new()),
+            ui_ready: Arc::new(tokio::sync::Notify::new()),
+            ai_router_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mcp: Arc::new(mcp::McpManager::default()),
+            approvals: Arc::new(approval::AttachmentApprovals::default()),
+        };
+        core.db
+            .write(|conn| {
+                testutil::seed_account(conn);
+                // Indexed messages spanning more than one sweep batch, plus
+                // one message with a cached body indexed through the real
+                // `index_message` path (its body text is what repair must
+                // reproduce identically).
+                testutil::seed_bulk_messages(conn, 1, 6_001, "bulkterm");
+                let (_t, m) = testutil::seed_message(conn, "s@t.dev", "hdrterm", false);
+                conn.execute(
+                    "INSERT INTO message_bodies (message_id, text_body)
+                     VALUES (?1, 'bodyonlyterm rest of the body')",
+                    [m],
+                )?;
+                repo::search::index_message(conn, m)?;
+                repo::caldav::upsert_config(
+                    conn,
+                    &repo::caldav::CaldavConfig {
+                        account_id: 1,
+                        kind: "generic".into(),
+                        base_url: "https://cal.invalid".into(),
+                        username: Some("u".into()),
+                        principal_url: None,
+                        home_set_url: None,
+                        enabled: true,
+                        last_error: None,
+                    },
+                )?;
+                repo::carddav::upsert_config(
+                    conn,
+                    &repo::carddav::CarddavConfig {
+                        account_id: 1,
+                        base_url: "https://card.invalid".into(),
+                        username: Some("u".into()),
+                        principal_url: None,
+                        home_set_url: None,
+                        enabled: true,
+                        last_error: None,
+                        last_synced_at: None,
+                    },
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        credentials::store_async(1, Slot::Password, "pass".into())
+            .await
+            .unwrap();
+        let cfg = core
+            .db
+            .read(|conn| Ok(repo::accounts::get_config(conn, 1)?.unwrap()))
+            .await
+            .unwrap();
+        core.spawn_actor(cfg).await;
+        core.spawn_cal_task(1).await;
+        core.spawn_contacts_task(1).await;
+        (core, root)
+    }
+
+    /// What every pre-commit failure must leave behind: the account row, its
+    /// credentials, and all three task groups running again.
+    async fn assert_fully_usable(core: &Core) {
+        assert!(
+            core.handles.read().await.contains_key(&1),
+            "sync actor must be running again"
+        );
+        assert!(
+            core.cal_handles.read().await.contains_key(&1),
+            "calendar task must be running again"
+        );
+        assert!(
+            core.contacts_handles.read().await.contains_key(&1),
+            "contacts task must be running again"
+        );
+        assert!(
+            core.db
+                .read(|conn| Ok(repo::accounts::get(conn, 1)?.is_some()))
+                .await
+                .unwrap(),
+            "account row must be intact"
+        );
+        assert_eq!(
+            credentials::load_async(1, Slot::Password).await.unwrap(),
+            "pass",
+            "credentials must survive a rolled-back removal"
+        );
+        // The repair path must leave the search index COMPLETE, not merely
+        // present: every swept row re-indexed, body-only terms matching the
+        // cached body again (same content index_message wrote), the negative
+        // predicate search relies on correct, and the marker cleared.
+        core.db
+            .read(|conn| {
+                let fts: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM messages_fts fts
+                     WHERE fts.rowid IN (SELECT id FROM messages WHERE account_id = 1)",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(fts, 6_002, "every swept FTS row must be re-indexed");
+                let hits: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'bodyonlyterm'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(hits, 1, "body-only term must match the cached body again");
+                let not_indexed: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM messages m
+                     WHERE m.account_id = 1
+                       AND m.id NOT IN (SELECT rowid FROM messages_fts)",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(
+                    not_indexed, 0,
+                    "search's NOT-IN predicate must exclude nothing"
+                );
+                assert!(
+                    repo::accounts::removal_markers(conn)?.is_empty(),
+                    "marker must be cleared after a repaired rollback"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A failing writer-thread barrier is a pre-commit failure: teardown is
+    /// undone and the account is usable again, not left taskless.
+    #[tokio::test]
+    async fn barrier_failure_restores_the_whole_task_set() {
+        let _guard = failpoint_lock().await;
+        let (core, _root) = test_core().await;
+        REMOVE_FAIL_BARRIER.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = core.remove_account(1).await.unwrap_err();
+        assert!(err.to_string().contains("barrier"), "{err}");
+        assert_fully_usable(&core).await;
+    }
+
+    /// A delete-transaction failure rolls the account data back and restarts
+    /// every task group - credentials were not purged yet at that point.
+    #[tokio::test]
+    async fn delete_tx_failure_restores_the_whole_task_set() {
+        let _guard = failpoint_lock().await;
+        let (core, _root) = test_core().await;
+        REMOVE_FAIL_TX.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = core.remove_account(1).await.unwrap_err();
+        assert!(err.to_string().contains("injected delete"), "{err}");
+        assert_fully_usable(&core).await;
+    }
+
+    /// The lifecycle lock excludes account creation from the id-recycle
+    /// window: while it is held a removal can run everything up to the
+    /// delete commit but cannot finish. Releasing it lets it complete.
+    #[tokio::test]
+    async fn removal_cannot_finish_while_the_lifecycle_lock_is_held() {
+        let _guard = failpoint_lock().await;
+        let (core, _root) = test_core().await;
+        // Stop the tasks first so the removal does not burn the test window
+        // waiting on the stop deadline against unreachable hosts.
+        let handle = core.handles.read().await.get(&1).cloned().unwrap();
+        handle.send(SyncCmd::Shutdown);
+
+        let lifecycle = core.account_lifecycle.lock().await;
+        let spawned = {
+            let core = core.clone();
+            tokio::spawn(async move { core.remove_account(1).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !spawned.is_finished(),
+            "remove_account finished while the lifecycle lock was held"
+        );
+        drop(lifecycle);
+        spawned.await.unwrap().unwrap();
+        assert!(core.account_lifecycle.try_lock().is_ok());
+    }
+
+    /// The lifecycle lock is the only thing that makes `account_id` still
+    /// mean "the account being removed" - so every cleanup step keyed by it
+    /// (credential purge) or by recyclable message ids (vector eviction)
+    /// must finish before the lock is released. Hold a removal inside its
+    /// locked section, queue an add behind the lock, and prove the new
+    /// account - which recycles the id - keeps its password and a vector
+    /// pushed on a recycled message id.
+    #[tokio::test]
+    async fn id_keyed_cleanup_finishes_before_the_lifecycle_lock_releases() {
+        let _guard = failpoint_lock().await;
+        let (core, _root) = test_core().await;
+        // Stop the tasks so the removal does not spend the window on the
+        // stop deadline against unreachable hosts.
+        let handle = core.handles.read().await.get(&1).cloned().unwrap();
+        handle.send(SyncCmd::Shutdown);
+        // A vector on one of account 1's messages - the eviction must drop it.
+        let old_mid: i64 = core
+            .db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT id FROM messages WHERE account_id = 1 LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        {
+            let mut idx = core.embed.index.write().await;
+            idx.reset(3, "m");
+            idx.push(old_mid, 0, &[1.0, 0.0, 0.0]);
+        }
+
+        REMOVE_PAUSE_FOR_ADD.store(true, std::sync::atomic::Ordering::SeqCst);
+        let spawned = {
+            let core = core.clone();
+            tokio::spawn(async move { core.remove_account(1).await })
+        };
+        // The flag clears when the removal reaches the gate inside the
+        // locked section - post-commit, before the id-keyed cleanup.
+        while REMOVE_PAUSE_FOR_ADD.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        // Queue the add's locked section. The real add paths
+        // (add_account_password, finish_oauth) hold account_lifecycle across
+        // insert + credential store; they can't run here because
+        // test_connection needs a real TLS IMAP handshake, so this spawns
+        // exactly their locked steps on the same mutex and repo calls.
+        let add = {
+            let core = core.clone();
+            tokio::spawn(async move {
+                let _lifecycle = core.account_lifecycle.lock().await;
+                let id = core
+                    .db
+                    .write(|conn| {
+                        repo::accounts::insert(
+                            conn,
+                            &repo::accounts::NewAccount {
+                                email: "new@test.dev",
+                                display_name: None,
+                                provider: Provider::Imap,
+                                auth_kind: AuthKind::Password,
+                                username: "new",
+                                imap_host: "h",
+                                imap_port: 993,
+                                smtp_host: "h",
+                                smtp_port: 587,
+                            },
+                        )
+                    })
+                    .await
+                    .unwrap();
+                credentials::store_async(id, Slot::Password, "newpass".into())
+                    .await
+                    .unwrap();
+                // A vector on a recycled message id of the new account.
+                core.embed
+                    .index
+                    .write()
+                    .await
+                    .push(old_mid, 0, &[0.0, 1.0, 0.0]);
+                id
+            })
+        };
+        // Let the add reach its lock wait, then release the removal: purge
+        // and eviction run while the lock is still held.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        REMOVE_RESUME_GATE.notify_one();
+        spawned.await.unwrap().unwrap();
+        let new_id = add.await.unwrap();
+        assert_eq!(new_id, 1, "the add must recycle the removed account's id");
+        // ...so the purge could only have deleted the OLD credentials; the
+        // new account's password - stored after the lock released - is intact.
+        assert_eq!(
+            credentials::load_async(1, Slot::Password).await.unwrap(),
+            "newpass"
+        );
+        // And the vector pushed on the recycled message id survived the
+        // removal's eviction, which ran before the add could even insert.
+        let hits = {
+            let idx = core.embed.index.read().await;
+            idx.search(&[0.0, 1.0, 0.0], 5)
+        };
+        assert_eq!(
+            hits.iter().map(|h| h.0).collect::<Vec<_>>(),
+            vec![old_mid],
+            "the recycled-id vector must survive; the old one was evicted"
+        );
+    }
 }
 
 #[cfg(test)]

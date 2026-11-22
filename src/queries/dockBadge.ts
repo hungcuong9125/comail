@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { MOCK_MODE } from "../ipc/mock";
+import { MOCK_MODE } from "../ipc/mockMode";
 import { useSettings, useUnreadCounts } from "./hooks";
 
 /** Mirror the unread count onto the app icon (macOS Dock badge). Mount once. */

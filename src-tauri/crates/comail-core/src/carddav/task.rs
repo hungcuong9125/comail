@@ -13,6 +13,7 @@ use crate::db::repo;
 use crate::error::{CoreError, Result};
 use crate::events::{CoreEvent, EventBus};
 use crate::models::now_ms;
+use crate::sync::engine::AccountTasks;
 
 use super::sync::sync_account;
 
@@ -22,32 +23,47 @@ const POLL_SECS: u64 = 300;
 pub struct ContactsTaskHandle {
     pub account_id: i64,
     tx: mpsc::UnboundedSender<()>,
+    /// Shared stop flag + join handle for the poll task.
+    tasks: std::sync::Arc<AccountTasks>,
 }
 
 impl ContactsTaskHandle {
     pub fn nudge(&self) {
         let _ = self.tx.send(());
     }
+
+    /// Signal the task to stop, then wait for it until `deadline`;
+    /// stragglers are aborted. See [`AccountTasks::stop_and_join`].
+    pub async fn stop_tasks(&self, deadline: tokio::time::Instant) {
+        self.tasks.stop_and_join(deadline).await;
+    }
 }
 
 pub fn spawn(db: Db, bus: EventBus, account_id: i64) -> ContactsTaskHandle {
     let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-    let handle = ContactsTaskHandle { account_id, tx };
-    tokio::spawn(async move {
+    let tasks = std::sync::Arc::new(AccountTasks::new());
+    let handle = ContactsTaskHandle {
+        account_id,
+        tx,
+        tasks: tasks.clone(),
+    };
+    let mut stop = tasks.subscribe();
+    tasks.track(tokio::spawn(async move {
         loop {
             let woke = tokio::select! {
+                _ = stop.changed() => break,
                 m = rx.recv() => m.is_some(),
                 _ = tokio::time::sleep(Duration::from_secs(POLL_SECS)) => true,
             };
-            if !woke {
-                break; // handle dropped: account removed / contacts disconnected
+            if !woke || *stop.borrow() {
+                break; // handle dropped / stopped: account removed / disconnected
             }
             // Drain coalesced nudges.
             while rx.try_recv().is_ok() {}
             run_cycle(&db, &bus, account_id).await;
         }
         tracing::debug!("carddav task for account {account_id} stopped");
-    });
+    }));
     handle
 }
 

@@ -5,6 +5,7 @@ use crate::error::{CoreError, Result};
 
 const SERVICE: &str = "comail";
 
+#[derive(Clone, Copy)]
 pub enum Slot {
     Password,
     RefreshToken,
@@ -24,6 +25,10 @@ pub enum Slot {
     DecisionOpenAiKey,
     /// Key for a custom decision endpoint (account id 0).
     DecisionCustomKey,
+    /// User-supplied Google OAuth client secret (app-level, account id 0).
+    GoogleClientSecret,
+    /// User-supplied Microsoft/Entra OAuth client secret (account id 0).
+    MsClientSecret,
 }
 
 impl Slot {
@@ -39,6 +44,8 @@ impl Slot {
             Slot::DecisionApiKey => "decision_api_key",
             Slot::DecisionOpenAiKey => "decision_api_key_openai",
             Slot::DecisionCustomKey => "decision_api_key_custom",
+            Slot::GoogleClientSecret => "google_client_secret",
+            Slot::MsClientSecret => "ms_client_secret",
         }
     }
 }
@@ -213,19 +220,25 @@ pub fn store(account_id: i64, slot: Slot, secret: &str) -> Result<()> {
 }
 
 pub fn load(account_id: i64, slot: Slot) -> Result<String> {
+    try_load(account_id, slot)?.ok_or_else(|| CoreError::Auth("no stored credential".into()))
+}
+
+/// Like `load` but distinguishes "no entry" (`Ok(None)`) from a real
+/// credential-store failure (`Err`), so callers can fall back deliberately.
+/// (The insecure file cannot tell a missing entry from an unreadable file;
+/// both read as `None` — stores still surface the failure.)
+pub fn try_load(account_id: i64, slot: Slot) -> Result<Option<String>> {
     if let Some(path) = insecure_file() {
         let _guard = file_lock().lock().unwrap_or_else(|e| e.into_inner());
-        return file_map(&path)
-            .remove(&slot_key(account_id, &slot))
-            .ok_or_else(|| CoreError::Auth("no stored credential".into()));
+        return Ok(file_map(&path).remove(&slot_key(account_id, &slot)));
     }
     let head = match entry(account_id, &slot)?.get_password() {
         Ok(s) => s,
-        Err(keyring::Error::NoEntry) => return Err(CoreError::Auth("no stored credential".into())),
+        Err(keyring::Error::NoEntry) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let Some(count) = head.strip_prefix(CHUNK_MARKER) else {
-        return Ok(head);
+        return Ok(Some(head));
     };
     let count: usize = count
         .parse()
@@ -240,22 +253,42 @@ pub fn load(account_id: i64, slot: Slot) -> Result<String> {
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
+/// Per-account slots removed on account deletion. App-level secrets (AI key,
+/// OAuth client secrets, MCP token, decision keys — all under account id 0)
+/// are deliberately absent: they are not credentials of any account.
+const ACCOUNT_SLOTS: [Slot; 5] = [
+    Slot::Password,
+    Slot::RefreshToken,
+    Slot::AccessToken,
+    Slot::CaldavPassword,
+    Slot::CarddavPassword,
+];
+
+/// Delete every credential of one mailbox account — identical semantics in
+/// both backends: exactly the per-account slots and their chunks, never an
+/// app-level secret. Never call with the app-level id (0).
 pub fn delete_all(account_id: i64) {
+    debug_assert_ne!(account_id, 0, "app-level secrets are not per-account");
     if let Some(path) = insecure_file() {
-        let prefix = format!("{account_id}:");
-        let _ = file_update(&path, |map| map.retain(|k, _| !k.starts_with(&prefix)));
+        // Prefix-match per slot so stale chunk keys ("<slot>:cN") go too,
+        // while other accounts' and app-level ("0:…") keys are untouched.
+        let keys: Vec<String> = ACCOUNT_SLOTS
+            .iter()
+            .map(|slot| slot_key(account_id, slot))
+            .collect();
+        let _ = file_update(&path, |map| {
+            map.retain(|k, _| {
+                !keys
+                    .iter()
+                    .any(|key| k == key || k.starts_with(&format!("{key}:c")))
+            })
+        });
         return;
     }
-    for slot in [
-        Slot::Password,
-        Slot::RefreshToken,
-        Slot::AccessToken,
-        Slot::CaldavPassword,
-        Slot::CarddavPassword,
-    ] {
+    for slot in ACCOUNT_SLOTS {
         if let Ok(e) = entry(account_id, &slot) {
             let _ = e.delete_credential();
         }
@@ -265,15 +298,26 @@ pub fn delete_all(account_id: i64) {
 
 /// Remove one stored secret; missing entries are fine.
 pub fn delete(account_id: i64, slot: Slot) {
+    let _ = try_delete(account_id, slot);
+}
+
+/// Like [`delete`] but reports a real store failure to the caller — deleting
+/// a missing entry is still `Ok`.
+pub fn try_delete(account_id: i64, slot: Slot) -> Result<()> {
     if let Some(path) = insecure_file() {
         let key = slot_key(account_id, &slot);
-        let _ = file_update(&path, |map| map.remove(&key));
-        return;
+        let chunks = format!("{key}:c");
+        file_update(&path, |map| {
+            map.retain(|k, _| *k != key && !k.starts_with(&chunks));
+        })?;
+        return Ok(());
     }
-    if let Ok(e) = entry(account_id, &slot) {
-        let _ = e.delete_credential();
+    match entry(account_id, &slot)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(e) => return Err(e.into()),
     }
     delete_chunks_from(account_id, &slot, 0);
+    Ok(())
 }
 
 pub async fn store_async(account_id: i64, slot: Slot, secret: String) -> Result<()> {
@@ -284,6 +328,18 @@ pub async fn store_async(account_id: i64, slot: Slot, secret: String) -> Result<
 
 pub async fn load_async(account_id: i64, slot: Slot) -> Result<String> {
     tokio::task::spawn_blocking(move || load(account_id, slot))
+        .await
+        .map_err(|e| CoreError::Other(e.to_string()))?
+}
+
+pub async fn try_load_async(account_id: i64, slot: Slot) -> Result<Option<String>> {
+    tokio::task::spawn_blocking(move || try_load(account_id, slot))
+        .await
+        .map_err(|e| CoreError::Other(e.to_string()))?
+}
+
+pub async fn try_delete_async(account_id: i64, slot: Slot) -> Result<()> {
+    tokio::task::spawn_blocking(move || try_delete(account_id, slot))
         .await
         .map_err(|e| CoreError::Other(e.to_string()))?
 }

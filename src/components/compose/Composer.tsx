@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import i18n from "../../i18n";
 import { errorMessage, parseError } from "../../ipc/errors";
 import { call } from "../../ipc/commands";
-import { MOCK_MODE } from "../../ipc/mock";
+import { MOCK_MODE } from "../../ipc/mockMode";
 import { subscribeEvent } from "../../ipc/events";
-import type { Address, AiDraftAction, DraftAttachment, MessageDetail, Snippet } from "../../ipc/types";
+import type { Address, AiDraftAction, MessageDetail, Snippet } from "../../ipc/types";
+import type {
+  ComposerAttachment,
+  ForwardSource,
+} from "../../lib/draftAttachments";
+import { ComposerDraft, type ComposerDraftDeps } from "../../lib/composerDraft";
 import { RecipientField } from "./RecipientField";
 import { Checkbox } from "../ui/Field";
 import { onComposerAction } from "../../keyboard/commands";
@@ -26,7 +30,6 @@ import {
   type ComposeMode,
 } from "../../lib/signatures";
 import { draftBodyForSave, quoteToHtml } from "../../lib/draftBody";
-import { DraftSaver } from "../../lib/draftSaver";
 import { playSound } from "../../lib/sound";
 import { RichBody, type RichBodyHandle } from "./RichBody";
 import { deleteDrafts, performThreadAction } from "../../queries/actions";
@@ -228,17 +231,12 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   const [sendLaterOpen, setSendLaterOpen] = useState(false);
   const [snippetOpen, setSnippetOpen] = useState(false);
   const [sending, setSending] = useState(false);
-  const [attachments, setAttachments] = useState<DraftAttachment[]>(
-    state.initial?.attachments ?? [],
-  );
+  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  /** Composer session nonce attachment tokens are bound to. Carried through
+   *  an undo-send reopen via `state.composerNonce`; minted fresh otherwise. */
+  const [composerNonce] = useState(() => state.composerNonce ?? crypto.randomUUID());
   const [dragOver, setDragOver] = useState(false);
-  /** forwarded originals still being extracted; sending waits for them */
-  const [forwardPending, setForwardPending] = useState(0);
-  const forwardPendingRef = useRef(0);
-  /** the original's extracted files, kept so the toggle can re-add them */
-  const forwardFilesRef = useRef<DraftAttachment[]>([]);
   const [includeForwardFiles, setIncludeForwardFiles] = useState(true);
-  const includeForwardFilesRef = useRef(true);
   const forwardFileCount = (state.replyTo?.attachments ?? []).filter((a) => !a.isInline).length;
   const offerForwardFiles =
     state.mode === "forward" && !state.initial && !state.draftId && forwardFileCount > 0;
@@ -305,81 +303,101 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
 
   const bodyRef = useRef<RichBodyHandle>(null);
   const dirtyRef = useRef(false);
+  // Non-attachment fields the controller reads at call time. Attachments
+  // live in the controller's chip model - nowhere else.
   const fieldsRef = useRef({
-    accountId, to, cc, bcc, subject, body, draftId, attachments,
+    accountId, to, cc, bcc, subject, body, draftId,
     quote: init.quote, quoteRemoved,
   });
   fieldsRef.current = {
-    accountId, to, cc, bcc, subject, body, draftId, attachments,
+    accountId, to, cc, bcc, subject, body, draftId,
     quote: init.quote, quoteRemoved,
   };
 
-  // One serialized saver per composer instance: autosave, Send,
-  // save-and-close and Discard all funnel through it so at most one
-  // save_draft call is ever in flight. onSaved only fires while the composer
-  // is open, so a save completing after close can't write global state.
-  const saver = useMemo(
-    () =>
-      new DraftSaver(
-        {
-          save: async (existingId) => {
-            const f = fieldsRef.current;
-            // Backstop: the payload is sanitized here even though the body
-            // state already is - whatever reaches save_draft is clean.
-            const { bodyText, bodyHtml } = draftBodyForSave(
-              f.body,
-              f.quote,
-              f.quoteRemoved,
-            );
-            const { draftId: newId } = await call("save_draft", {
-              args: {
-                draftId: existingId,
-                accountId: f.accountId,
-                to: f.to,
-                cc: f.cc,
-                bcc: f.bcc,
-                subject: f.subject,
-                bodyText,
-                bodyHtml,
-                mode: state.mode,
-                inReplyToMessageId: state.replyTo?.id ?? null,
-                attachments: f.attachments,
-              },
-            });
-            return newId;
-          },
-          onSaved: (id, clean) => {
-            setDraftId(id);
-            fieldsRef.current.draftId = id;
-            setSavedAt(Date.now());
-            // Edits made while the save was in flight stay dirty: the Esc
-            // confirm and the next autosave tick must still see them.
-            set(
-              clean
-                ? { composerDirty: false, editingDraftId: id }
-                : { editingDraftId: id },
-            );
-            if (clean) dirtyRef.current = false;
-          },
-          // The draft vanished under us (deleted on another surface, or
-          // already sent): the saver drops the stale id and recreates.
-          isDraftGone: (err) => parseError(err).code === "not_found",
+  // The attachment + save + send orchestration lives in this controller
+  // (framework-free, unit-tested); the component only owns field state and
+  // renders `chips`. onChips mirrors the chip model into state for render.
+  const draft = useMemo(() => {
+    const forwardSources: ForwardSource[] =
+      state.mode === "forward" && !state.initial && !state.draftId
+        ? (state.replyTo?.attachments ?? [])
+            .filter((a) => !a.isInline)
+            .map((a) => ({
+              attachmentId: a.id,
+              displayName: a.filename ?? "",
+              size: a.size ?? null,
+            }))
+        : [];
+    return new ComposerDraft(
+      {
+        call: call as unknown as ComposerDraftDeps["call"],
+        composerNonce,
+        getFields: () => {
+          const f = fieldsRef.current;
+          // Backstop: the payload is sanitized here even though the body
+          // state already is - whatever reaches save_draft is clean.
+          const { bodyText, bodyHtml } = draftBodyForSave(
+            f.body,
+            f.quote,
+            f.quoteRemoved,
+          );
+          return {
+            accountId: f.accountId,
+            to: f.to,
+            cc: f.cc,
+            bcc: f.bcc,
+            subject: f.subject,
+            bodyText,
+            bodyHtml,
+            mode: state.mode,
+            inReplyToMessageId: state.replyTo?.id ?? null,
+          };
         },
-        state.draftId ?? null,
-      ),
+        onSaved: (id, clean) => {
+          setDraftId(id);
+          fieldsRef.current.draftId = id;
+          setSavedAt(Date.now());
+          // Edits made while the save was in flight stay dirty: the Esc
+          // confirm and the next autosave tick must still see them.
+          set(
+            clean
+              ? { composerDirty: false, editingDraftId: id }
+              : { editingDraftId: id },
+          );
+          if (clean) dirtyRef.current = false;
+        },
+        // The draft vanished under us (deleted on another surface, or
+        // already sent): the saver drops the stale id and recreates.
+        isDraftGone: (err) => parseError(err).code === "not_found",
+        onChips: setAttachments,
+        onChipFailed: (chip, detail) =>
+          pushToast({
+            kind: "error",
+            message: t("compose:forwardAttachFailed", {
+              name: chip.displayName,
+              detail,
+            }),
+          }),
+      },
+      {
+        restored: state.initial?.attachments ?? [],
+        forwardSources,
+        includeForwards: forwardSources.length > 0,
+      },
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
-  );
+  }, []);
+  const saver = draft.saver;
 
-  // "Closed" means this composer instance is gone - and it is reversible,
-  // because StrictMode unmounts and remounts effects in dev while useMemo
-  // keeps the same saver: opening in the effect body keeps the saver alive
-  // through the fake unmount/remount cycle. A drain already in flight
-  // settles silently so Discard can still learn the created draft id.
+  // Construction is pure; IPC begins in this effect. StrictMode's
+  // mount → cleanup → mount reuses the same memoised controller:
+  // dispose() pauses its work and releases unused tokens, the second
+  // start() re-arms it. A drain already in flight settles silently so
+  // Discard can still learn the created draft id.
   useEffect(() => {
-    saver.open();
-    return () => saver.close();
-  }, [saver]);
+    draft.start();
+    return () => draft.dispose();
+  }, [draft]);
 
   useEffect(() => {
     if (accounts && !accounts.some((a) => a.id === accountId) && accounts[0]) {
@@ -426,53 +444,6 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSig]);
 
-  // A fresh forward carries the original's files (not inline images, which
-  // belong to the quoted body). Each is extracted to disk, then staged like a
-  // picked file when the draft saves.
-  useEffect(() => {
-    if (state.mode !== "forward" || state.initial || state.draftId) return;
-    const files = (state.replyTo?.attachments ?? []).filter((a) => !a.isInline);
-    if (files.length === 0) return;
-    let cancelled = false;
-    forwardPendingRef.current = files.length;
-    setForwardPending(files.length);
-    void Promise.all(
-      files.map(async (a) => {
-        try {
-          const filePath = await call("get_attachment", { attachmentId: a.id });
-          if (cancelled) return;
-          const file = { filePath, filename: a.filename ?? t("thread:attachment.fallbackName") };
-          forwardFilesRef.current.push(file);
-          if (!includeForwardFilesRef.current) return;
-          setAttachments((cur) =>
-            cur.some((x) => x.filePath === filePath) ? cur : [...cur, file],
-          );
-        } catch (e) {
-          if (!cancelled) {
-            pushToast({
-              kind: "error",
-              message: t("compose:forwardAttachFailed", {
-                name: a.filename ?? t("thread:attachment.fallbackName"),
-                detail: errorMessage(e),
-              }),
-            });
-          }
-        } finally {
-          if (!cancelled) {
-            forwardPendingRef.current -= 1;
-            setForwardPending(forwardPendingRef.current);
-          }
-        }
-      }),
-    );
-    return () => {
-      cancelled = true;
-      forwardPendingRef.current = 0;
-      forwardFilesRef.current = [];
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const markDirty = () => {
     saver.markChanged();
     if (!dirtyRef.current) {
@@ -518,32 +489,41 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
       // A discard in flight owns the draft id; sending now would race the
       // delete. No state change - the composer is closing anyway.
       if (saver.isDiscarding) return;
-      const f = fieldsRef.current;
-      if (f.to.length === 0) {
+      if (fieldsRef.current.to.length === 0) {
         pushToast({ kind: "error", message: t("compose:addRecipient"), durationMs: 3000 });
-        return;
-      }
-      if (forwardPendingRef.current > 0 && includeForwardFilesRef.current) {
-        pushToast({ kind: "info", message: t("compose:forwardAttaching"), durationMs: 3000 });
         return;
       }
       if (sending) return;
       setSending(true);
       try {
-        // Await any in-flight save and persist whatever is still dirty; the
-        // draft id the last save produced is the one that gets queued, so a
-        // pending first save can't leave a duplicate draft behind.
-        const id = await saver.flush();
-        if (id == null) {
-          // Only possible if the saver was closed under us; never swallow it.
+        // The controller owns the send gate: flush the saver, verify the
+        // chips the user sees equal what the draft holds (one resave on
+        // divergence), then queue_send carrying the expected staged paths
+        // as the Rust backstop.
+        const sendAt = opts.instant ? Date.now() : opts.sendAt;
+        const outcome = await draft.send({ sendAt });
+        if (outcome.kind === "attaching") {
+          pushToast({ kind: "info", message: t("compose:forwardAttaching"), durationMs: 3000 });
+          return;
+        }
+        if (outcome.kind === "failed") {
+          pushToast({
+            kind: "error",
+            message: t("compose:attachmentFailed", { names: outcome.names.join(", ") }),
+            durationMs: 4000,
+          });
+          return;
+        }
+        if (outcome.kind === "out_of_sync") {
           pushToast({
             kind: "error",
             message: t("compose:couldntSend", { error: t("compose:sendNoDraft") }),
           });
           return;
         }
-        const sendAt = opts.instant ? Date.now() : opts.sendAt;
-        const res = await call("queue_send", { args: { draftId: id, sendAt } });
+        const res = outcome.result;
+        const id = outcome.draftId;
+        const f = fieldsRef.current;
         // The draft is now the send queue's: stop autosaving against it so a
         // late tick can't resurrect a copy once it dispatches.
         saver.close();
@@ -555,6 +535,7 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
           draftId: id,
           accountId: f.accountId,
           replyTo: state.replyTo,
+          composerNonce,
           initial: {
             to: f.to,
             cc: f.cc,
@@ -562,7 +543,7 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
             subject: f.subject,
             body: htmlToText(f.body),
             bodyHtml: f.body,
-            attachments: f.attachments,
+            attachments: draft.wire(),
           },
         };
         closeComposer();
@@ -630,40 +611,24 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         setSending(false);
       }
     },
-    [saver, sending, state.mode, state.replyTo, closeComposer, pushToast, t],
+    [saver, sending, state.mode, state.replyTo, closeComposer, pushToast, t, composerNonce],
   );
 
-  // Merge picked/dropped paths into the attachment list, skipping dupes.
-  const stageAttachmentPaths = (paths: string[]) => {
-    setAttachments((cur) => [
-      ...cur,
-      ...paths
-        .filter((p) => !cur.some((a) => a.filePath === p))
-        .map((p) => ({ filePath: p, filename: p.split(/[\\/]/).pop() || p })),
-    ]);
-    markDirty();
-  };
-
-  // Stage files to attach; the backend reads them from disk at dispatch time.
+  // The backend opens the native dialog itself and returns approval tokens;
+  // the webview never sees a usable source path. Over-limit picks come back
+  // in `skipped` and are reported, never become chips that fail every save.
   const attachFiles = useCallback(async () => {
-    if (MOCK_MODE) {
-      // fake picker: add one mock file chip
-      setAttachments((cur) => [
-        ...cur,
-        {
-          filePath: `/tmp/comail-mock/quarterly-report-${cur.length + 1}.pdf`,
-          filename: `quarterly-report-${cur.length + 1}.pdf`,
-        },
-      ]);
-      markDirty();
-      return;
-    }
     try {
-      const picked = await openFileDialog({ multiple: true });
-      if (!picked) return;
-      const paths = Array.isArray(picked) ? picked : [picked];
-      if (paths.length === 0) return;
-      stageAttachmentPaths(paths);
+      const skipped = await draft.pick();
+      for (const s of skipped) {
+        pushToast({
+          kind: "error",
+          message: t("compose:attachmentSkipped", {
+            name: s.path.split(/[\\/]/).pop() ?? s.path,
+            reason: s.reason,
+          }),
+        });
+      }
     } catch (err) {
       pushToast({
         kind: "error",
@@ -676,15 +641,43 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   // The webview intercepts native OS file drops at the window level (no
   // "over any composer" scoping needed - App.tsx only ever mounts one
   // Composer at a time, full-screen or inline). Skipped in mock/browser dev
-  // since there's no real Tauri webview to subscribe to.
+  // since there's no real Tauri webview to subscribe to. The `disposed`
+  // flag makes registration cleanup-safe under StrictMode's double
+  // mount/unmount and fast remounts: a listener whose registration promise
+  // resolves after cleanup unregisters itself instead of leaking.
   useEffect(() => {
     if (MOCK_MODE) return;
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     void getCurrentWebview()
       .onDragDropEvent((event) => {
         if (event.payload.type === "drop") {
           setDragOver(false);
-          stageAttachmentPaths(event.payload.paths);
+          // The Rust window-event handler already registered these paths as
+          // a real OS drop; the claim only exchanges paths Rust saw. A
+          // duplicate claim for an already-claimed drop comes back empty -
+          // a silent no-op, not an error.
+          void draft
+            .claimDrops(event.payload.paths)
+            .then((skipped) => {
+              for (const s of skipped) {
+                pushToast({
+                  kind: "error",
+                  message: t("compose:attachmentSkipped", {
+                    name: s.path.split(/[\\/]/).pop() ?? s.path,
+                    reason: s.reason,
+                  }),
+                });
+              }
+            })
+            .catch((err) =>
+              pushToast({
+                kind: "error",
+                message: t("compose:couldntPickFiles", {
+                  error: errorMessage(err),
+                }),
+              }),
+            );
         } else if (event.payload.type === "enter" || event.payload.type === "over") {
           setDragOver(true);
         } else {
@@ -692,29 +685,27 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         }
       })
       .then((fn) => {
-        unlisten = fn;
+        if (disposed) fn();
+        else unlisten = fn;
       });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** Forward with or without the original's files. */
+  /** Forward with or without the original's files - re-ticking re-prepares
+   *  FRESH chips from the controller's identity stash; old wire refs are
+   *  never replayed. */
   const toggleForwardFiles = () => {
-    const next = !includeForwardFilesRef.current;
-    includeForwardFilesRef.current = next;
+    const next = !includeForwardFiles;
     setIncludeForwardFiles(next);
-    const files = forwardFilesRef.current;
-    const paths = new Set(files.map((f) => f.filePath));
-    setAttachments((cur) => {
-      const rest = cur.filter((a) => !paths.has(a.filePath));
-      return next ? [...rest, ...files] : rest;
-    });
-    markDirty();
+    draft.toggleForward(next);
   };
 
-  const removeAttachment = (filePath: string) => {
-    setAttachments((cur) => cur.filter((a) => a.filePath !== filePath));
-    markDirty();
+  const removeAttachment = (id: string) => {
+    draft.removeAttachment(id);
   };
 
   // "Write with AI": Enter runs ai_draft, result replaces the body.
@@ -1268,20 +1259,26 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
                   />
                 </div>
               )}
-              {includeForwardFiles && forwardPending > 0 && (
-                <span className="co-chip text-ink-faint">
-                  <Icon name="paperclip" size={11} />
-                  {t("compose:forwardAttachingCount", { count: forwardPending })}
-                </span>
-              )}
               {attachments.map((a) => (
-                <span key={a.filePath} className="co-chip" title={a.filePath}>
+                <span
+                  key={a.id}
+                  className={`co-chip${a.status === "error" ? " border-danger/60 text-danger" : ""}`}
+                  title={a.error ?? a.displayName}
+                >
                   <Icon name="paperclip" size={11} />
-                  {a.filename}
+                  {a.displayName}
+                  {a.status === "attaching" && (
+                    <span
+                      className="ml-1 text-ink-faint"
+                      aria-label={t("compose:forwardAttaching")}
+                    >
+                      …
+                    </span>
+                  )}
                   <button
                     className="ml-0.5 rounded px-0.5 text-ink-faint hover:text-danger"
-                    onClick={() => removeAttachment(a.filePath)}
-                    aria-label={t("compose:removeNamed", { name: a.filename })}
+                    onClick={() => removeAttachment(a.id)}
+                    aria-label={t("compose:removeNamed", { name: a.displayName })}
                   >
                     ×
                   </button>

@@ -109,7 +109,7 @@ pub fn spawn_dispatcher(app: AppHandle, core: Core) {
 }
 
 async fn dispatch_due<R: Runtime>(app: &AppHandle<R>, core: &Core) {
-    let settings = match core.get_settings().await {
+    let settings = match core.settings().await {
         Ok(settings) => settings,
         Err(error) => {
             tracing::warn!(%error, "notification dispatcher could not read settings");

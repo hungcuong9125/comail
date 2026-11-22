@@ -20,12 +20,14 @@ import type {
   McpStatus,
   AskCitation,
   AskResult,
+  ApprovedAttachment,
   AttachmentMeta,
   AttachmentPreview,
   CalendarEvent,
   Commands,
   ConnectionTestResult,
   ContactSuggestion,
+  DraftAttachment,
   EmailStats,
   FolderInfo,
   Label,
@@ -36,6 +38,7 @@ import type {
   QueueSendArgs,
   QueueSendResult,
   SaveDraftArgs,
+  SaveDraftResult,
   SearchArgs,
   SearchChip,
   SearchExplain,
@@ -59,9 +62,7 @@ import {
   queryToCondition,
 } from "../lib/ruleCondition";
 
-export const MOCK_MODE =
-  typeof window !== "undefined" &&
-  (!("__TAURI_INTERNALS__" in window) || import.meta.env.VITE_MOCK === "1");
+export { MOCK_MODE } from "./mockMode";
 
 // ---------------------------------------------------------------------------
 // Fixture state
@@ -1489,9 +1490,9 @@ const DEFAULT_MOCK_SETTINGS: Settings = {
   aiTierSummarize: "instant",
   aiTierVoice: "cheap",
   googleClientId: "",
-  googleClientSecret: "",
+  hasGoogleClientSecret: false,
   msClientId: "",
-  msClientSecret: "",
+  hasMsClientSecret: false,
   embeddingBackend: "local",
   embeddingModel: "bge-small-en-v1.5",
   aiQuickReplies: true,
@@ -2199,7 +2200,50 @@ interface DraftLoc {
 const draftIndex = new Map<number, DraftLoc>();
 const draftArgsById = new Map<number, SaveDraftArgs>();
 
-function saveDraft(args: SaveDraftArgs): { draftId: number } {
+// Approval tokens the mock mints for picks/drops/forwards; mirrors the Rust
+// registry so save_draft can resolve token entries to staged ones.
+const mockAttachmentTokens = new Map<
+  string,
+  { filename: string; path: string; size: number }
+>();
+let mockTokenSeq = 0;
+
+function mockApproved(filename: string, path?: string): ApprovedAttachment {
+  const token = `mock-token-${++mockTokenSeq}`;
+  const p = path ?? `/tmp/comail-mock/${filename}`;
+  mockAttachmentTokens.set(token, { filename, path: p, size: 2048 });
+  // `source` is the opaque dedupe alias the real backend sends; one alias
+  // per distinct fake path keeps the demo's dedupe behaving like prod.
+  return { token, filename, source: p, size: 2048, mimeType: null };
+}
+
+function mockAttachmentName(attachmentId: number): string {
+  for (const t of threads)
+    for (const m of t.messages)
+      for (const a of m.attachments)
+        if (a.id === attachmentId)
+          return a.filename ?? `attachment-${attachmentId}`;
+  return `attachment-${attachmentId}`;
+}
+
+/** Resolve incoming attachment entries to the staged references a real
+ *  save_draft returns (tokens become `staged` rows). */
+function stageAttachments(
+  atts: DraftAttachment[],
+): Extract<DraftAttachment, { kind: "staged" }>[] {
+  return atts.map((a) => {
+    if (a.kind === "staged") return a;
+    const filename =
+      mockAttachmentTokens.get(a.token)?.filename ?? "attachment";
+    return {
+      kind: "staged" as const,
+      filePath: `/tmp/comail-mock/staged/${id()}/${filename}`,
+      filename,
+    };
+  });
+}
+
+function saveDraft(args: SaveDraftArgs): SaveDraftResult {
   let loc = args.draftId != null ? draftIndex.get(args.draftId) : undefined;
   let thread: MockThread | undefined;
   let msg: MockMessage | undefined;
@@ -2265,10 +2309,12 @@ function saveDraft(args: SaveDraftArgs): { draftId: number } {
     if (thread && thread.folder === "drafts")
       thread.subject = args.subject || thread.subject;
   }
-  // Staged files replace the draft's attachment set on every save.
-  msg.attachments = (args.attachments ?? []).map((a) => ({
+  // Staged files replace the draft's attachment set on every save; the
+  // stored args keep the staged echoes a real get_draft returns.
+  const staged = stageAttachments(args.attachments ?? []);
+  msg.attachments = staged.map((a) => ({
     id: id(),
-    filename: a.filename,
+    filename: a.kind === "staged" ? a.filename : "attachment",
     mimeType: null,
     size: null,
     isInline: false,
@@ -2279,9 +2325,9 @@ function saveDraft(args: SaveDraftArgs): { draftId: number } {
     to: [...args.to],
     cc: [...args.cc],
     bcc: [...args.bcc],
-    attachments: [...(args.attachments ?? [])],
+    attachments: staged,
   });
-  return { draftId: msg.id };
+  return { draftId: msg.id, attachments: staged };
 }
 
 function getDraft(draftId: number): SaveDraftArgs {
@@ -3088,6 +3134,34 @@ export async function mockInvoke(
       return delay({ cancelled: false });
     }
 
+    case "pick_draft_attachments": {
+      // The mock "dialog" picks one file per click.
+      const n = mockAttachmentTokens.size + 1;
+      return delay({
+        approved: [mockApproved(`quarterly-report-${n}.pdf`)],
+        skipped: [],
+      });
+    }
+
+    case "claim_dropped_attachments":
+      return delay({
+        approved: (a.paths as string[]).map((p) =>
+          mockApproved(p.split(/[\\/]/).pop() || p, p),
+        ),
+        skipped: [],
+      });
+
+    case "prepare_forward_attachment":
+      return delay(
+        mockApproved(mockAttachmentName(a.attachmentId as number)),
+      );
+
+    case "release_attachment_tokens":
+      for (const t of (a.tokens as string[]) ?? []) {
+        mockAttachmentTokens.delete(t);
+      }
+      return delay(undefined);
+
     case "save_draft":
       return delay(saveDraft(a.args as SaveDraftArgs));
 
@@ -3867,6 +3941,21 @@ export async function mockInvoke(
     case "set_ai_key":
     case "set_decision_key":
       return delay(undefined, 150);
+
+    case "set_oauth_client_secret": {
+      // The browser demo keeps no real secret: it only tracks the presence
+      // flag, like the app's settings row.
+      const secret = ((a.secret as string) ?? "").trim() !== "";
+      if (a.provider === "google") settings.hasGoogleClientSecret = secret;
+      else if (a.provider === "microsoft")
+        settings.hasMsClientSecret = secret;
+      try {
+        localStorage.setItem("comail:mock-settings", JSON.stringify(settings));
+      } catch {
+        /* ignore */
+      }
+      return delay(undefined, 150);
+    }
 
     case "test_decision_provider": {
       const chain = [

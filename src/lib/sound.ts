@@ -12,7 +12,7 @@
 // definition; nothing can ever reach the speakers except an explicit
 // playSound(). Decoded buffers also start with zero latency and keep working
 // while the app is backgrounded.
-import { MOCK_MODE } from "../ipc/mock";
+import { MOCK_MODE } from "../ipc/mockMode";
 import type { Settings } from "../ipc/types";
 import { queryClient } from "../queries/client";
 

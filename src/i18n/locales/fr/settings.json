@@ -269,7 +269,7 @@
       "g2": "Écran de consentement OAuth : choisissez Externe (Interne seulement si vous avez une organisation Workspace), renseignez le nom de l’application et votre e-mail comme contact d’assistance et de développeur, puis ajoutez votre propre adresse Gmail sous Utilisateurs test.",
       "g3": "Scopes : cliquez sur Ajouter ou supprimer des scopes, collez https://mail.google.com/ dans la zone de saisie manuelle et ajoutez-le. C’est le seul scope accepté par Google pour IMAP/SMTP XOAUTH2 ; vous n’avez pas besoin d’activer l’API Gmail.",
       "g4": "Identifiants : Créer des identifiants, ID client OAuth, type d’application Application de bureau. Les clients de bureau acceptent automatiquement la boucle locale http://127.0.0.1, il n’y a donc aucune URI de redirection à configurer.",
-      "g5": "Copiez le client ID (se termine par .apps.googleusercontent.com) et le secret client (commence par GOCSPX-) dans les champs ci-dessous. Ils sont enregistrés à la perte de focus ou avec Entrée.",
+      "g5": "Copiez le client ID (se termine par .apps.googleusercontent.com) et le secret client (commence par GOCSPX-) dans les champs ci-dessous. Le client ID est enregistré à la perte de focus ou avec Entrée ; le secret s'enregistre avec son bouton Enregistrer et est conservé dans le trousseau système.",
       "g6": "Une fois la connexion fonctionnelle, revenez à l’écran de consentement et cliquez sur Publier l’application (Production). En statut Test, Google fait expirer les jetons d’actualisation après 7 jours et le compte doit être réauthentifié chaque semaine ; la publication l’évite.",
       "g7": "Pour la synchronisation de l’agenda (Connecter Google Agenda) : dans le même projet, activez l’API Google Calendar (API et services, Bibliothèque, cherchez Google Calendar API, Activer), et sur l’écran de consentement ajoutez le scope https://www.googleapis.com/auth/calendar. Sans les deux, la connexion échoue avec une erreur du serveur d’agenda.",
       "msTitle": "Microsoft (Outlook / 365)",
@@ -283,7 +283,12 @@
       "msNote": "Compte personnel Outlook.com / Hotmail / Live ? Vous enregistrez quand même l’application ici. Connectez-vous au portail avec votre compte personnel (c’est gratuit, aucun abonnement Azure requis) et choisissez l’option multilocataire + personnel à l’étape 2. Le compte utilisé pour l’enregistrement et la boîte que vous connectez peuvent être différents.",
       "docsHint": "Vous préférez le guide complet avec captures d’écran et dépannage ?",
       "viewDocs": "Voir le guide complet sur GitHub"
-    }
+    },
+    "secretSaved": "Secret client enregistré",
+    "secretCleared": "Secret client effacé",
+    "secretStored": "Enregistré dans le trousseau système et jamais affiché.",
+    "secretClear": "Effacer",
+    "secretClearConfirm": "Supprimer"
   },
   "accounts": {
     "signedOut": "Déconnecté. La synchronisation du courrier est en pause jusqu'à la reconnexion.",

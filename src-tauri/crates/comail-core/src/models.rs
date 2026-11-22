@@ -332,11 +332,60 @@ pub struct ActionResult {
     pub action_ids: Vec<i64>,
 }
 
+/// How a draft attachment reaches the staging area. The webview can never
+/// name a source path: a compromised renderer with path-passing ability
+/// could attach (and then send) any readable local file. Every variant
+/// therefore refers to something Rust has authority over.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum DraftAttachmentIn {
+    /// A file the user approved through a trusted Rust path - the native
+    /// file dialog, an OS drop exchanged via `claim_dropped_attachments`, or
+    /// a forward source resolved by `prepare_forward_attachment`. The token
+    /// is opaque, single-use-on-commit and expires (see `approval.rs`); the
+    /// staged copy is taken at save time.
+    Token { token: String },
+    /// A file already staged under the staging root that THIS draft already
+    /// references - the shape `get_draft` and `save_draft` return, echoed
+    /// back on re-save - or a staged file this same composer session
+    /// produced earlier (draft-recreated adoption). `filename` is echoed for
+    /// display only; the persisted name comes from the draft's existing row.
+    Staged { file_path: String, filename: String },
+}
+
+/// A user-approved attachment source: what `pick_draft_attachments`,
+/// `claim_dropped_attachments` and `prepare_forward_attachment` return.
+/// `token` is the only part `save_draft` can consume; the rest is display
+/// metadata for the attachment chip. No source path ever crosses to the
+/// webview - `source` is an opaque session alias for dedupe only.
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DraftAttachmentIn {
-    pub file_path: String,
+pub struct ApprovedAttachment {
+    pub token: String,
     pub filename: String,
+    /// Opaque per-source-file alias, stable within the session: two
+    /// approvals of the same canonical file share it. Dedupe only.
+    pub source: String,
+    pub size: u64,
+    pub mime_type: Option<String>,
+}
+
+/// What `claim_dropped_attachments` returns: tokens for the usable files the
+/// OS dropped, plus the observed-but-unusable entries (a folder, a file that
+/// vanished) the UI should surface rather than silently drop.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropClaim {
+    pub approved: Vec<ApprovedAttachment>,
+    pub skipped: Vec<SkippedDrop>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedDrop {
+    /// The path as reported by the OS drop event (never used for staging).
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +405,36 @@ pub struct SaveDraftArgs {
     pub in_reply_to_message_id: Option<i64>,
     #[serde(default)]
     pub attachments: Vec<DraftAttachmentIn>,
+    /// The composer session nonce the attachment tokens were minted for.
+    /// Internal saves (calendar invites, MCP drafts) leave it `None`, which
+    /// also matches nonce-less internal approvals.
+    #[serde(default)]
+    pub composer_nonce: Option<String>,
+}
+
+/// The persisted outcome of ONE `save_draft` attachment entry, in request
+/// order. `staged` is the ref the composer echoes on re-save (a one-shot
+/// `Token` entry must never be replayed); `refused` means the entry was
+/// rejected per-entry (e.g. over the per-draft size limit) while the rest
+/// of the draft saved - the composer marks that chip failed and leaves it
+/// out of the wire on the next save.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SavedAttachment {
+    #[serde(rename = "staged")]
+    Staged { file_path: String, filename: String },
+    #[serde(rename = "refused")]
+    Refused { reason: String },
+}
+
+/// What `save_draft` returns: the draft id plus one `SavedAttachment` per
+/// request entry, aligned by index - request order IS the mapping, so the
+/// composer zips them onto the chips the request was built from.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDraftResult {
+    pub draft_id: i64,
+    pub attachments: Vec<SavedAttachment>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -363,6 +442,12 @@ pub struct SaveDraftArgs {
 pub struct QueueSendArgs {
     pub draft_id: i64,
     pub send_at: Option<i64>,
+    /// The staged paths the composer believes this draft holds. Optional
+    /// backstop: when present, queueing is refused if the draft's
+    /// `draft_attachments` rows differ - the draft that goes out must be the
+    /// one the composer shows. Internal callers (MCP) leave it unset.
+    #[serde(default)]
+    pub expected_attachments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -998,7 +1083,7 @@ pub struct AiAutomationPlan {
     pub issues: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub theme: String,
@@ -1066,13 +1151,26 @@ pub struct Settings {
     /// (COMAIL_GOOGLE_CLIENT_ID etc.) override these when set.
     #[serde(default)]
     pub google_client_id: String,
+    /// Whether a Google OAuth client secret is stored in the OS keyring.
+    /// Presence only: the value never crosses IPC; `set_oauth_client_secret`
+    /// stores or clears it.
     #[serde(default)]
+    pub has_google_client_secret: bool,
+    /// Retired field: settings rows written before secrets moved to the OS
+    /// keyring carry the secret inline. Deserialized only so the startup
+    /// migration can move it; `skip_serializing` keeps it out of every row
+    /// rewrite and every IPC reply.
+    #[serde(default, skip_serializing)]
     pub google_client_secret: String,
     #[serde(default)]
     pub ms_client_id: String,
-    /// Only for Web-type Entra registrations; public (desktop) clients must
-    /// leave this empty or Microsoft rejects the token request.
+    /// Whether a Microsoft OAuth client secret is stored in the OS keyring
+    /// (only Web-type Entra registrations use one; public desktop clients
+    /// must leave it unset or Microsoft rejects the token request).
     #[serde(default)]
+    pub has_ms_client_secret: bool,
+    /// Retired inline copy, same contract as `google_client_secret`.
+    #[serde(default, skip_serializing)]
     pub ms_client_secret: String,
     /// Semantic-search embedding backend: "local" | "off". Local runs a small
     /// model on-device; off disables vector indexing (keyword search only).
@@ -1272,6 +1370,21 @@ pub struct SignatureDefaults {
     pub reply_id: Option<String>,
 }
 
+/// The retired inline secrets are redacted: even while a row copy is still
+/// pending keyring migration, a Debug dump must not leak it to logs.
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |s: &str| if s.is_empty() { "" } else { "<redacted>" };
+        f.debug_struct("Settings")
+            .field(
+                "google_client_secret",
+                &redacted(&self.google_client_secret),
+            )
+            .field("ms_client_secret", &redacted(&self.ms_client_secret))
+            .finish_non_exhaustive()
+    }
+}
+
 impl Settings {
     /// The retired "holiday" theme reads back as Snow (it was a light theme),
     /// both globally and as a per-account override.
@@ -1426,8 +1539,10 @@ impl Default for Settings {
             ai_tier_summarize: default_tier_instant(),
             ai_tier_voice: default_tier_cheap(),
             google_client_id: String::new(),
+            has_google_client_secret: false,
             google_client_secret: String::new(),
             ms_client_id: String::new(),
+            has_ms_client_secret: false,
             ms_client_secret: String::new(),
             embedding_backend: default_embedding_backend(),
             embedding_model: default_embedding_model(),

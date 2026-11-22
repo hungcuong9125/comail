@@ -5,6 +5,10 @@ use comail_core::{
 };
 use std::sync::Arc;
 
+fn stop_rx() -> tokio::sync::watch::Receiver<bool> {
+    tokio::sync::watch::channel(false).1
+}
+
 #[tokio::test]
 #[ignore = "requires disposable Dovecot at 11993 and COMAIL_TLS_INSECURE=1"]
 async fn exact_identity_search_and_chained_move_with_missing_uid() {
@@ -128,7 +132,7 @@ async fn exact_identity_search_and_chained_move_with_missing_uid() {
         .await
         .unwrap();
     for _ in 0..3 {
-        queue::execute_due(&ctx, &config, &mut session)
+        queue::execute_due(&ctx, &config, &mut session, &stop_rx())
             .await
             .unwrap();
     }

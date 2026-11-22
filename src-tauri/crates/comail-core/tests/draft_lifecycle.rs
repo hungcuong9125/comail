@@ -27,6 +27,18 @@ async fn setup() -> (tempfile::TempDir, Core) {
     (tmp, core)
 }
 
+/// "The user picked this file in the dialog": mint an approval token for
+/// `path` as `pick_draft_attachments` does once the dialog returns.
+async fn token_for(core: &Core, path: &std::path::Path) -> DraftAttachmentIn {
+    let approved = core
+        .approve_attachment_sources(vec![path.to_path_buf()], None)
+        .unwrap();
+    assert_eq!(approved.len(), 1, "approve skipped {path:?}");
+    DraftAttachmentIn::Token {
+        token: approved[0].token.clone(),
+    }
+}
+
 fn args(attachment: Option<DraftAttachmentIn>) -> SaveDraftArgs {
     SaveDraftArgs {
         draft_id: None,
@@ -49,6 +61,7 @@ fn args(attachment: Option<DraftAttachmentIn>) -> SaveDraftArgs {
         mode: "new".into(),
         in_reply_to_message_id: None,
         attachments: attachment.into_iter().collect(),
+        composer_nonce: None,
     }
 }
 
@@ -58,12 +71,10 @@ async fn saved_draft_can_be_reloaded_without_losing_editable_fields() {
     let source = tmp.path().join("notes.txt");
     std::fs::write(&source, "notes").unwrap();
     let draft_id = core
-        .save_draft(args(Some(DraftAttachmentIn {
-            file_path: source.to_string_lossy().into_owned(),
-            filename: "notes.txt".into(),
-        })))
+        .save_draft(args(Some(token_for(&core, &source).await)))
         .await
-        .unwrap();
+        .unwrap()
+        .draft_id;
 
     let loaded = core.get_draft(draft_id).await.unwrap();
     assert_eq!(loaded.draft_id, Some(draft_id));
@@ -76,14 +87,23 @@ async fn saved_draft_can_be_reloaded_without_losing_editable_fields() {
         Some("<p>Still <strong>working</strong></p>")
     );
     assert_eq!(loaded.attachments.len(), 1);
-    assert_eq!(loaded.attachments[0].filename, "notes.txt");
-    assert_ne!(loaded.attachments[0].file_path, source.to_string_lossy());
+    // Reloaded attachments are `Staged` echoes the composer returns verbatim.
+    let DraftAttachmentIn::Staged {
+        file_path,
+        filename,
+        ..
+    } = &loaded.attachments[0]
+    else {
+        panic!("get_draft must return Staged attachment references");
+    };
+    assert_eq!(filename, "notes.txt");
+    assert_ne!(file_path.as_str(), source.to_string_lossy());
 }
 
 #[tokio::test]
 async fn archive_and_trash_remove_local_drafts_from_the_drafts_view() {
     let (_tmp, core) = setup().await;
-    let archived_id = core.save_draft(args(None)).await.unwrap();
+    let archived_id = core.save_draft(args(None)).await.unwrap().draft_id;
     let thread_id = core
         .db
         .read(move |conn| {
@@ -119,7 +139,7 @@ async fn archive_and_trash_remove_local_drafts_from_the_drafts_view() {
         1
     );
 
-    let trashed_id = core.save_draft(args(None)).await.unwrap();
+    let trashed_id = core.save_draft(args(None)).await.unwrap().draft_id;
     let trashed_thread = core
         .db
         .read(move |conn| {
@@ -158,7 +178,7 @@ async fn archive_and_trash_remove_local_drafts_from_the_drafts_view() {
 #[tokio::test]
 async fn deleting_a_remote_draft_queues_trash_instead_of_allowing_resurrection() {
     let (_tmp, core) = setup().await;
-    let draft_id = core.save_draft(args(None)).await.unwrap();
+    let draft_id = core.save_draft(args(None)).await.unwrap().draft_id;
     core.db
         .write(move |conn| {
             conn.execute("UPDATE messages SET uid = 42 WHERE id = ?1", [draft_id])?;
@@ -303,10 +323,7 @@ async fn rejected_save_removes_freshly_staged_attachment() {
     let src = tmp.path().join("attach.bin");
     std::fs::write(&src, b"payload").unwrap();
     let mut a = update_args(sent_id);
-    a.attachments.push(DraftAttachmentIn {
-        file_path: src.to_string_lossy().into_owned(),
-        filename: "attach.bin".into(),
-    });
+    a.attachments.push(token_for(&core, &src).await);
     let err = core.save_draft(a).await.unwrap_err();
     assert!(matches!(err, comail_core::error::CoreError::NotFound(_)));
 
@@ -332,12 +349,14 @@ async fn rejected_save_removes_freshly_staged_attachment() {
 #[tokio::test]
 async fn delete_draft_cancels_its_pending_send() {
     let (_tmp, core) = setup().await;
-    let draft_id = core.save_draft(args(None)).await.unwrap();
+    let draft_id = core.save_draft(args(None)).await.unwrap().draft_id;
     let send_at = now_ms() + 3_600_000; // far future: never dispatches here
     let result = core
         .queue_send(QueueSendArgs {
             draft_id,
             send_at: Some(send_at),
+
+            expected_attachments: None,
         })
         .await
         .unwrap();
@@ -364,11 +383,13 @@ async fn delete_draft_cancels_its_pending_send() {
 #[tokio::test]
 async fn delete_draft_refuses_while_its_send_is_in_flight() {
     let (_tmp, core) = setup().await;
-    let draft_id = core.save_draft(args(None)).await.unwrap();
+    let draft_id = core.save_draft(args(None)).await.unwrap().draft_id;
     let result = core
         .queue_send(QueueSendArgs {
             draft_id,
             send_at: Some(now_ms() + 3_600_000),
+
+            expected_attachments: None,
         })
         .await
         .unwrap();
@@ -419,16 +440,16 @@ async fn deleting_a_remote_draft_without_a_trash_folder_is_rejected_not_gone() {
     let src = tmp.path().join("keep.bin");
     std::fs::write(&src, b"payload").unwrap();
     let draft_id = core
-        .save_draft(args(Some(DraftAttachmentIn {
-            file_path: src.to_string_lossy().into_owned(),
-            filename: "keep.bin".into(),
-        })))
+        .save_draft(args(Some(token_for(&core, &src).await)))
         .await
-        .unwrap();
+        .unwrap()
+        .draft_id;
     let send = core
         .queue_send(QueueSendArgs {
             draft_id,
             send_at: Some(now_ms() + 3_600_000),
+
+            expected_attachments: None,
         })
         .await
         .unwrap();

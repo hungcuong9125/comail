@@ -1,6 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { EventMap } from "./types";
-import { MOCK_MODE } from "./mock";
+import { MOCK_MODE } from "./mockMode";
 import { subscribeMockEvent } from "./mockEvents";
 
 /** Subscribe after the native listener is installed, for snapshot handshakes. */

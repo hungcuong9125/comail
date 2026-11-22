@@ -344,7 +344,7 @@ pub fn run() {
                     .await
                     .expect("failed to start comail core");
                 events::spawn_forwarder(handle.clone(), core.bus.subscribe());
-                let lang = resolve_lang(&core.get_settings().await.unwrap_or_default().language);
+                let lang = resolve_lang(&core.settings().await.unwrap_or_default().language);
                 handle.manage(AppState { core: core.clone() });
                 apple_intents::install(&handle);
                 notifications::spawn_dispatcher(handle.clone(), core);
@@ -423,6 +423,18 @@ pub fn run() {
                 }
             }
         })
+        // Register OS file drops on the Rust side. This is what makes a drop a
+        // real user gesture: the webview's own drag/drop events still fire
+        // (this listener is additive - the built-in emission runs first), but
+        // `claim_dropped_attachments` only mints tokens for paths observed
+        // here, so the webview can't nominate files it claims were dropped.
+        .on_webview_event(|webview, event| {
+            if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                if let Some(state) = webview.try_state::<AppState>() {
+                    state.core.record_os_drop(paths);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::ui_ready,
             commands::cinema_close,
@@ -450,6 +462,10 @@ pub fn run() {
             commands::undo_last,
             commands::cancel_send,
             commands::send_now,
+            commands::pick_draft_attachments,
+            commands::claim_dropped_attachments,
+            commands::prepare_forward_attachment,
+            commands::release_attachment_tokens,
             commands::save_draft,
             commands::get_draft,
             commands::delete_draft,
@@ -521,6 +537,7 @@ pub fn run() {
             commands::email_stats,
             commands::ai_plan_automation,
             commands::set_ai_key,
+            commands::set_oauth_client_secret,
             commands::set_decision_key,
             commands::test_decision_provider,
             commands::create_category,

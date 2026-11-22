@@ -194,12 +194,16 @@ async fn offline_actions_queue_locally_and_survive_restart() {
             mode: "new".into(),
             in_reply_to_message_id: None,
             attachments: vec![],
+            composer_nonce: None,
         })
         .await
-        .expect("save draft offline");
+        .expect("save draft offline")
+        .draft_id;
     core.queue_send(QueueSendArgs {
         draft_id,
         send_at: Some(now_ms()),
+
+        expected_attachments: None,
     })
     .await
     .expect("queue send offline");

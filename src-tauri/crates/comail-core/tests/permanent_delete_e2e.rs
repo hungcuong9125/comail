@@ -6,6 +6,10 @@ use comail_core::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+fn stop_rx() -> tokio::sync::watch::Receiver<bool> {
+    tokio::sync::watch::channel(false).1
+}
+
 async fn mcp(http: &reqwest::Client, url: &str, token: &str, name: &str, args: Value) -> Value {
     let text = http.post(url).bearer_auth(token)
         .header("accept", "application/json, text/event-stream")
@@ -146,7 +150,7 @@ async fn shared_action_and_mcp_delete_with_remote_confirmation_and_safety_guards
                 .is_some()
         );
         imap::select(&mut session, &trash).await.unwrap();
-        queue::execute_due(&ctx, &config, &mut session)
+        queue::execute_due(&ctx, &config, &mut session, &stop_rx())
             .await
             .unwrap();
         let status = core.deletion_status(result.action_ids).await.unwrap();
@@ -199,7 +203,7 @@ async fn shared_action_and_mcp_delete_with_remote_confirmation_and_safety_guards
             .perform_action(action(ActionKind::DeletePermanently, 3))
             .await
             .unwrap();
-        queue::execute_due(&ctx, &config, &mut session)
+        queue::execute_due(&ctx, &config, &mut session, &stop_rx())
             .await
             .unwrap();
         assert_eq!(
@@ -264,7 +268,7 @@ async fn shared_action_and_mcp_delete_with_remote_confirmation_and_safety_guards
         .await;
         assert_eq!(out["status"], "queued");
         let mut deletion_events = core.bus.subscribe();
-        queue::execute_due(&ctx, &config, &mut session)
+        queue::execute_due(&ctx, &config, &mut session, &stop_rx())
             .await
             .unwrap();
         let statuses = mcp(
@@ -337,7 +341,7 @@ async fn shared_action_and_mcp_delete_with_remote_confirmation_and_safety_guards
             .await
             .unwrap();
         for _ in 0..4 {
-            queue::execute_due(&ctx, &config, &mut session)
+            queue::execute_due(&ctx, &config, &mut session, &stop_rx())
                 .await
                 .unwrap();
         }
@@ -422,7 +426,7 @@ async fn shared_action_and_mcp_delete_with_remote_confirmation_and_safety_guards
                 .unwrap()
                 .is_some()
         );
-        queue::execute_due(&ctx, &config, &mut session)
+        queue::execute_due(&ctx, &config, &mut session, &stop_rx())
             .await
             .unwrap();
         let move_state = core
@@ -447,7 +451,7 @@ async fn shared_action_and_mcp_delete_with_remote_confirmation_and_safety_guards
             2,
             "target reaches canonical Trash before deletion"
         );
-        queue::execute_due(&ctx, &config, &mut session)
+        queue::execute_due(&ctx, &config, &mut session, &stop_rx())
             .await
             .unwrap();
         assert_eq!(
@@ -533,7 +537,7 @@ async fn shared_action_and_mcp_delete_with_remote_confirmation_and_safety_guards
             })
             .await
             .unwrap();
-        queue::execute_due(&ctx, &config, &mut session)
+        queue::execute_due(&ctx, &config, &mut session, &stop_rx())
             .await
             .unwrap();
         let rollback_status = core

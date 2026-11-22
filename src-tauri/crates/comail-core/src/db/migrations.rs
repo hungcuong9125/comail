@@ -40,6 +40,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/036_rescan_skipped_headers.sql"),
     include_str!("migrations/037_tab_override.sql"),
     include_str!("migrations/038_carddav.sql"),
+    include_str!("migrations/039_removing_accounts.sql"),
 ];
 
 pub fn run(conn: &mut Connection) -> Result<()> {
