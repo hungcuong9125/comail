@@ -9,6 +9,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { captureOutsideSelection } from "../../lib/selection";
 import { stripFormatting, textToHtml } from "../../lib/richtext";
+import { sanitizeEditorHtml } from "../../lib/signatures";
 import { activeMention } from "../../lib/mentions";
 import { addressName, IS_MAC } from "../../lib/format";
 import { call } from "../../ipc/commands";
@@ -114,15 +115,23 @@ export const RichBody = forwardRef<
   }, []);
 
   // Sync external value -> DOM (only when it actually differs, so typing
-  // never fights the caret).
+  // never fights the caret). The value goes through the editor allowlist
+  // first: drafts and AI output are raw HTML, and whatever lands in the DOM is
+  // what send/draft-save serializes back out.
   useEffect(() => {
     const el = elRef.current;
-    if (el && el.innerHTML !== value) {
-      el.innerHTML = value;
-      lastEmittedRef.current = value;
-      refreshEmpty(el);
-    }
-  }, [value, refreshEmpty]);
+    if (!el) return;
+    const clean = sanitizeEditorHtml(value);
+    if (el.innerHTML === clean) return;
+    el.innerHTML = clean;
+    refreshEmpty(el);
+    lastEmittedRef.current = el.innerHTML;
+    // When the allowlist changed the input, hand the safe version back so the
+    // parent's body state (and any draft/send built from it) carries it too.
+    // Idempotent - editor-produced HTML is a fixed point, so this settles in
+    // one pass and never fires for ordinary typing.
+    if (clean !== value) onChange(el.innerHTML);
+  }, [value, onChange, refreshEmpty]);
 
   const emit = useCallback(() => {
     const el = elRef.current;
@@ -379,7 +388,7 @@ export const RichBody = forwardRef<
       const range = sel.getRangeAt(0);
       range.deleteContents();
       const tpl = document.createElement("template");
-      tpl.innerHTML = html;
+      tpl.innerHTML = sanitizeEditorHtml(html);
       const last = tpl.content.lastChild;
       range.insertNode(tpl.content);
       const after = document.createRange();
@@ -640,8 +649,20 @@ export const RichBody = forwardRef<
       // Bare hostnames get https:// so they aren't treated as relative paths.
       const href = /^(https?:|mailto:|tel:|#|\/)/i.test(raw) ? raw : `https://${raw}`;
       const sel = document.getSelection();
-      if (sel && sel.isCollapsed) {
-        document.execCommand("insertHTML", false, `<a href="${href.replace(/"/g, "&quot;")}">${href}</a>`);
+      if (sel && sel.isCollapsed && sel.rangeCount) {
+        // Build the anchor as a node: outerHTML serializes both the attribute
+        // and the text safely, so the URL can't break out of its quotes.
+        const a = document.createElement("a");
+        a.setAttribute("href", href);
+        a.textContent = href;
+        if (!document.execCommand("insertHTML", false, a.outerHTML)) {
+          const range = sel.getRangeAt(0);
+          range.insertNode(a);
+          range.setStartAfter(a);
+          range.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
       } else {
         document.execCommand("createLink", false, href);
       }
@@ -895,7 +916,38 @@ export const RichBody = forwardRef<
             if (file) {
               e.preventDefault();
               insertImageFile(file);
+              return;
             }
+          }
+          // Clipboard HTML (web pages, Word, other mail clients) is arbitrary
+          // markup: run it through the editor allowlist before it reaches the
+          // DOM. Without this branch the browser would paste it unsanitized.
+          const html = e.clipboardData?.getData("text/html") ?? "";
+          if (html) {
+            e.preventDefault();
+            const clean = sanitizeEditorHtml(html);
+            const sel = document.getSelection();
+            if (!sel || sel.rangeCount === 0) return;
+            if (clean) {
+              if (!document.execCommand("insertHTML", false, clean)) {
+                const range = sel.getRangeAt(0);
+                range.deleteContents();
+                const tpl = document.createElement("template");
+                tpl.innerHTML = clean;
+                const last = tpl.content.lastChild;
+                range.insertNode(tpl.content);
+                const after = document.createRange();
+                if (last) after.setStartAfter(last);
+                else after.setStart(range.startContainer, range.startOffset);
+                after.collapse(true);
+                sel.removeAllRanges();
+                sel.addRange(after);
+              }
+            } else if (plain) {
+              // Nothing survived the allowlist; keep the plain text at least.
+              replaceRangeWithText(sel.getRangeAt(0), sel, plain);
+            }
+            emit();
           }
         }}
       />

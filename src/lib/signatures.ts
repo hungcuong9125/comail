@@ -98,6 +98,39 @@ export function replaceSignature(bodyHtml: string, sigHtml: string): string {
 // text with `<`/`>` escaped. A tokenizer that reads odd markup differently from
 // a browser can therefore only drop content, never let markup through. Tags are
 // balanced on output so the signature block can't leak into the body around it.
+//
+// The same engine, under a wider profile, sanitizes everything that enters the
+// composer's contenteditable DOM (drafts, AI output, pasted HTML, inserted
+// fragments) — see sanitizeEditorHtml.
+
+/** What one sanitizing pass allows. The signature profile is the strictest;
+ *  the editor profile adds the markup the composer itself produces (mention
+ *  chips, the signature block's class). */
+interface SanitizeProfile {
+  /** Attributes kept on any allowed element. */
+  globalAttrs: ReadonlySet<string>;
+  /** Elements kept, with the attributes they add to globalAttrs. */
+  allowed: ReadonlyMap<string, readonly string[]>;
+  /** Dropped with their content, which is not markup ("<" in a script is not a
+   *  tag), so they are skipped straight to their end tag. */
+  rawText: ReadonlySet<string>;
+  /** Dropped with everything inside them. */
+  dropped: ReadonlySet<string>;
+  /** Allowed URL schemes for `href`. */
+  linkRe: RegExp;
+  /** Allowed URL schemes for `src` / `background` / style url(). */
+  imageRe: RegExp;
+  /** tag -> class tokens allowed on it (class is dropped otherwise). */
+  classes: ReadonlyMap<string, ReadonlySet<string>>;
+  /** Inline-style property allowlist; null keeps every property not in
+   *  `blockedCss`. `cssPrefixes` allows whole families ("border-"). */
+  cssProps: ReadonlySet<string> | null;
+  cssPrefixes: readonly string[] | null;
+  /** Properties dropped when cssProps is null: `position` would let a
+   *  signature cover the app around the editor; the others are legacy script
+   *  hooks. */
+  blockedCss: ReadonlySet<string>;
+}
 
 /** Attributes kept on any allowed element: email HTML lays signatures out with
  *  tables and presentational attributes rather than stylesheets. */
@@ -162,9 +195,81 @@ const SAFE_LINK = /^(?:https?|mailto|tel):/;
  *  turns base64 `data:` images into inline parts. */
 const SAFE_IMAGE = /^(?:https?:|cid:|data:image\/)/;
 
-/** Inline-style properties dropped: `position` would let a signature cover the
- *  app around the editor; the others are legacy script hooks. */
+/** Editor links: the schemes the link tool itself will emit, plus cid: so a
+ *  pasted/drafted link to an inline part survives. */
+const EDITOR_LINK = /^(?:https?|mailto|tel|cid):/;
+/** Editor images: raster `data:` only - `data:image/svg` carries markup. */
+const EDITOR_IMAGE =
+  /^(?:https?:|cid:|data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)(?=[;,]))/;
+
+/** Editor styles: the presentational properties the toolbar, pasted content
+ *  and signature/table markup legitimately use. Anything not listed (position,
+ *  z-index, transform, visibility, content, behavior, vendor -moz-binding, …)
+ *  is dropped declaration by declaration. */
+const EDITOR_CSS_PROPS = new Set([
+  "color", "direction", "display", "float", "clear", "hyphens", "letter-spacing",
+  "line-height", "overflow-wrap", "quotes", "text-align", "text-indent",
+  "text-shadow", "text-transform", "vertical-align", "white-space", "word-break",
+  "word-spacing",
+  "font", "font-family", "font-size", "font-style", "font-weight", "font-stretch",
+  "font-size-adjust",
+  "background",
+  "width", "height", "min-width", "min-height", "max-width", "max-height",
+  "margin", "padding", "border", "box-sizing", "outline",
+  "border-collapse", "border-spacing", "caption-side", "empty-cells",
+  "table-layout", "list-style",
+]);
+const EDITOR_CSS_PREFIXES = [
+  "background-", "border-", "font-variant-", "list-style-", "margin-",
+  "outline-", "padding-", "text-decoration",
+];
+
 const BLOCKED_CSS = new Set(["position", "behavior", "-moz-binding"]);
+
+const SIGNATURE_PROFILE: SanitizeProfile = {
+  globalAttrs: GLOBAL_ATTRS,
+  allowed: ALLOWED,
+  rawText: RAW_TEXT,
+  dropped: DROPPED,
+  linkRe: SAFE_LINK,
+  imageRe: SAFE_IMAGE,
+  classes: new Map(),
+  cssProps: null,
+  cssPrefixes: null,
+  blockedCss: BLOCKED_CSS,
+};
+
+const EDITOR_ALLOWED = new Map<string, readonly string[]>([
+  ...ALLOWED,
+  // The mention chip and the signature-block wrapper are the only classes the
+  // composer itself relies on (mentions.ts / findSignatureBlock).
+  ["span", ["class", "contenteditable", "data-email"]],
+  ["div", ["class"]],
+]);
+
+const EDITOR_PROFILE: SanitizeProfile = {
+  globalAttrs: GLOBAL_ATTRS,
+  allowed: EDITOR_ALLOWED,
+  rawText: RAW_TEXT,
+  // Form chrome pasted from a page is dead weight and `<form>` markup doesn't
+  // belong in an email. (Void tags like meta/link/embed/input aren't listed:
+  // they carry no content, and a dropped void tag would skip to an end tag
+  // that never comes, eating the rest of the body.)
+  dropped: new Set([
+    ...DROPPED,
+    "form", "button", "fieldset", "label", "legend", "option", "optgroup",
+    "datalist", "frameset", "picture", "map", "dialog",
+  ]),
+  linkRe: EDITOR_LINK,
+  imageRe: EDITOR_IMAGE,
+  classes: new Map([
+    ["span", new Set(["co-mention"])],
+    ["div", new Set(["co-signature"])],
+  ]),
+  cssProps: EDITOR_CSS_PROPS,
+  cssPrefixes: EDITOR_CSS_PREFIXES,
+  blockedCss: new Set(),
+};
 
 /** Character references, enough to read a URL or style the way the browser
  *  will: numeric ones, plus the named ones that spell URL and CSS punctuation
@@ -189,10 +294,10 @@ function decodeCharRefs(s: string): string {
   );
 }
 
-function isSafeUrl(attr: string, raw: string): boolean {
+function isSafeUrl(attr: string, raw: string, profile: SanitizeProfile): boolean {
   // As the URL parser reads it: references decoded, controls and spaces gone.
   const url = decodeCharRefs(raw).replace(/[\x00-\x20\x7f-\x9f]/g, "").toLowerCase();
-  return (attr === "href" ? SAFE_LINK : SAFE_IMAGE).test(url);
+  return (attr === "href" ? profile.linkRe : profile.imageRe).test(url);
 }
 
 /** Split a style attribute on the `;`s between declarations (not those inside
@@ -220,7 +325,7 @@ function splitDeclarations(css: string): string[] {
 }
 
 /** The style's declarations minus the unsafe ones (same text otherwise). */
-function cleanStyle(raw: string): string {
+function cleanStyle(raw: string, profile: SanitizeProfile): string {
   return splitDeclarations(decodeCharRefs(raw))
     .filter((decl) => {
       if (!decl.trim()) return true;
@@ -228,19 +333,32 @@ function cleanStyle(raw: string): string {
       if (colon < 0) return false;
       const prop = decl.slice(0, colon).trim().toLowerCase();
       const value = decl.slice(colon + 1).toLowerCase();
-      if (!/^-?[a-z][a-z0-9-]*$/.test(prop) || BLOCKED_CSS.has(prop)) return false;
+      if (!/^-?[a-z][a-z0-9-]*$/.test(prop) || profile.blockedCss.has(prop)) return false;
+      if (
+        profile.cssProps &&
+        !profile.cssProps.has(prop) &&
+        !(profile.cssPrefixes ?? []).some((p) => prop.startsWith(p))
+      )
+        return false;
       if (/expression\s*\(|(?:java|vb)script:/.test(value)) return false;
       // Every url() must parse and point at an image source we allow.
       const urls = [...value.matchAll(/url\(([^)]*)\)/g)];
       if (urls.length !== value.split("url(").length - 1) return false;
-      return urls.every((u) => SAFE_IMAGE.test(u[1].trim().replace(/^["']|["']$/g, "").trim()));
+      return urls.every(
+        (u) => profile.imageRe.test(u[1].trim().replace(/^["']|["']$/g, "").trim()),
+      );
     })
     .join(";");
 }
 
 /** Allowed attributes, re-quoted. Values keep their character references
  *  (only a quote or angle bracket is escaped), except style, rebuilt above. */
-function cleanAttrs(raw: string, extra: readonly string[]): { attrs: string; src: boolean } {
+function cleanAttrs(
+  raw: string,
+  extra: readonly string[],
+  tag: string,
+  profile: SanitizeProfile,
+): { attrs: string; src: boolean } {
   const seen = new Set<string>();
   let attrs = "";
   let src = false;
@@ -249,29 +367,40 @@ function cleanAttrs(raw: string, extra: readonly string[]): { attrs: string; src
     // A browser keeps the first of a repeated attribute.
     if (seen.has(name)) continue;
     seen.add(name);
-    if (!GLOBAL_ATTRS.has(name) && !extra.includes(name)) continue;
+    if (!profile.globalAttrs.has(name) && !extra.includes(name)) continue;
     const value = m[2] ?? m[3] ?? m[4] ?? "";
+    if (name === "class") {
+      const tokens = profile.classes.get(tag);
+      if (!tokens) continue;
+      const kept = value
+        .split(/\s+/)
+        .filter((tok, i, all) => tokens.has(tok) && all.indexOf(tok) === i);
+      if (kept.length) attrs += ` class="${kept.join(" ")}"`;
+      continue;
+    }
+    if (name === "contenteditable") {
+      // Only the atomic mention chip needs it, and only as "false".
+      if (value.trim().toLowerCase() === "false") attrs += ' contenteditable="false"';
+      continue;
+    }
     if (name === "style") {
-      const css = cleanStyle(value);
+      const css = cleanStyle(value, profile);
       if (css.trim()) attrs += ` style="${escapeHtml(css)}"`;
       continue;
     }
-    if ((name === "href" || name === "src" || name === "background") && !isSafeUrl(name, value)) continue;
+    if (
+      (name === "href" || name === "src" || name === "background") &&
+      !isSafeUrl(name, value, profile)
+    )
+      continue;
     if (name === "src") src = true;
     attrs += ` ${name}="${value.replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}"`;
   }
   return { attrs, src };
 }
 
-/**
- * Signature HTML reduced to what is safe to render in the app and send:
- * tables and their layout attributes, inline styles, links (http, mailto, tel)
- * and images (http, cid, data:image) survive; scripts, `<style>` blocks,
- * forms, frames, SVG, comments, event handlers, classes and ids go. Source
- * formatting (line breaks, indentation) is kept, so the HTML editor shows the
- * user's own markup back. Idempotent.
- */
-export function sanitizeSignatureHtml(html: string): string {
+/** The shared tokenizer behind sanitizeSignatureHtml / sanitizeEditorHtml. */
+function sanitizeWith(profile: SanitizeProfile, html: string): string {
   const src = html.replace(/\0/g, "");
   const re = new RegExp(TOKEN_RE.source, "gi");
   const open: string[] = [];
@@ -322,19 +451,19 @@ export function sanitizeSignatureHtml(html: string): string {
       if (i >= 0) closeTo(i);
       continue;
     }
-    if (RAW_TEXT.has(tag)) {
+    if (profile.rawText.has(tag)) {
       const end = src.slice(pos).search(new RegExp(`</${tag}[\\s/>]`, "i"));
       pos = end < 0 ? src.length : pos + end;
       re.lastIndex = pos;
       continue;
     }
-    if (DROPPED.has(tag)) {
+    if (profile.dropped.has(tag)) {
       if (!token.endsWith("/>")) skip = { tag, depth: 1 };
       continue;
     }
-    const extra = ALLOWED.get(tag);
+    const extra = profile.allowed.get(tag);
     if (!extra) continue;
-    const { attrs, src: hasSrc } = cleanAttrs(rawAttrs, extra);
+    const { attrs, src: hasSrc } = cleanAttrs(rawAttrs, extra, tag, profile);
     // An image whose source didn't survive shows nothing.
     if (tag === "img" && !hasSrc) continue;
     if (CLOSES_P.has(tag)) closeNearest(["p"], ["table", "td", "th", "caption"]);
@@ -350,4 +479,31 @@ export function sanitizeSignatureHtml(html: string): string {
   text(src.slice(pos));
   closeTo(0);
   return out;
+}
+
+/**
+ * Signature HTML reduced to what is safe to render in the app and send:
+ * tables and their layout attributes, inline styles, links (http, mailto, tel)
+ * and images (http, cid, data:image) survive; scripts, `<style>` blocks,
+ * forms, frames, SVG, comments, event handlers, classes and ids go. Source
+ * formatting (line breaks, indentation) is kept, so the HTML editor shows the
+ * user's own markup back. Idempotent.
+ */
+export function sanitizeSignatureHtml(html: string): string {
+  return sanitizeWith(SIGNATURE_PROFILE, html);
+}
+
+/**
+ * Composer-body HTML reduced to what is safe to keep in the live editor DOM
+ * (and therefore in drafts and outgoing mail). Everything the composer itself
+ * produces is a fixed point: the formatting tags, lists, blockquotes, tables
+ * and presentational attributes email HTML uses, links (http, https, mailto,
+ * tel, cid), inline images (http, cid, raster data:), mention chips
+ * (`span.co-mention` + contenteditable + data-email) and the signature block's
+ * `co-signature` class. Styles are filtered to a presentational property
+ * allowlist; scripts, styles, frames, forms, SVG/MathML, comments, event
+ * handlers, ids and other classes go. Idempotent.
+ */
+export function sanitizeEditorHtml(html: string): string {
+  return sanitizeWith(EDITOR_PROFILE, html);
 }
