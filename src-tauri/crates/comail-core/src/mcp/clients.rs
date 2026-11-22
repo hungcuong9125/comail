@@ -555,6 +555,36 @@ pub(crate) fn merge_codex_config(file: &Path, conn: &Conn) -> Result<()> {
     write_with_backup(file, &doc.to_string())
 }
 
+/// Write `contents` to `path` creating it mode 0600: these files embed the
+/// MCP bearer token, so neither the config nor its backup may be
+/// world-readable.
+fn write_private(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(path)?;
+    f.write_all(contents.as_bytes())?;
+    #[cfg(unix)]
+    {
+        // `mode` only applies when the file is created; a pre-existing temp
+        // file keeps its old mode, so enforce 0600 unconditionally.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Clamp `path`'s mode to at most 0600 on Unix (keeps stricter modes).
+#[cfg(unix)]
+fn clamp_private(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o600))?;
+    Ok(())
+}
+
 fn write_with_backup(file: &Path, contents: &str) -> Result<()> {
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
@@ -562,13 +592,16 @@ fn write_with_backup(file: &Path, contents: &str) -> Result<()> {
     if file.exists() {
         let mut bak = file.as_os_str().to_owned();
         bak.push(".bak");
-        std::fs::copy(file, PathBuf::from(bak))?;
+        let bak = PathBuf::from(bak);
+        std::fs::copy(file, &bak)?;
+        #[cfg(unix)]
+        clamp_private(&bak)?;
     }
     // Write-then-rename so a crash never leaves a half-written config.
     let mut tmp = file.as_os_str().to_owned();
     tmp.push(".comail-tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, contents)?;
+    write_private(&tmp, contents)?;
     std::fs::rename(&tmp, file)?;
     Ok(())
 }
@@ -760,6 +793,28 @@ mod tests {
             let s = snippet(c.id, &conn()).unwrap();
             assert!(s.contains("127.0.0.1:47823"), "{} snippet lacks url", c.id);
         }
+    }
+
+    /// The config and its .bak hold the bearer token: neither may be more
+    /// permissive than 0600 on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn written_config_and_backup_are_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        std::fs::write(&file, r#"{"mcpServers":{}}"#).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (path, entry) = json_entry("cursor", &conn()).unwrap();
+        merge_json_config(&file, path, entry.clone()).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&dir.path().join("mcp.json.bak")), 0o600);
+        // A stricter source stays stricter.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        merge_json_config(&file, path, entry).unwrap();
+        assert_eq!(mode(&dir.path().join("mcp.json.bak")), 0o400);
+        assert_eq!(mode(&file), 0o600);
     }
 
     #[test]

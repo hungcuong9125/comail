@@ -114,11 +114,31 @@ fn insecure_file() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// Serializes every read-modify-write of the insecure file. Without it two
+/// racing `store` calls could each read the other's pre-write state and one
+/// secret would be lost.
+fn file_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 fn file_map(path: &std::path::Path) -> std::collections::HashMap<String, String> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Load the map, apply `f`, write it back — all under [`file_lock`].
+fn file_update<R>(
+    path: &std::path::Path,
+    f: impl FnOnce(&mut std::collections::HashMap<String, String>) -> R,
+) -> Result<R> {
+    let _guard = file_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = file_map(path);
+    let out = f(&mut map);
+    file_save(path, &map)?;
+    Ok(out)
 }
 
 fn file_save(
@@ -128,7 +148,33 @@ fn file_save(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_string(map)?)?;
+    // Write a sibling temp file then rename over the target: a crash mid-write
+    // never leaves a half-written secrets file, and a concurrent reader sees
+    // either the old file or the new one, never a mix.
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("credentials"),
+        std::process::id()
+    ));
+    {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        // The file holds plaintext secrets: 0600 from the moment it exists.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let mut f = opts.open(&tmp)?;
+        f.write_all(serde_json::to_string(map)?.as_bytes())?;
+    }
+    #[cfg(unix)]
+    {
+        // Covers a pre-existing temp file created under a permissive umask.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -139,9 +185,10 @@ fn slot_key(account_id: i64, slot: &Slot) -> String {
 /// Keyring calls are blocking (D-Bus on Linux); call from spawn_blocking in async paths.
 pub fn store(account_id: i64, slot: Slot, secret: &str) -> Result<()> {
     if let Some(path) = insecure_file() {
-        let mut map = file_map(&path);
-        map.insert(slot_key(account_id, &slot), secret.to_string());
-        return file_save(&path, &map);
+        let key = slot_key(account_id, &slot);
+        return file_update(&path, |map| {
+            map.insert(key, secret.to_string());
+        });
     }
     let chunks = split_utf16_chunks(secret, MAX_SECRET_UTF16);
     if chunks.len() <= 1 {
@@ -167,6 +214,7 @@ pub fn store(account_id: i64, slot: Slot, secret: &str) -> Result<()> {
 
 pub fn load(account_id: i64, slot: Slot) -> Result<String> {
     if let Some(path) = insecure_file() {
+        let _guard = file_lock().lock().unwrap_or_else(|e| e.into_inner());
         return file_map(&path)
             .remove(&slot_key(account_id, &slot))
             .ok_or_else(|| CoreError::Auth("no stored credential".into()));
@@ -197,9 +245,8 @@ pub fn load(account_id: i64, slot: Slot) -> Result<String> {
 
 pub fn delete_all(account_id: i64) {
     if let Some(path) = insecure_file() {
-        let mut map = file_map(&path);
-        map.retain(|k, _| !k.starts_with(&format!("{account_id}:")));
-        let _ = file_save(&path, &map);
+        let prefix = format!("{account_id}:");
+        let _ = file_update(&path, |map| map.retain(|k, _| !k.starts_with(&prefix)));
         return;
     }
     for slot in [
@@ -219,9 +266,8 @@ pub fn delete_all(account_id: i64) {
 /// Remove one stored secret; missing entries are fine.
 pub fn delete(account_id: i64, slot: Slot) {
     if let Some(path) = insecure_file() {
-        let mut map = file_map(&path);
-        map.remove(&slot_key(account_id, &slot));
-        let _ = file_save(&path, &map);
+        let key = slot_key(account_id, &slot);
+        let _ = file_update(&path, |map| map.remove(&key));
         return;
     }
     if let Ok(e) = entry(account_id, &slot) {
@@ -268,5 +314,45 @@ mod tests {
         let chunks = split_utf16_chunks(&secret, 1023); // odd cap, forces a squeeze
         assert!(chunks.iter().all(|c| c.encode_utf16().count() <= 1023));
         assert_eq!(chunks.concat(), secret);
+    }
+
+    #[test]
+    fn insecure_file_update_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        file_update(&path, |m| m.insert("1:password".into(), "s3cret".into())).unwrap();
+        file_update(&path, |m| m.insert("2:password".into(), "other".into())).unwrap();
+        let map = file_map(&path);
+        assert_eq!(map.get("1:password").unwrap(), "s3cret");
+        assert_eq!(map.get("2:password").unwrap(), "other");
+        // No temp file is left behind after the rename.
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    /// The plaintext secrets file must be 0600 on Unix, both on first
+    /// create and when replacing an existing (wider) file.
+    #[cfg(unix)]
+    #[test]
+    fn insecure_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        // Start with a permissive existing file; the atomic replace must
+        // tighten it, not inherit it.
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        file_update(&path, |m| m.insert("1:password".into(), "s3cret".into())).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // Fresh create is 0600 too.
+        let path2 = dir.path().join("other.json");
+        file_update(&path2, |m| m.insert("k".into(), "v".into())).unwrap();
+        let mode = std::fs::metadata(&path2).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

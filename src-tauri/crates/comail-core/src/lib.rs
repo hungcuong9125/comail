@@ -20,6 +20,7 @@ pub mod imap;
 pub mod mcp;
 pub mod mime;
 pub mod models;
+pub mod netguard;
 pub mod oauth;
 pub mod otp;
 pub mod preview;
