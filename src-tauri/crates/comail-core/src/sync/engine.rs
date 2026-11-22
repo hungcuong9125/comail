@@ -1066,6 +1066,40 @@ async fn imap_credentials(ctx: &SyncCtx, config: &AccountConfig) -> Result<ImapC
     }
 }
 
+/// What a parked wait should do next after [`route_wait_cmd`].
+enum WaitStep {
+    /// A Sync Now nudge arrived (its `complete` already joined
+    /// `sync_waiters`); run a cycle now so that caller is answered.
+    Wake,
+    /// Unrelated command; keep waiting.
+    Stay,
+    /// Command channel closed or Shutdown; end the actor.
+    Quit,
+    /// Priority body fetch; the caller services it when it holds a session.
+    FetchBody(i64),
+}
+
+/// Route a command received while the actor is parked between cycles -
+/// connect retry backoff, the no-inbox fallback wait, the poll loop and
+/// IDLE nudges all share this so a `Sync Now` caller is never dropped nor
+/// doubly queued.
+fn route_wait_cmd(
+    cmd: Option<SyncCmd>,
+    sync_waiters: &mut Vec<oneshot::Sender<std::result::Result<(), String>>>,
+) -> WaitStep {
+    match cmd {
+        None | Some(SyncCmd::Shutdown) => WaitStep::Quit,
+        Some(SyncCmd::SyncNow { complete }) => {
+            if let Some(complete) = complete {
+                sync_waiters.push(complete);
+            }
+            WaitStep::Wake
+        }
+        Some(SyncCmd::FetchBody { message_id }) => WaitStep::FetchBody(message_id),
+        Some(_) => WaitStep::Stay,
+    }
+}
+
 async fn run_actor(
     ctx: SyncCtx,
     config: AccountConfig,
@@ -1124,15 +1158,9 @@ async fn run_actor(
                         let _ = waiter.send(Err("authentication required".into()));
                     }
                     // Wait for an external nudge before retrying auth.
-                    match rx.recv().await {
-                        None | Some(SyncCmd::Shutdown) => return,
-                        Some(SyncCmd::SyncNow { complete }) => {
-                            if let Some(complete) = complete {
-                                sync_waiters.push(complete);
-                            }
-                            continue;
-                        }
-                        Some(_) => continue,
+                    match route_wait_cmd(rx.recv().await, &mut sync_waiters) {
+                        WaitStep::Quit => return,
+                        _ => continue,
                     }
                 }
                 Err(e) => {
@@ -1149,14 +1177,11 @@ async fn run_actor(
                     let wait = std::time::Duration::from_secs(backoff_secs);
                     backoff_secs = (backoff_secs * 2).min(300);
                     match tokio::time::timeout(wait, rx.recv()).await {
-                        Ok(None) | Ok(Some(SyncCmd::Shutdown)) => return,
-                        Ok(Some(SyncCmd::SyncNow { complete })) => {
-                            if let Some(complete) = complete {
-                                sync_waiters.push(complete);
-                            }
-                            continue;
-                        }
-                        _ => continue,
+                        Err(_) => continue,
+                        Ok(cmd) => match route_wait_cmd(cmd, &mut sync_waiters) {
+                            WaitStep::Quit => return,
+                            _ => continue,
+                        },
                     }
                 }
             }
@@ -1309,37 +1334,39 @@ async fn run_actor(
                                                 "receive: IDLE signaled activity, syncing now",
                                             );
                                         }
-                                        // Backstop timeout or a sync/action
-                                        // nudge: next iteration runs a cycle.
-                                        imap::IdleOutcome::Timeout
-                                        | imap::IdleOutcome::Command(SyncCmd::RunActions) => {}
-                                        imap::IdleOutcome::Command(SyncCmd::SyncNow {
-                                            complete,
-                                        }) => {
-                                            if let Some(complete) = complete {
-                                                sync_waiters.push(complete);
-                                            }
-                                        }
-                                        imap::IdleOutcome::Command(SyncCmd::FetchBody {
-                                            message_id,
-                                        }) => {
-                                            if let Some(ref mut s) = session {
-                                                if let Err(e) =
-                                                    fetch_one_body(&ctx, &config, s, message_id)
-                                                        .await
-                                                {
-                                                    tracing::warn!(
-                                                        "priority body fetch failed: {e}"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        imap::IdleOutcome::Command(SyncCmd::Shutdown)
-                                        | imap::IdleOutcome::ChannelClosed => {
+                                        // Backstop timeout: next iteration
+                                        // runs a cycle.
+                                        imap::IdleOutcome::Timeout => {}
+                                        imap::IdleOutcome::ChannelClosed => {
                                             if let Some(s) = session.take() {
                                                 imap::logout(s).await;
                                             }
                                             return;
+                                        }
+                                        imap::IdleOutcome::Command(cmd) => {
+                                            match route_wait_cmd(Some(cmd), &mut sync_waiters) {
+                                                WaitStep::Quit => {
+                                                    if let Some(s) = session.take() {
+                                                        imap::logout(s).await;
+                                                    }
+                                                    return;
+                                                }
+                                                WaitStep::FetchBody(message_id) => {
+                                                    if let Some(ref mut s) = session
+                                                        && let Err(e) = fetch_one_body(
+                                                            &ctx, &config, s, message_id,
+                                                        )
+                                                        .await
+                                                    {
+                                                        tracing::warn!(
+                                                            "priority body fetch failed: {e}"
+                                                        );
+                                                    }
+                                                }
+                                                // Wake/Stay both fall
+                                                // through to a cycle.
+                                                _ => {}
+                                            }
                                         }
                                     }
                                 }
@@ -1368,26 +1395,27 @@ async fn run_actor(
                     )
                     .await
                     {
-                        Ok(None) | Ok(Some(SyncCmd::Shutdown)) => {
-                            if let Some(s) = session.take() {
-                                imap::logout(s).await;
+                        // Poll tick: the loop that follows runs a cycle.
+                        Err(_) => {}
+                        Ok(cmd) => match route_wait_cmd(cmd, &mut sync_waiters) {
+                            WaitStep::Quit => {
+                                if let Some(s) = session.take() {
+                                    imap::logout(s).await;
+                                }
+                                return;
                             }
-                            return;
-                        }
-                        // Keep the waiter: the cycle that follows completes it.
-                        Ok(Some(SyncCmd::SyncNow {
-                            complete: Some(complete),
-                        })) => {
-                            sync_waiters.push(complete);
-                        }
-                        Ok(Some(SyncCmd::FetchBody { message_id })) => {
-                            if let Some(ref mut s) = session
-                                && let Err(e) = fetch_one_body(&ctx, &config, s, message_id).await
-                            {
-                                tracing::warn!("priority body fetch failed: {e}");
+                            WaitStep::FetchBody(message_id) => {
+                                if let Some(ref mut s) = session
+                                    && let Err(e) =
+                                        fetch_one_body(&ctx, &config, s, message_id).await
+                                {
+                                    tracing::warn!("priority body fetch failed: {e}");
+                                }
                             }
-                        }
-                        _ => {}
+                            // The waiter stays queued; the cycle that follows
+                            // completes it.
+                            _ => {}
+                        },
                     }
                 }
             }
@@ -1407,32 +1435,29 @@ async fn run_actor(
                         // Timer fired: next iteration runs a full cycle.
                         break;
                     }
-                    Ok(None) | Ok(Some(SyncCmd::Shutdown)) => {
-                        if let Some(s) = session.take() {
-                            imap::logout(s).await;
-                        }
-                        return;
-                    }
-                    Ok(Some(SyncCmd::SyncNow { complete })) => {
-                        if let Some(complete) = complete {
-                            sync_waiters.push(complete);
-                        }
-                        break;
-                    }
-                    Ok(Some(SyncCmd::RunActions)) => {
-                        // Public handles route mutations to their own worker.
-                        continue;
-                    }
-                    Ok(Some(SyncCmd::FetchBody { message_id })) => {
-                        if let Some(ref mut s) = session {
-                            if let Err(e) = fetch_one_body(&ctx, &config, s, message_id).await {
-                                tracing::warn!("priority body fetch failed: {e}");
-                                deadline = tokio::time::Instant::now();
+                    Ok(cmd) => match route_wait_cmd(cmd, &mut sync_waiters) {
+                        WaitStep::Quit => {
+                            if let Some(s) = session.take() {
+                                imap::logout(s).await;
                             }
-                        } else {
-                            break;
+                            return;
                         }
-                    }
+                        WaitStep::Wake => break,
+                        WaitStep::Stay => {
+                            // Public handles route mutations to their own worker.
+                            continue;
+                        }
+                        WaitStep::FetchBody(message_id) => {
+                            if let Some(ref mut s) = session {
+                                if let Err(e) = fetch_one_body(&ctx, &config, s, message_id).await {
+                                    tracing::warn!("priority body fetch failed: {e}");
+                                    deadline = tokio::time::Instant::now();
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -1692,12 +1717,12 @@ enum ForwardPlan {
     /// Server reported UIDNEXT: fetch the bounded `lo:hi` range directly.
     Fetch(ForwardScan),
     /// Server omits UIDNEXT: there is no high-water to bound a FETCH range
-    /// against, so `UID SEARCH` this open range for the real UID list first
-    /// and turn it into a bounded fetch via [`forward_search_batch`]. The
-    /// reply is bare numbers - even a 200k-message folder answers in about a
-    /// megabyte, far less than one header per message - so a single unbounded
-    /// `n:*` FETCH is never issued.
-    Search { set: String },
+    /// against, so `UID SEARCH` from this UID for the real list first and
+    /// turn it into a bounded fetch via [`forward_search_batch`]. The reply
+    /// is bare numbers - even a 200k-message folder answers in about a
+    /// megabyte, far less than one header per message - so a single
+    /// unbounded `n:*` FETCH is never issued.
+    Search { lo: u32 },
 }
 
 /// Plan the next forward pass. `None` when the server says nothing is new
@@ -1706,9 +1731,7 @@ fn forward_scan(last_seen: u32, uid_next: Option<i64>) -> Option<ForwardPlan> {
     let Some(uid_next) = uid_next else {
         // `last_seen + 1` overflowing means no newer UID can exist.
         let lo = last_seen.checked_add(1)?;
-        return Some(ForwardPlan::Search {
-            set: format!("{lo}:*"),
-        });
+        return Some(ForwardPlan::Search { lo });
     };
     if (last_seen as i64) + 1 >= uid_next {
         return None;
@@ -1742,6 +1765,109 @@ fn forward_search_batch(found: &[u32], last_seen: u32) -> Option<ForwardScan> {
         hi,
         remaining: new.len() > chunk.len(),
     })
+}
+
+/// What one forward pass needs from the IMAP session: the open-ended
+/// `UID SEARCH` used when the server omits UIDNEXT, and the tolerant header
+/// fetch. [`Session`] is the production impl; tests drive the whole
+/// plan -> search -> fetch -> store -> advance sequence with a double.
+trait ForwardSession {
+    async fn search_new_uids(&mut self, start: u32) -> Result<Vec<u32>>;
+    async fn headers(
+        &mut self,
+        ctx: &SyncCtx,
+        config: &AccountConfig,
+        folder: &Folder,
+        set: &str,
+    ) -> Result<HeaderFetch>;
+}
+
+impl ForwardSession for Session {
+    async fn search_new_uids(&mut self, start: u32) -> Result<Vec<u32>> {
+        imap::uid_search_from(self, start).await
+    }
+
+    async fn headers(
+        &mut self,
+        ctx: &SyncCtx,
+        config: &AccountConfig,
+        folder: &Folder,
+        set: &str,
+    ) -> Result<HeaderFetch> {
+        fetch_headers_tolerant(ctx, config, self, folder, set).await
+    }
+}
+
+/// One bounded forward pass over mail newer than the folder's stored
+/// watermark: plan the scan - searching real UIDs first when the server
+/// omits UIDNEXT - fetch, ledger/store, advance `last_seen` to the covered
+/// high end, and report whether another pass is needed this cycle.
+async fn forward_pass(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    session: &mut impl ForwardSession,
+    folder: &Folder,
+    uid_next: Option<i64>,
+    is_inbox: bool,
+    notify_min_uid: Option<u32>,
+) -> Result<bool> {
+    let account_id = config.id;
+    let last_seen = folder.last_seen_uid.max(0) as u32;
+    let scan = match forward_scan(last_seen, uid_next) {
+        Some(ForwardPlan::Fetch(scan)) => Some(scan),
+        Some(ForwardPlan::Search { lo }) => {
+            let found = session.search_new_uids(lo).await?;
+            forward_search_batch(&found, last_seen)
+        }
+        None => None,
+    };
+    let Some(scan) = scan else {
+        return Ok(false);
+    };
+
+    let fetched = session.headers(ctx, config, folder, &scan.set).await?;
+    ledger_unreadable_headers(ctx, folder.id, fetched.unreadable).await?;
+    let headers: Vec<FetchedHeader> = fetched
+        .headers
+        .into_iter()
+        .filter(|h| h.uid > last_seen && h.uid <= scan.hi)
+        .collect();
+    let count = headers.len();
+    let (thread_ids, fresh) = store_headers(ctx, config, folder, headers, notify_min_uid).await?;
+    if count > 0 {
+        tracing::info!(
+            account_id,
+            folder = %folder.imap_name,
+            count,
+            since_uid = last_seen,
+            "receive: new mail on server",
+        );
+        if !thread_ids.is_empty() {
+            ctx.bus.emit(CoreEvent::MailUpdated { thread_ids });
+        }
+        // MailNew drives the chime + desktop notification, so it only
+        // fires for genuinely fresh arrivals: unread, incoming, recent, and
+        // never during the launch catch-up cycle (notify=false).
+        // New-to-the-folder UIDs that are our own sends, already read on
+        // another device, or moved back into the inbox (unarchive /
+        // unsnooze) refresh the list via MailUpdated above but stay silent.
+        if is_inbox && !fresh.is_empty() {
+            ctx.bus.emit(CoreEvent::MailNew {
+                account_id,
+                thread_ids: fresh,
+            });
+        }
+    }
+    // The FETCH covered the whole set - a range the server bounded, or UIDs
+    // the SEARCH just proved exist - and unreadable ones sit in the failure
+    // ledger for their own retry, so the watermark always advances to the
+    // set's high end.
+    let new_seen = i64::from(scan.hi);
+    let fid = folder.id;
+    ctx.db
+        .write(move |conn| repo::folders::set_last_seen_uid(conn, fid, new_seen))
+        .await?;
+    Ok(scan.remaining)
 }
 
 #[cfg(test)]
@@ -1783,18 +1909,18 @@ mod forward_scan_tests {
     #[test]
     fn missing_uid_next_searches_then_fetches_bounded_batches() {
         // No UIDNEXT: the pass starts with a UID SEARCH over the open range.
-        let Some(ForwardPlan::Search { set }) = forward_scan(100, None) else {
+        let Some(ForwardPlan::Search { lo }) = forward_scan(100, None) else {
             panic!("expected a search plan");
         };
-        assert_eq!(set, "101:*");
+        assert_eq!(lo, 101);
 
         // First sync: last_seen 0, more new UIDs than one chunk. Each pass
         // fetches one bounded batch of real UIDs, the watermark moves
         // monotonically, and the loop terminates once caught up.
-        let Some(ForwardPlan::Search { set }) = forward_scan(0, None) else {
+        let Some(ForwardPlan::Search { lo }) = forward_scan(0, None) else {
             panic!("expected a search plan");
         };
-        assert_eq!(set, "1:*");
+        assert_eq!(lo, 1);
         let found: Vec<u32> = (1..=450).collect();
         let mut last_seen = 0;
         let mut passes = 0;
@@ -1842,6 +1968,330 @@ mod forward_scan_tests {
     }
 }
 
+#[cfg(test)]
+mod forward_pass_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// `ForwardSession` double. `SEARCH {start}:*` answers with every remote
+    /// UID >= start, or just the highest when none qualify - the IMAP `n:*`
+    /// tail echo. `FETCH set` validates the set with the same check the
+    /// production fetch applies, records it, and answers a canned header per
+    /// requested UID it holds - so a UID SEARCH listed but FETCH omits looks
+    /// exactly like a message that vanished between the two commands.
+    struct FakeSession {
+        remote: BTreeSet<u32>,
+        mail: BTreeMap<u32, FetchedHeader>,
+        searches: Vec<u32>,
+        fetches: Vec<String>,
+        fail_search: bool,
+        fail_fetch: bool,
+    }
+
+    impl FakeSession {
+        fn with_uids(uids: impl Iterator<Item = u32>) -> Self {
+            let remote: BTreeSet<u32> = uids.collect();
+            let mail = remote.iter().map(|&uid| (uid, fake_header(uid))).collect();
+            Self {
+                remote,
+                mail,
+                searches: Vec::new(),
+                fetches: Vec::new(),
+                fail_search: false,
+                fail_fetch: false,
+            }
+        }
+    }
+
+    impl ForwardSession for FakeSession {
+        async fn search_new_uids(&mut self, start: u32) -> Result<Vec<u32>> {
+            self.searches.push(start);
+            if self.fail_search {
+                return Err(CoreError::Imap("NO search failed".into()));
+            }
+            let mut found: Vec<u32> = self.remote.range(start..).copied().collect();
+            if found.is_empty() {
+                found.extend(self.remote.iter().next_back().copied());
+            }
+            Ok(found)
+        }
+
+        async fn headers(
+            &mut self,
+            _ctx: &SyncCtx,
+            _config: &AccountConfig,
+            _folder: &Folder,
+            set: &str,
+        ) -> Result<HeaderFetch> {
+            assert!(
+                imap::valid_uid_set(set),
+                "fetch set must pass the same validator as production: {set}"
+            );
+            self.fetches.push(set.to_string());
+            if self.fail_fetch {
+                return Err(CoreError::Imap("BAD fetch failed".into()));
+            }
+            Ok(HeaderFetch {
+                headers: uids_of(set)
+                    .iter()
+                    .filter_map(|uid| self.mail.get(uid).cloned())
+                    .collect(),
+                unreadable: Vec::new(),
+            })
+        }
+    }
+
+    /// Expand a strict UID set ("1:5,8") into its UIDs.
+    fn uids_of(set: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        for part in set.split(',') {
+            match part.split_once(':') {
+                Some((a, b)) => out.extend(a.parse::<u32>().unwrap()..=b.parse().unwrap()),
+                None => out.push(part.parse().unwrap()),
+            }
+        }
+        out
+    }
+
+    fn fake_header(uid: u32) -> FetchedHeader {
+        FetchedHeader {
+            uid,
+            flags: Default::default(),
+            internal_date_ms: Some(1_000 + i64::from(uid)),
+            gm_msgid: None,
+            size: None,
+            header_bytes: format!(
+                "Message-ID: <m{uid}@test.dev>\r\nFrom: a@test.dev\r\nSubject: m{uid}\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            )
+            .into_bytes(),
+            has_attachments: false,
+            mime_plan: None,
+        }
+    }
+
+    async fn forward_ctx() -> (SyncCtx, AccountConfig, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::for_tests(root.path());
+        let db = Db::open(&paths.db_file()).unwrap();
+        db.write(|conn| {
+            crate::db::testutil::seed_account(conn);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let config = db
+            .read(|conn| Ok(repo::accounts::get_config(conn, 1)?.unwrap()))
+            .await
+            .unwrap();
+        let ctx = SyncCtx {
+            db,
+            bus: EventBus::new(),
+            paths: Arc::new(paths),
+            tokens: TokenProvider::new(),
+        };
+        (ctx, config, root)
+    }
+
+    async fn folder_of(ctx: &SyncCtx) -> Folder {
+        ctx.db
+            .read(|conn| Ok(repo::folders::get(conn, 1)?.unwrap()))
+            .await
+            .unwrap()
+    }
+
+    async fn set_last_seen(ctx: &SyncCtx, uid: i64) {
+        ctx.db
+            .write(move |conn| {
+                repo::folders::set_last_seen_uid(conn, 1, uid)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn stored_uids(ctx: &SyncCtx) -> Vec<i64> {
+        ctx.db
+            .read(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT uid FROM messages WHERE folder_id = 1 AND uid IS NOT NULL")?;
+                let rows = stmt
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<i64>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Run `forward_pass` the way `run_cycle` would: re-read the folder
+    /// each pass, keep going while the pass reports remaining work.
+    async fn sync_until_done(
+        ctx: &SyncCtx,
+        config: &AccountConfig,
+        session: &mut FakeSession,
+        uid_next: Option<i64>,
+        max_passes: usize,
+    ) -> usize {
+        let mut passes = 0;
+        loop {
+            passes += 1;
+            let folder = folder_of(ctx).await;
+            let remaining = forward_pass(ctx, config, session, &folder, uid_next, true, None)
+                .await
+                .unwrap();
+            assert!(passes <= max_passes, "forward passes must terminate");
+            if !remaining {
+                return passes;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_uidnext_first_sync_batches_all_uids_and_terminates() {
+        let (ctx, config, _root) = forward_ctx().await;
+        let mut session = FakeSession::with_uids(1..=450u32);
+        let passes = sync_until_done(&ctx, &config, &mut session, None, 10).await;
+        assert_eq!(passes, 3, "200 + 200 + 50");
+        // The watermark advanced monotonically to the folder high-water.
+        assert_eq!(folder_of(&ctx).await.last_seen_uid, 450);
+        // SEARCH went out as the open range, FETCH as bounded UID sets -
+        // and the search repeats per pass exactly like the production loop.
+        assert_eq!(session.searches, vec![1, 201, 401]);
+        assert_eq!(session.fetches, vec!["1:200", "201:400", "401:450"]);
+        // Every UID stored exactly once.
+        let mut stored = stored_uids(&ctx).await;
+        stored.sort_unstable();
+        assert_eq!(stored, (1..=450i64).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn no_uidnext_sparse_uids_fetch_as_explicit_set() {
+        let (ctx, config, _root) = forward_ctx().await;
+        let mut session = FakeSession::with_uids([5u32, 7, 900].into_iter());
+        let passes = sync_until_done(&ctx, &config, &mut session, None, 3).await;
+        assert_eq!(passes, 1);
+        assert_eq!(session.fetches, vec!["5,7,900"]);
+        assert_eq!(folder_of(&ctx).await.last_seen_uid, 900);
+        let mut stored = stored_uids(&ctx).await;
+        stored.sort_unstable();
+        assert_eq!(stored, vec![5, 7, 900]);
+    }
+
+    #[tokio::test]
+    async fn no_uidnext_empty_mailbox_never_fetches() {
+        let (ctx, config, _root) = forward_ctx().await;
+        let mut session = FakeSession::with_uids(std::iter::empty());
+        let passes = sync_until_done(&ctx, &config, &mut session, None, 1).await;
+        assert_eq!(passes, 1);
+        assert_eq!(session.searches, vec![1]);
+        assert!(session.fetches.is_empty(), "nothing to fetch");
+        assert_eq!(folder_of(&ctx).await.last_seen_uid, 0);
+    }
+
+    #[tokio::test]
+    async fn no_uidnext_tail_echo_does_not_refetch_the_tail() {
+        let (ctx, config, _root) = forward_ctx().await;
+        set_last_seen(&ctx, 100).await;
+        // The only remote message is UID 100 - the ledgered-unreadable tail.
+        let mut session = FakeSession::with_uids(std::iter::once(100));
+        let passes = sync_until_done(&ctx, &config, &mut session, None, 1).await;
+        assert_eq!(passes, 1);
+        assert_eq!(session.searches, vec![101]);
+        assert!(
+            session.fetches.is_empty(),
+            "the echo is filtered; the ledgered tail is never refetched"
+        );
+        assert_eq!(folder_of(&ctx).await.last_seen_uid, 100);
+        assert!(stored_uids(&ctx).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_uidnext_fetch_returning_fewer_still_advances() {
+        let (ctx, config, _root) = forward_ctx().await;
+        let mut session = FakeSession::with_uids(1..=10u32);
+        // UID 5 vanished between SEARCH and FETCH.
+        session.mail.remove(&5);
+        let passes = sync_until_done(&ctx, &config, &mut session, None, 3).await;
+        assert_eq!(passes, 1);
+        assert_eq!(session.fetches, vec!["1:10"]);
+        // The whole searched set was covered; the gap is not retried here.
+        assert_eq!(folder_of(&ctx).await.last_seen_uid, 10);
+        assert_eq!(stored_uids(&ctx).await.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn search_or_fetch_error_leaves_the_watermark() {
+        let (ctx, config, _root) = forward_ctx().await;
+        let mut session = FakeSession::with_uids(1..=5u32);
+        session.fail_search = true;
+        let folder = folder_of(&ctx).await;
+        assert!(
+            forward_pass(&ctx, &config, &mut session, &folder, None, true, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(folder_of(&ctx).await.last_seen_uid, 0);
+
+        session.fail_search = false;
+        session.fail_fetch = true;
+        assert!(
+            forward_pass(&ctx, &config, &mut session, &folder, None, true, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(folder_of(&ctx).await.last_seen_uid, 0);
+        assert!(stored_uids(&ctx).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn uid_next_path_fetches_the_bounded_range() {
+        let (ctx, config, _root) = forward_ctx().await;
+        set_last_seen(&ctx, 100).await;
+        let mut session = FakeSession::with_uids(101..=500u32);
+        let folder = folder_of(&ctx).await;
+        let remaining = forward_pass(&ctx, &config, &mut session, &folder, Some(302), true, None)
+            .await
+            .unwrap();
+        assert!(remaining, "UID 301 still ahead of the chunk");
+        assert_eq!(session.fetches, vec!["101:300"]);
+        assert_eq!(folder_of(&ctx).await.last_seen_uid, 300);
+        assert!(session.searches.is_empty(), "no SEARCH with a UIDNEXT");
+    }
+
+    #[test]
+    fn wait_cmds_route_sync_now_to_the_waiters() {
+        let (tx, mut rx) = oneshot::channel();
+        let mut waiters = Vec::new();
+        assert!(matches!(
+            route_wait_cmd(Some(SyncCmd::SyncNow { complete: Some(tx) }), &mut waiters),
+            WaitStep::Wake
+        ));
+        assert_eq!(waiters.len(), 1, "the waiter is kept for the next cycle");
+        assert!(rx.try_recv().is_err(), "not answered until the cycle runs");
+
+        // A bare nudge wakes without queueing a waiter.
+        assert!(matches!(
+            route_wait_cmd(Some(SyncCmd::SyncNow { complete: None }), &mut waiters),
+            WaitStep::Wake
+        ));
+        assert_eq!(waiters.len(), 1);
+
+        assert!(matches!(
+            route_wait_cmd(Some(SyncCmd::FetchBody { message_id: 9 }), &mut waiters),
+            WaitStep::FetchBody(9)
+        ));
+        assert!(matches!(
+            route_wait_cmd(Some(SyncCmd::RunActions), &mut waiters),
+            WaitStep::Stay
+        ));
+        assert!(matches!(
+            route_wait_cmd(Some(SyncCmd::Shutdown), &mut waiters),
+            WaitStep::Quit
+        ));
+        assert!(matches!(route_wait_cmd(None, &mut waiters), WaitStep::Quit));
+    }
+}
+
 async fn sync_folder(
     ctx: &SyncCtx,
     config: &AccountConfig,
@@ -1851,7 +2301,6 @@ async fn sync_folder(
     hist_tx: &mpsc::UnboundedSender<()>,
     inbox_baseline: &mut Option<InboxBaseline>,
 ) -> Result<bool> {
-    let account_id = config.id;
     let selected = imap::select(session, &folder.imap_name).await?;
     let is_inbox = folder.role.as_deref() == Some(roles::INBOX);
 
@@ -1930,69 +2379,21 @@ async fn sync_folder(
         let _ = hist_tx.send(());
     } else {
         // New mail since last seen UID.
-        let last_seen = fresh_folder.last_seen_uid.max(0) as u32;
-        let scan = match forward_scan(last_seen, selected.uid_next) {
-            Some(ForwardPlan::Fetch(scan)) => Some(scan),
-            // The server omitted UIDNEXT: SEARCH the open range for the real
-            // UID list, then fetch one bounded batch of it per pass.
-            Some(ForwardPlan::Search { set }) => {
-                let found = imap::uid_search_in(session, &set).await?;
-                forward_search_batch(&found, last_seen)
-            }
-            None => None,
+        let notify_min_uid = if is_inbox {
+            inbox_baseline.as_ref().map(|b| b.first_live_uid)
+        } else {
+            None
         };
-        if let Some(scan) = scan {
-            forward_remaining = scan.remaining;
-            let notify_min_uid = if is_inbox {
-                inbox_baseline.as_ref().map(|b| b.first_live_uid)
-            } else {
-                None
-            };
-            let (thread_ids, fresh, count) = fetch_and_store_headers(
-                ctx,
-                config,
-                session,
-                &fresh_folder,
-                &scan.set,
-                |h| h.uid > last_seen && h.uid <= scan.hi,
-                notify_min_uid,
-            )
-            .await?;
-            if count > 0 {
-                tracing::info!(
-                    account_id,
-                    folder = %folder.imap_name,
-                    count,
-                    since_uid = last_seen,
-                    "receive: new mail on server",
-                );
-                if !thread_ids.is_empty() {
-                    ctx.bus.emit(CoreEvent::MailUpdated { thread_ids });
-                }
-                // MailNew drives the chime + desktop notification, so it only
-                // fires for genuinely fresh arrivals: unread, incoming, recent,
-                // and never during the launch catch-up cycle (notify=false).
-                // New-to-the-folder UIDs that are our own sends, already read
-                // on another device, or moved back into the inbox (unarchive /
-                // unsnooze) refresh the list via MailUpdated above but stay
-                // silent.
-                if is_inbox && !fresh.is_empty() {
-                    ctx.bus.emit(CoreEvent::MailNew {
-                        account_id,
-                        thread_ids: fresh,
-                    });
-                }
-            }
-            // The FETCH covered the whole set - a range the server bounded,
-            // or UIDs the SEARCH just proved exist - and unreadable ones sit
-            // in the failure ledger for their own retry, so the watermark
-            // always advances to the set's high end.
-            let new_seen = i64::from(scan.hi);
-            let fid = fresh_folder.id;
-            ctx.db
-                .write(move |conn| repo::folders::set_last_seen_uid(conn, fid, new_seen))
-                .await?;
-        }
+        forward_remaining = forward_pass(
+            ctx,
+            config,
+            session,
+            &fresh_folder,
+            selected.uid_next,
+            is_inbox,
+            notify_min_uid,
+        )
+        .await?;
         if heavy {
             reconcile_flags(ctx, session, &fresh_folder).await?;
             reconcile_expunges(ctx, session, &fresh_folder).await?;
