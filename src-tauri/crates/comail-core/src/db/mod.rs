@@ -1,6 +1,6 @@
-//! SQLite access. WAL mode: one dedicated writer thread + one reader thread,
-//! each owning a Connection. Async callers submit closures and await results,
-//! so all repo code is plain synchronous rusqlite.
+//! SQLite access. WAL mode: one dedicated writer thread + a small fixed pool
+//! of reader threads, each owning a Connection. Async callers submit closures
+//! and await results, so all repo code is plain synchronous rusqlite.
 
 pub mod migrations;
 pub mod repo;
@@ -8,10 +8,16 @@ pub mod repo;
 use crate::error::{CoreError, Result};
 use rusqlite::Connection;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use tokio::sync::oneshot;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
+
+/// Readers run jobs concurrently so a slow query (full-text search, the
+/// unread-count fan-out) cannot head-of-line block cheap reads behind it.
+/// WAL gives each connection an independent read snapshot. 4 covers a
+/// counts refetch, a search, and a view load in flight at once.
+const READ_POOL_SIZE: usize = 4;
 
 #[derive(Clone)]
 pub struct Db {
@@ -30,6 +36,39 @@ fn spawn_conn_thread(path: std::path::PathBuf, name: &str) -> Result<mpsc::Sende
             }
         })
         .map_err(CoreError::Io)?;
+    Ok(tx)
+}
+
+/// A pool of reader threads sharing one job queue. `std::sync::mpsc` has no
+/// multi-consumer channel, so the receivers contend on the lock: whichever
+/// thread holds it takes the next job, and the others take what follows.
+/// A thread busy inside `run_job` never holds the lock, so slow jobs leave
+/// the queue open to the remaining readers. Like the writer, each thread
+/// exits once the senders are gone and the queue is drained.
+fn spawn_read_pool(path: &Path, size: usize) -> Result<mpsc::Sender<Job>> {
+    let (tx, rx) = mpsc::channel::<Job>();
+    let rx = Arc::new(Mutex::new(rx));
+    for i in 0..size {
+        let mut conn = open_connection(path)?;
+        let rx = Arc::clone(&rx);
+        std::thread::Builder::new()
+            .name(format!("comail-db-reader-{i}"))
+            .spawn(move || {
+                loop {
+                    let job = {
+                        // Poison means a holder panicked while waiting on the
+                        // channel; recovering keeps the remaining readers alive.
+                        let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                        match guard.recv() {
+                            Ok(job) => job,
+                            Err(_) => return,
+                        }
+                    };
+                    run_job(&mut conn, job);
+                }
+            })
+            .map_err(CoreError::Io)?;
+    }
     Ok(tx)
 }
 
@@ -75,7 +114,7 @@ impl Db {
             repo::contacts::backfill_folded(&conn)?;
         }
         let write_tx = spawn_conn_thread(path.to_path_buf(), "writer")?;
-        let read_tx = spawn_conn_thread(path.to_path_buf(), "reader")?;
+        let read_tx = spawn_read_pool(path, READ_POOL_SIZE)?;
         Ok(Db { write_tx, read_tx })
     }
 
@@ -104,7 +143,7 @@ impl Db {
         self.call(&self.write_tx, f).await
     }
 
-    /// Run a read-only closure on the reader connection.
+    /// Run a read-only closure on one of the pooled reader connections.
     pub async fn read<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -156,6 +195,89 @@ mod tests {
             .unwrap();
         assert!(autocommit);
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_read_does_not_block_other_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        db.write(|c| Ok(c.execute_batch("CREATE TABLE t (v INTEGER)")?))
+            .await
+            .unwrap();
+
+        // Occupy all but one reader with a sleeping job; a cheap read would
+        // wait ~500ms on a single reader, but the pool has one free worker.
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut slow = Vec::new();
+        for _ in 0..READ_POOL_SIZE - 1 {
+            let db = db.clone();
+            let started = started.clone();
+            slow.push(tokio::spawn(async move {
+                db.read(move |conn| {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?;
+                    Ok(())
+                })
+                .await
+            }));
+        }
+        // Wait until the sleep jobs actually hold readers before timing.
+        while started.load(std::sync::atomic::Ordering::SeqCst) < READ_POOL_SIZE - 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let start = std::time::Instant::now();
+        db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM t", [], |r| r.get::<_, i64>(0))?))
+            .await
+            .unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(400),
+            "cheap read waited {:?} behind slow reads",
+            start.elapsed()
+        );
+        for s in slow {
+            s.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_read_job_errors_and_the_pool_keeps_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        // Saturate the pool with panicking jobs; every caller sees an error.
+        let mut panics = Vec::new();
+        for _ in 0..READ_POOL_SIZE * 2 {
+            let db = db.clone();
+            panics.push(tokio::spawn(async move {
+                db.read(|_| -> Result<()> { panic!("boom") }).await
+            }));
+        }
+        for p in panics {
+            assert!(p.await.unwrap().is_err());
+        }
+        // Every reader thread survived: submit one job per pool member and
+        // check they all run concurrently (sleeping jobs overlap).
+        let start = std::time::Instant::now();
+        let mut jobs = Vec::new();
+        for _ in 0..READ_POOL_SIZE {
+            let db = db.clone();
+            jobs.push(tokio::spawn(async move {
+                db.read(|conn| {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?;
+                    Ok(())
+                })
+                .await
+            }));
+        }
+        for j in jobs {
+            j.await.unwrap().unwrap();
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(400),
+            "pool did not run reads in parallel ({:?})",
+            start.elapsed()
+        );
     }
 }
 

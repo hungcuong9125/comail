@@ -2,14 +2,20 @@ use crate::error::Result;
 use crate::models::Settings;
 use rusqlite::{Connection, OptionalExtension, params};
 
-pub fn get(conn: &Connection) -> Result<Settings> {
-    let json: Option<String> = conn
+/// The raw settings blob, for callers that only need to know whether it
+/// changed (e.g. the scheduler tick's cheap change check).
+pub fn raw_json(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn
         .query_row(
             "SELECT value FROM app_settings WHERE key = 'settings'",
             [],
             |r| r.get(0),
         )
-        .optional()?;
+        .optional()?)
+}
+
+pub fn get(conn: &Connection) -> Result<Settings> {
+    let json: Option<String> = raw_json(conn)?;
     let mut settings: Settings = json
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
