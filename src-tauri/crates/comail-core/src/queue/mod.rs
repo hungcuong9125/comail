@@ -10,6 +10,7 @@ use crate::imap::{self, Session};
 use crate::models::*;
 use crate::smtp;
 use crate::sync::engine::SyncCtx;
+use rusqlite::OptionalExtension;
 use tokio::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -20,6 +21,8 @@ mod delete_tests;
 mod identity_tests;
 #[cfg(test)]
 mod move_tests;
+#[cfg(test)]
+mod send_tests;
 
 const MAX_ATTEMPTS: i64 = 8;
 const MAX_ACTIONS_PER_SLICE: i64 = 20;
@@ -1086,6 +1089,25 @@ async fn send_action(
     let Some(draft_id) = action.payload["draftId"].as_i64() else {
         return Err(CoreError::Other("send action without draftId".into()));
     };
+    // A send action that arrives for a message which is no longer a draft
+    // has already completed: the process can die between the post-send
+    // commit below and the action being marked done, and startup recovery
+    // re-queues it. Re-dispatching would deliver a duplicate - without
+    // attachments, since their rows and files are already gone - so a
+    // non-draft id is treated as "already sent". A deleted draft row is
+    // unsendable and ends up the same way.
+    let still_needed = ctx
+        .db
+        .read(move |conn| send_still_needed(conn, draft_id))
+        .await?;
+    if !still_needed {
+        tracing::info!(
+            account_id = config.id,
+            draft_id,
+            "smtp send: skipping, draft already sent or deleted"
+        );
+        return Ok(());
+    }
     tracing::info!(account_id = config.id, draft_id, "smtp send: starting");
 
     // Load everything needed to build the message.
@@ -1298,44 +1320,14 @@ async fn send_action(
     let (thread_id, staged_paths) = ctx
         .db
         .write(move |conn| {
-            let tx = conn.transaction()?;
-            let sent_at = now_ms();
-            tx.execute(
-                "UPDATE messages SET is_draft = 0, is_outgoing = 1, is_read = 1,
-                        message_id = ?2, folder_id = COALESCE(?3, folder_id), uid = NULL, date = ?4
-                 WHERE id = ?1",
-                rusqlite::params![draft_id, msg_id_bare, sent_folder_id, sent_at],
-            )?;
-            for a in &sent_to {
-                repo::contacts::harvest(&tx, account_id, a, true, sent_at)?;
-            }
-            tx.execute(
-                "DELETE FROM drafts_meta WHERE message_id = ?1",
-                rusqlite::params![draft_id],
-            )?;
-            // The staged-attachment rows go with the draft, atomically with
-            // the is_draft flip: if this transaction fails the action retries
-            // and the retry re-reads rows and files exactly as at dispatch.
-            // The files themselves are removed only after commit, since a
-            // retry can no longer happen once it succeeds.
-            let staged_paths: Vec<String> = {
-                let mut stmt =
-                    tx.prepare("SELECT file_path FROM draft_attachments WHERE draft_id = ?1")?;
-                stmt.query_map(rusqlite::params![draft_id], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            tx.execute(
-                "DELETE FROM draft_attachments WHERE draft_id = ?1",
-                rusqlite::params![draft_id],
-            )?;
-            let tid: Option<i64> =
-                repo::messages::get_row(&tx, draft_id)?.and_then(|r| r.thread_id);
-            if let Some(tid) = tid {
-                repo::threads::recompute(&tx, tid)?;
-            }
-            repo::search::index_message(&tx, draft_id)?;
-            tx.commit()?;
-            Ok((tid, staged_paths))
+            finalize_sent_draft(
+                conn,
+                draft_id,
+                &msg_id_bare,
+                sent_folder_id,
+                &sent_to,
+                account_id,
+            )
         })
         .await?;
     // Send is durably complete; the staged copies have no remaining reader.
@@ -1355,6 +1347,73 @@ async fn send_action(
         "smtp send: complete",
     );
     Ok(())
+}
+
+/// Dispatch is still required only while the draft row exists and is still a
+/// draft. Once `finalize_sent_draft` commits, `is_draft` is 0 - a re-queued
+/// action (crash recovery) observing that state is replaying a completed
+/// send and must be skipped rather than delivered again.
+fn send_still_needed(conn: &rusqlite::Connection, draft_id: i64) -> Result<bool> {
+    let is_draft: Option<i64> = conn
+        .query_row(
+            "SELECT is_draft FROM messages WHERE id = ?1",
+            rusqlite::params![draft_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(is_draft == Some(1))
+}
+
+/// Post-send bookkeeping for a dispatched draft: flips it into a sent
+/// message, harvests recipients, drops `drafts_meta`, and deletes the
+/// `draft_attachments` rows, returning their paths for post-commit file
+/// removal. Runs only after the server has accepted the message - any
+/// earlier failure in `send_action` leaves rows and files intact so the
+/// retried dispatch can rebuild exactly what it sent.
+fn finalize_sent_draft(
+    conn: &mut rusqlite::Connection,
+    draft_id: i64,
+    msg_id_bare: &str,
+    sent_folder_id: Option<i64>,
+    sent_to: &[Address],
+    account_id: i64,
+) -> Result<(Option<i64>, Vec<String>)> {
+    let tx = conn.transaction()?;
+    let sent_at = now_ms();
+    tx.execute(
+        "UPDATE messages SET is_draft = 0, is_outgoing = 1, is_read = 1,
+                message_id = ?2, folder_id = COALESCE(?3, folder_id), uid = NULL, date = ?4
+         WHERE id = ?1",
+        rusqlite::params![draft_id, msg_id_bare, sent_folder_id, sent_at],
+    )?;
+    for a in sent_to {
+        repo::contacts::harvest(&tx, account_id, a, true, sent_at)?;
+    }
+    tx.execute(
+        "DELETE FROM drafts_meta WHERE message_id = ?1",
+        rusqlite::params![draft_id],
+    )?;
+    // The staged-attachment rows go with the draft, atomically with the
+    // is_draft flip: if this transaction fails the action retries and the
+    // retry re-reads rows and files exactly as at dispatch. The files
+    // themselves are removed only after commit, since a retry can no
+    // longer happen once it succeeds.
+    let staged_paths: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT file_path FROM draft_attachments WHERE draft_id = ?1")?;
+        stmt.query_map(rusqlite::params![draft_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    tx.execute(
+        "DELETE FROM draft_attachments WHERE draft_id = ?1",
+        rusqlite::params![draft_id],
+    )?;
+    let tid: Option<i64> = repo::messages::get_row(&tx, draft_id)?.and_then(|r| r.thread_id);
+    if let Some(tid) = tid {
+        repo::threads::recompute(&tx, tid)?;
+    }
+    repo::search::index_message(&tx, draft_id)?;
+    tx.commit()?;
+    Ok((tid, staged_paths))
 }
 
 /// Tiny extension-based MIME guess for outgoing attachments.
