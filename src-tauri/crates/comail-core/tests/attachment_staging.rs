@@ -232,7 +232,7 @@ async fn save_draft_neutralizes_traversal_filename_and_is_idempotent() {
     // And the traversal-ish echoed name was ignored: the row keeps the
     // filename stored when the file was first staged.
     match &result.attachments[0] {
-        DraftAttachmentIn::Staged { filename, .. } => {
+        comail_core::models::SavedAttachment::Staged { filename, .. } => {
             assert_eq!(filename, "payload.bin");
         }
         other => panic!("expected a Staged attachment, got {other:?}"),
@@ -396,7 +396,10 @@ async fn forward_by_attachment_id_stages_cached_bytes() {
 
     // What `prepare_forward_attachment` does before save_draft: resolve the
     // row id to the cached bytes and mint a token for them.
-    let prepared = core.prepare_forward_attachment(60, None).await.unwrap();
+    let prepared = core
+        .prepare_forward_attachment(60, None, 0, 0)
+        .await
+        .unwrap();
     assert_eq!(prepared.filename, "report.pdf");
     let draft_id = core
         .save_draft(draft_args(
@@ -883,7 +886,7 @@ async fn claim_dropped_attachments_accepts_only_rust_observed_drops() {
 
     // Exchanging the observed path works...
     let claimed = core
-        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None)
+        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None, 0, 0)
         .unwrap()
         .approved;
     assert_eq!(claimed.len(), 1);
@@ -892,7 +895,7 @@ async fn claim_dropped_attachments_accepts_only_rust_observed_drops() {
     // ...once: the drop record is consumed by the exchange, and a duplicate
     // claim for it (e.g. a double-registered listener) is a silent no-op.
     let dup = core
-        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None)
+        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None, 0, 0)
         .unwrap();
     assert!(dup.approved.is_empty());
 
@@ -900,7 +903,7 @@ async fn claim_dropped_attachments_accepts_only_rust_observed_drops() {
     // file - cannot be claimed.
     core.record_os_drop(std::slice::from_ref(&dropped));
     let err = core
-        .claim_dropped_attachments(&[not_dropped.to_string_lossy().into_owned()], None)
+        .claim_dropped_attachments(&[not_dropped.to_string_lossy().into_owned()], None, 0, 0)
         .unwrap_err();
     assert!(
         matches!(err, comail_core::error::CoreError::ActionRejected(_)),
@@ -914,6 +917,8 @@ async fn claim_dropped_attachments_accepts_only_rust_observed_drops() {
                 not_dropped.to_string_lossy().into_owned(),
             ],
             None,
+            0,
+            0,
         )
         .unwrap_err();
     assert!(matches!(
@@ -921,7 +926,7 @@ async fn claim_dropped_attachments_accepts_only_rust_observed_drops() {
         comail_core::error::CoreError::ActionRejected(_)
     ));
     assert!(
-        core.claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None)
+        core.claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None, 0, 0)
             .is_ok(),
         "the genuine drop should survive a failed mixed claim"
     );
@@ -929,7 +934,7 @@ async fn claim_dropped_attachments_accepts_only_rust_observed_drops() {
     // The claimed token stages like a picked file.
     core.record_os_drop(std::slice::from_ref(&dropped));
     let claimed = core
-        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None)
+        .claim_dropped_attachments(&[dropped.to_string_lossy().into_owned()], None, 0, 0)
         .unwrap()
         .approved;
     let draft_id = core
@@ -1265,16 +1270,20 @@ async fn two_drafts_cannot_share_a_staged_path() {
     assert!(std::path::Path::new(&staged).exists());
 }
 
-/// Per-draft bounds: over 100 attachments or over 150 MB total fails the
-/// save outright (and the staged copies it made are removed).
+/// Per-draft bounds are enforced PER ENTRY: entries past the 100-file /
+/// 150 MB limits come back `refused`, the rest of the draft (including the
+/// accepted attachments) still commits, and refused entries never reach
+/// staging. A draft already at the limit stays savable - only ADDING past
+/// it is refused.
 #[tokio::test]
-async fn per_draft_attachment_limits_are_enforced() {
+async fn per_draft_attachment_limits_are_enforced_per_entry() {
     let tmp = tempfile::tempdir().unwrap();
     let (paths, core) = setup_core(&tmp).await;
     std::fs::create_dir_all(paths.draft_attachments_dir()).unwrap();
     let staging_root = std::fs::canonicalize(paths.draft_attachments_dir()).unwrap();
 
-    // Too many: 101 one-byte files.
+    // 101 one-byte files: the first 100 stage, the 101st is refused
+    // per-entry and the rest of the draft still saves.
     let mut atts = Vec::new();
     for i in 0..101usize {
         let f = tmp.path().join(format!("f{i}.txt"));
@@ -1284,22 +1293,36 @@ async fn per_draft_attachment_limits_are_enforced() {
             token: approved[0].token.clone(),
         });
     }
-    let err = core.save_draft(draft_args(1, atts)).await.unwrap_err();
-    assert!(
-        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
-        "count limit: {err:?}"
+    let res = core.save_draft(draft_args(1, atts)).await.unwrap();
+    let staged_count = res
+        .attachments
+        .iter()
+        .filter(|a| matches!(a, comail_core::models::SavedAttachment::Staged { .. }))
+        .count();
+    assert_eq!(staged_count, 100, "first 100 files stage");
+    assert_eq!(
+        res.attachments.len(),
+        101,
+        "the result is index-aligned to the request"
     );
-    // The staged copies of a rejected save were cleaned up.
-    let leftovers = std::fs::read_dir(&staging_root).unwrap().count();
-    assert_eq!(leftovers, 0, "staged copies of a rejected save leaked");
+    match &res.attachments[100] {
+        comail_core::models::SavedAttachment::Refused { reason } => {
+            assert!(reason.contains("attachment limit"), "{reason}");
+        }
+        other => panic!("entry 101 should be refused, got {other:?}"),
+    }
+    // The refused entry never copied into staging: exactly 100 dirs.
+    let staged_dirs = std::fs::read_dir(&staging_root).unwrap().count();
+    assert_eq!(staged_dirs, 100, "only accepted entries were staged");
 
-    // Too big: one sparse 160 MB file (sparse: no real disk cost).
+    // A sparse 160 MB file (sparse: no real disk cost) is refused while the
+    // draft's existing files stay - the save commits.
     let big = tmp.path().join("big.bin");
     let file = std::fs::File::create(&big).unwrap();
     file.set_len(160 * 1024 * 1024).unwrap();
     drop(file);
     let approved = core.approve_attachment_sources(vec![big], None).unwrap();
-    let err = core
+    let res2 = core
         .save_draft(draft_args(
             1,
             vec![DraftAttachmentIn::Token {
@@ -1307,13 +1330,33 @@ async fn per_draft_attachment_limits_are_enforced() {
             }],
         ))
         .await
-        .unwrap_err();
+        .unwrap();
+    assert!(matches!(
+        res2.attachments[0],
+        comail_core::models::SavedAttachment::Refused { .. }
+    ));
+    // No copy of the oversized file ever reached staging.
+    assert_eq!(std::fs::read_dir(&staging_root).unwrap().count(), 100);
+
+    // A draft that is ALREADY at the limit still re-saves its echoes:
+    // only ADDING past the limit is refused.
+    let echoes = stored_paths(&core, res.draft_id)
+        .await
+        .into_iter()
+        .map(|p| DraftAttachmentIn::Staged {
+            filename: p.rsplit('/').next().unwrap_or(&p).to_string(),
+            file_path: p,
+        })
+        .collect::<Vec<_>>();
+    let mut args3 = draft_args(1, echoes);
+    args3.draft_id = Some(res.draft_id);
+    let res3 = core.save_draft(args3).await.unwrap();
     assert!(
-        matches!(err, comail_core::error::CoreError::ActionRejected(_)),
-        "byte limit: {err:?}"
+        res3.attachments
+            .iter()
+            .all(|a| matches!(a, comail_core::models::SavedAttachment::Staged { .. })),
+        "a draft already at the limit remains savable"
     );
-    let leftovers = std::fs::read_dir(&staging_root).unwrap().count();
-    assert_eq!(leftovers, 0);
 }
 
 /// A prepared forward whose cached file would push the session's
@@ -1349,7 +1392,7 @@ async fn prepared_forward_bytes_are_capped_per_session() {
         .unwrap();
 
     let err = core
-        .prepare_forward_attachment(71, Some("session-big".into()))
+        .prepare_forward_attachment(71, Some("session-big".into()), 0, 0)
         .await
         .unwrap_err();
     assert!(

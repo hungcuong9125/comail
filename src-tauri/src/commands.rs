@@ -215,12 +215,17 @@ fn webview_nonce(composer_nonce: Option<String>) -> Option<String> {
 /// display metadata - never the raw paths the webview could replay into
 /// `save_draft`. The only line of the approval flow that cannot run in tests
 /// is the dialog call itself; everything after it is `approve_attachment_sources`.
+/// `current_count`/`current_bytes` are the draft's current attachment
+/// totals: picks that would push it past the per-draft limits come back in
+/// `skipped` instead of becoming chips that would fail every save.
 #[tauri::command]
 pub async fn pick_draft_attachments(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     composer_nonce: Option<String>,
-) -> CmdResult<Vec<ApprovedAttachment>> {
+    current_count: Option<usize>,
+    current_bytes: Option<u64>,
+) -> CmdResult<DropClaim> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let mut builder = app.dialog().file();
@@ -235,31 +240,48 @@ pub async fn pick_draft_attachments(
         .map_err(|_| "file picker closed without an answer".to_string())?;
     let Some(picked) = picked else {
         // Cancelled dialog: no chips.
-        return Ok(Vec::new());
+        return Ok(DropClaim {
+            approved: Vec::new(),
+            skipped: Vec::new(),
+        });
     };
     let paths = picked
         .into_iter()
         .filter_map(|f| f.into_path().ok())
         .collect::<Vec<_>>();
-    state
+    let (approved, skipped) = state
         .core
-        .approve_attachment_sources(paths, webview_nonce(composer_nonce))
-        .map_err(err)
+        .approve_attachment_sources_bounded(
+            paths,
+            webview_nonce(composer_nonce),
+            current_count.unwrap_or(0),
+            current_bytes.unwrap_or(0),
+        )
+        .map_err(err)?;
+    Ok(DropClaim { approved, skipped })
 }
 
 /// Exchange paths from an OS drop event for attachment tokens. Only paths
 /// the Rust webview-event handler observed fall on the window are accepted -
 /// the webview cannot mint approvals for paths it merely claims were
-/// dropped. `composer_nonce` binds the tokens to this composer session.
+/// dropped. `composer_nonce` binds the tokens to this composer session;
+/// `current_count`/`current_bytes` bound what a drop may add to the draft.
 #[tauri::command]
 pub async fn claim_dropped_attachments(
     state: State<'_, AppState>,
     paths: Vec<String>,
     composer_nonce: Option<String>,
+    current_count: Option<usize>,
+    current_bytes: Option<u64>,
 ) -> CmdResult<DropClaim> {
     state
         .core
-        .claim_dropped_attachments(&paths, webview_nonce(composer_nonce))
+        .claim_dropped_attachments(
+            &paths,
+            webview_nonce(composer_nonce),
+            current_count.unwrap_or(0),
+            current_bytes.unwrap_or(0),
+        )
         .map_err(err)
 }
 
@@ -271,10 +293,17 @@ pub async fn prepare_forward_attachment(
     state: State<'_, AppState>,
     attachment_id: i64,
     composer_nonce: Option<String>,
+    current_count: Option<usize>,
+    current_bytes: Option<u64>,
 ) -> CmdResult<ApprovedAttachment> {
     state
         .core
-        .prepare_forward_attachment(attachment_id, webview_nonce(composer_nonce))
+        .prepare_forward_attachment(
+            attachment_id,
+            webview_nonce(composer_nonce),
+            current_count.unwrap_or(0),
+            current_bytes.unwrap_or(0),
+        )
         .await
         .map_err(err)
 }

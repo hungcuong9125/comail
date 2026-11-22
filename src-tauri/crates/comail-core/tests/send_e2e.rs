@@ -137,6 +137,8 @@ async fn reply_send_reaches_smtp_and_sent_folder() {
         .queue_send(QueueSendArgs {
             draft_id,
             send_at: Some(now_ms()),
+
+            expected_attachments: None,
         })
         .await
         .expect("queue send");

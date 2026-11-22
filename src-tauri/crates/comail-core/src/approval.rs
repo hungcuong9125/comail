@@ -189,6 +189,43 @@ fn regular_file(path: &PathBuf) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
 
+/// How much draft capacity a candidate attachment may still consume.
+/// `pick`/`claim`/`prepare` enforce the per-draft bounds at mint time
+/// against the composer's own totals (advisory - `save_draft` re-validates
+/// authoritatively), so an over-limit file is refused BEFORE its chip even
+/// exists instead of failing every later autosave.
+#[derive(Clone, Copy)]
+pub struct AttachmentBudget {
+    /// Entries already counted toward `crate::MAX_DRAFT_ATTACHMENTS`.
+    pub count: usize,
+    /// Bytes already counted toward `crate::MAX_DRAFT_ATTACHMENT_BYTES`.
+    pub bytes: u64,
+}
+
+impl AttachmentBudget {
+    /// None when adding `size` more bytes and one more file would exceed the
+    /// per-draft bounds.
+    pub(crate) fn room_for(&self, size: u64) -> bool {
+        self.count < crate::MAX_DRAFT_ATTACHMENTS
+            && self.bytes.saturating_add(size) <= crate::MAX_DRAFT_ATTACHMENT_BYTES
+    }
+
+    pub(crate) fn consume(&mut self, size: u64) {
+        self.count += 1;
+        self.bytes = self.bytes.saturating_add(size);
+    }
+
+    /// The refusal reason matching `room_for` failing, used consistently at
+    /// mint and save time.
+    pub(crate) fn over_limit_reason() -> String {
+        format!(
+            "exceeds the draft's attachment limit ({} files / {} MB)",
+            crate::MAX_DRAFT_ATTACHMENTS,
+            crate::MAX_DRAFT_ATTACHMENT_BYTES / (1024 * 1024)
+        )
+    }
+}
+
 impl AttachmentApprovals {
     /// Mint approval tokens for user-picked local files. Callers must be
     /// trusted Rust code: the native file dialog handler, or internal code
@@ -203,6 +240,38 @@ impl AttachmentApprovals {
         nonce: Option<String>,
     ) -> Result<Vec<ApprovedAttachment>> {
         self.approve_at(paths, Instant::now(), nonce)
+    }
+
+    /// [`approve`] bounded by the caller's current draft totals: candidates
+    /// that would push the draft past its attachment limits are not minted
+    /// and come back as `skipped` with a reason the UI can surface.
+    /// `budget` is updated for each approved file so a multi-file pick is
+    /// counted against itself, not just what the draft already holds.
+    pub fn approve_budgeted(
+        &self,
+        paths: Vec<PathBuf>,
+        nonce: Option<String>,
+        budget: &mut AttachmentBudget,
+    ) -> Result<(Vec<ApprovedAttachment>, Vec<SkippedDrop>)> {
+        let mut kept = Vec::new();
+        let mut skipped = Vec::new();
+        for path in paths {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "attachment".into());
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if !budget.room_for(size) {
+                skipped.push(SkippedDrop {
+                    path: name,
+                    reason: AttachmentBudget::over_limit_reason(),
+                });
+                continue;
+            }
+            budget.consume(size);
+            kept.push(path);
+        }
+        Ok((self.approve(kept, nonce)?, skipped))
     }
 
     /// [`approve`] for a single internal source whose display name is not
@@ -346,7 +415,12 @@ impl AttachmentApprovals {
     /// devices) are skipped with a reason the caller can surface, and a path
     /// whose drop was already claimed is skipped silently (the same OS drop
     /// reaching two listeners is a no-op, not an error).
-    pub fn claim_drops(&self, paths: &[String], nonce: Option<String>) -> Result<DropClaim> {
+    pub fn claim_drops(
+        &self,
+        paths: &[String],
+        nonce: Option<String>,
+        mut budget: Option<&mut AttachmentBudget>,
+    ) -> Result<DropClaim> {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
         inner.evict_expired(now);
@@ -380,14 +454,27 @@ impl AttachmentApprovals {
             if inner.pending_drops.contains_key(&canon) {
                 // A fresh OS observation wins over an older consumed marker,
                 // so re-dropping the same file claims it again.
-                if regular_file(&canon) {
-                    canonical.push(canon);
-                } else {
+                if !regular_file(&canon) {
                     skipped.push(SkippedDrop {
                         path: raw.clone(),
                         reason: "not a file".into(),
                     });
+                    continue;
                 }
+                let size = std::fs::metadata(&canon).map(|m| m.len()).unwrap_or(0);
+                if let Some(b) = budget.as_deref_mut()
+                    && !b.room_for(size)
+                {
+                    skipped.push(SkippedDrop {
+                        path: raw.clone(),
+                        reason: AttachmentBudget::over_limit_reason(),
+                    });
+                    continue;
+                }
+                if let Some(b) = budget.as_deref_mut() {
+                    b.consume(size);
+                }
+                canonical.push(canon);
                 continue;
             }
             if inner.consumed_drops.contains_key(&canon) {
@@ -521,22 +608,28 @@ impl AttachmentApprovals {
     }
 }
 
-/// Tracks tokens checked out by one `save_draft` call. Tokens are consumed
-/// only via [`Self::commit`] after the draft transaction commits; dropping
-/// the guard without committing - early return, panics, a dropped save
-/// future - rolls every tracked token back so it can never stay marked
-/// in-flight forever.
+/// Tracks everything one `save_draft` attempt checked out: approval tokens
+/// AND the staged copies it wrote. Tokens are consumed only via
+/// [`Self::commit`] after the draft transaction commits; dropping the guard
+/// without committing - early return, panics, a dropped save future - rolls
+/// the tokens back AND deletes the fresh staged copies, so an aborted save
+/// never leaves files waiting for the hourly sweep.
 pub(crate) struct TokenGuard<'a> {
     registry: &'a AttachmentApprovals,
+    /// Canonical staging root the tracked fresh paths must stay under.
+    root: PathBuf,
     tokens: Vec<String>,
+    fresh: Vec<PathBuf>,
     committed: bool,
 }
 
 impl<'a> TokenGuard<'a> {
-    pub(crate) fn new(registry: &'a AttachmentApprovals) -> Self {
+    pub(crate) fn new(registry: &'a AttachmentApprovals, root: PathBuf) -> Self {
         Self {
             registry,
+            root,
             tokens: Vec::new(),
+            fresh: Vec::new(),
             committed: false,
         }
     }
@@ -545,18 +638,44 @@ impl<'a> TokenGuard<'a> {
         self.tokens.push(token.to_string());
     }
 
-    /// Consume all tracked tokens (single-use semantics) and disarm the
-    /// drop-time rollback.
-    pub(crate) fn commit(mut self) {
+    /// A staged copy this save attempt wrote - deleted on uncommitted drop.
+    pub(crate) fn track_fresh(&mut self, path: PathBuf) {
+        self.fresh.push(path);
+    }
+
+    /// Consume all tracked tokens (single-use semantics), disarm the
+    /// drop-time cleanup, and hand back the fresh paths so the caller can
+    /// record them as produced by this session.
+    pub(crate) fn commit(mut self) -> Vec<PathBuf> {
         self.committed = true;
         self.registry.commit(&self.tokens);
+        std::mem::take(&mut self.fresh)
     }
 }
 
 impl Drop for TokenGuard<'_> {
     fn drop(&mut self) {
-        if !self.committed {
-            self.registry.rollback(&self.tokens);
+        if self.committed {
+            return;
+        }
+        self.registry.rollback(&self.tokens);
+        // Same confinement rule as remove_staged_draft_files: only delete
+        // paths that canonicalise inside the staging root. Sync fs is fine
+        // here - unlink is cheap and Drop cannot await.
+        for p in &self.fresh {
+            let Ok(canon) = p.canonicalize() else {
+                continue;
+            };
+            if !canon.starts_with(&self.root) {
+                continue;
+            }
+            let _ = std::fs::remove_file(&canon);
+            if let Some(dir) = canon.parent()
+                && dir != self.root
+                && dir.starts_with(&self.root)
+            {
+                let _ = std::fs::remove_dir(dir);
+            }
         }
     }
 }
@@ -636,7 +755,7 @@ mod tests {
         reg.record_drop(std::slice::from_ref(&f));
         let raw = f.to_string_lossy().into_owned();
         assert_eq!(
-            reg.claim_drops(std::slice::from_ref(&raw), None)
+            reg.claim_drops(std::slice::from_ref(&raw), None, None)
                 .unwrap()
                 .approved
                 .len(),
@@ -644,7 +763,12 @@ mod tests {
         );
         // A duplicate claim for the same drop no-ops instead of erroring -
         // the files were minted for the first listener.
-        assert!(reg.claim_drops(&[raw], None).unwrap().approved.is_empty());
+        assert!(
+            reg.claim_drops(&[raw], None, None)
+                .unwrap()
+                .approved
+                .is_empty()
+        );
     }
 
     #[test]
@@ -654,7 +778,7 @@ mod tests {
         let f = tmp_file(tmp.path(), "never-dropped.txt");
         // Real file, never recorded: the webview cannot mint it.
         assert!(matches!(
-            reg.claim_drops(&[f.to_string_lossy().into_owned()], None),
+            reg.claim_drops(&[f.to_string_lossy().into_owned()], None, None),
             Err(CoreError::ActionRejected(_))
         ));
         // An observed directory is skipped with a reason the UI can surface,
@@ -663,7 +787,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         reg.record_drop(std::slice::from_ref(&dir));
         let claim = reg
-            .claim_drops(&[dir.to_string_lossy().into_owned()], None)
+            .claim_drops(&[dir.to_string_lossy().into_owned()], None, None)
             .unwrap();
         assert!(claim.approved.is_empty());
         assert_eq!(claim.skipped.len(), 1);
@@ -696,13 +820,13 @@ mod tests {
         let tok = minted[0].token.clone();
         // A guard dropped uncommitted returns the checkout...
         {
-            let mut guard = TokenGuard::new(&reg);
+            let mut guard = TokenGuard::new(&reg, tmp.path().to_path_buf());
             reg.checkout(&tok, &None).unwrap();
             guard.track(&tok);
             drop(guard);
         }
         // ...so the same token can be checked out again by the retry.
-        let mut guard = TokenGuard::new(&reg);
+        let mut guard = TokenGuard::new(&reg, tmp.path().to_path_buf());
         reg.checkout(&tok, &None).unwrap();
         guard.track(&tok);
         guard.commit();

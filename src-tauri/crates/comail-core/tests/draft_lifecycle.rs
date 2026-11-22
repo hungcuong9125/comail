@@ -355,6 +355,8 @@ async fn delete_draft_cancels_its_pending_send() {
         .queue_send(QueueSendArgs {
             draft_id,
             send_at: Some(send_at),
+
+            expected_attachments: None,
         })
         .await
         .unwrap();
@@ -386,6 +388,8 @@ async fn delete_draft_refuses_while_its_send_is_in_flight() {
         .queue_send(QueueSendArgs {
             draft_id,
             send_at: Some(now_ms() + 3_600_000),
+
+            expected_attachments: None,
         })
         .await
         .unwrap();
@@ -444,6 +448,8 @@ async fn deleting_a_remote_draft_without_a_trash_folder_is_rejected_not_gone() {
         .queue_send(QueueSendArgs {
             draft_id,
             send_at: Some(now_ms() + 3_600_000),
+
+            expected_attachments: None,
         })
         .await
         .unwrap();

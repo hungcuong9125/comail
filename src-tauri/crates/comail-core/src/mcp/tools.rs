@@ -537,6 +537,8 @@ pub(super) async fn call(core: &Core, name: &str, args: Value) -> ToolResult {
                 .queue_send(QueueSendArgs {
                     draft_id,
                     send_at: None,
+
+                    expected_attachments: None,
                 })
                 .await?;
             json!({

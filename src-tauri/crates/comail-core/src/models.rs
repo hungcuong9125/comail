@@ -412,14 +412,29 @@ pub struct SaveDraftArgs {
     pub composer_nonce: Option<String>,
 }
 
-/// What `save_draft` returns: the draft id plus every attachment as it was
-/// persisted - always `Staged` entries in request order, echoed back on
-/// re-save (one-shot `Token` entries must not be replayed).
+/// The persisted outcome of ONE `save_draft` attachment entry, in request
+/// order. `staged` is the ref the composer echoes on re-save (a one-shot
+/// `Token` entry must never be replayed); `refused` means the entry was
+/// rejected per-entry (e.g. over the per-draft size limit) while the rest
+/// of the draft saved - the composer marks that chip failed and leaves it
+/// out of the wire on the next save.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SavedAttachment {
+    #[serde(rename = "staged")]
+    Staged { file_path: String, filename: String },
+    #[serde(rename = "refused")]
+    Refused { reason: String },
+}
+
+/// What `save_draft` returns: the draft id plus one `SavedAttachment` per
+/// request entry, aligned by index - request order IS the mapping, so the
+/// composer zips them onto the chips the request was built from.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveDraftResult {
     pub draft_id: i64,
-    pub attachments: Vec<DraftAttachmentIn>,
+    pub attachments: Vec<SavedAttachment>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -427,6 +442,12 @@ pub struct SaveDraftResult {
 pub struct QueueSendArgs {
     pub draft_id: i64,
     pub send_at: Option<i64>,
+    /// The staged paths the composer believes this draft holds. Optional
+    /// backstop: when present, queueing is refused if the draft's
+    /// `draft_attachments` rows differ - the draft that goes out must be the
+    /// one the composer shows. Internal callers (MCP) leave it unset.
+    #[serde(default)]
+    pub expected_attachments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
