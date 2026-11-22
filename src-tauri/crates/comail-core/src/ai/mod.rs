@@ -280,6 +280,17 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Non-streaming response cap. Chat completions are tens of KB at most;
+/// 16 MB is far beyond any real answer and stops a hostile endpoint from
+/// growing memory unboundedly. Streaming responses share the same cap on the
+/// total bytes assembled.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Cap on a single buffered SSE event — the bytes accumulated while waiting
+/// for a newline. Real `data:` events are KBs; a server sending an endless
+/// line must not grow memory unboundedly.
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
 async fn read_all<S>(mut stream: S, req: &str, timeout_secs: u64) -> Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -290,19 +301,30 @@ where
         .await
         .map_err(|e| CoreError::Network(format!("ai request write failed: {e}")))?;
     let mut resp = Vec::new();
-    let read = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        stream.read_to_end(&mut resp),
-    )
-    .await
-    .map_err(|_| CoreError::Other("ai request timed out".into()))?;
-    // A server that closes the TLS connection abruptly (no close_notify) after
-    // sending the whole body surfaces as a read error here even though the body
-    // arrived. Keep whatever we read and let the caller parse it; a genuinely
-    // truncated body just fails to parse. Only fail outright on an empty read.
-    if let Err(e) = read {
-        if resp.is_empty() {
-            return Err(CoreError::Network(format!("ai response read failed: {e}")));
+    // The timeout covers the whole body, same as the old `read_to_end` wrap.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
+            Err(_) => return Err(CoreError::Other("ai request timed out".into())),
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                resp.extend_from_slice(&chunk[..n]);
+                if resp.len() > MAX_RESPONSE_BYTES {
+                    return Err(CoreError::Other("ai response too large".into()));
+                }
+            }
+            // A server that closes the TLS connection abruptly (no
+            // close_notify) after sending the whole body surfaces as a read
+            // error here even though the body arrived. Keep whatever we read
+            // and let the caller parse it; a genuinely truncated body just
+            // fails to parse. Only fail outright on an empty read.
+            Ok(Err(e)) => {
+                if resp.is_empty() {
+                    return Err(CoreError::Network(format!("ai response read failed: {e}")));
+                }
+                break;
+            }
         }
     }
     Ok(resp)
@@ -311,7 +333,9 @@ where
 /// Minimal HTTP/1.0 request. `https://` uses rustls; plain `http://` is
 /// supported for local endpoints (LM Studio, Ollama). Empty bearer sends
 /// no Authorization header (local servers need no key).
-/// Parse an endpoint URL into (host, port, https, path).
+/// Parse an endpoint URL into (host, port, https, request-target). The
+/// target keeps the path AND the query — endpoints like Azure's
+/// `.../openai?api-version=…` route on it; dropping it used to break them.
 fn parse_endpoint(url: &str) -> Result<(String, u16, bool, String)> {
     let parsed = url::Url::parse(url).map_err(|e| CoreError::Other(format!("bad ai url: {e}")))?;
     let https = match parsed.scheme() {
@@ -324,20 +348,88 @@ fn parse_endpoint(url: &str) -> Result<(String, u16, bool, String)> {
         .ok_or_else(|| CoreError::Other("bad ai url".into()))?
         .to_string();
     let port = parsed.port().unwrap_or(if https { 443 } else { 80 });
-    Ok((host, port, https, parsed.path().to_string()))
+    let mut target = parsed.path().to_string();
+    if let Some(q) = parsed.query() {
+        target.push('?');
+        target.push_str(q);
+    }
+    Ok((host, port, https, target))
 }
+
+/// Append an API sub-path to a base endpoint URL, keeping any query string at
+/// the end (`https://h/api?k=v` + `chat/completions` →
+/// `https://h/api/chat/completions?k=v`). `url::Url::join` would drop the
+/// query, and naive string concat would bury it inside the path; `set_path`
+/// replaces only the path and leaves the query untouched.
+fn endpoint_url(base_url: &str, sub_path: &str) -> Result<String> {
+    let mut parsed =
+        url::Url::parse(base_url).map_err(|e| CoreError::Other(format!("bad ai url: {e}")))?;
+    let base_path = parsed.path().trim_end_matches('/').to_string();
+    parsed.set_path(&format!("{base_path}/{sub_path}"));
+    Ok(parsed.to_string())
+}
+
+/// Connect + TLS-handshake budget. A stalled connect or handshake must not
+/// hang callers holding `ai_router_lock` (or the Ask loop) indefinitely.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Open a TCP connection to the AI endpoint, mapping a failed connect to
 /// [`CoreError::Network`] (server down / unreachable / DNS) rather than the
 /// generic IO error - which the UI renders as a misleading "File system error".
+/// Bounded by `CONNECT_TIMEOUT` so a black-holed peer can't hang the caller.
 async fn connect_endpoint(host: &str, port: u16) -> Result<tokio::net::TcpStream> {
-    tokio::net::TcpStream::connect((host, port))
+    tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    .map_err(|_| {
+        CoreError::Network(format!(
+            "couldn't reach AI endpoint {host}:{port}: connect timed out"
+        ))
+    })?
+    .map_err(|e| CoreError::Network(format!("couldn't reach AI endpoint {host}:{port}: {e}")))
+}
+
+/// TLS handshake over `tcp` under the same `CONNECT_TIMEOUT` budget as the
+/// connect - a peer that completes TCP then stalls the handshake must not
+/// hang the caller either.
+async fn tls_connect(
+    host: &str,
+    tcp: tokio::net::TcpStream,
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let connector = crate::imap::tls_connector();
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| CoreError::Tls(e.to_string()))?;
+    tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp))
         .await
-        .map_err(|e| CoreError::Network(format!("couldn't reach AI endpoint {host}:{port}: {e}")))
+        .map_err(|_| CoreError::Tls(format!("TLS handshake with {host} timed out")))?
+        .map_err(|e| CoreError::Tls(e.to_string()))
 }
 
 /// Build a bare HTTP/1.0 request line + headers (+ optional JSON body).
-fn format_request(method: &str, path: &str, host: &str, bearer: &str, payload: &str) -> String {
+/// `bearer` is interpolated into a header: reject CR/LF outright rather than
+/// let a malformed key inject extra headers. The Host header carries the port
+/// whenever it isn't the scheme default - some servers and virtual-host
+/// setups rely on it.
+fn format_request(
+    method: &str,
+    path: &str,
+    host: &str,
+    port: u16,
+    https: bool,
+    bearer: &str,
+    payload: &str,
+) -> Result<String> {
+    if bearer.contains(['\r', '\n']) {
+        return Err(CoreError::Other("ai api key contains a line break".into()));
+    }
+    let default_port = if https { 443 } else { 80 };
+    let authority = if port == default_port {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
     let auth = if bearer.is_empty() {
         String::new()
     } else {
@@ -351,10 +443,10 @@ fn format_request(method: &str, path: &str, host: &str, bearer: &str, payload: &
             payload.len()
         )
     };
-    format!(
-        "{method} {path} HTTP/1.0\r\nHost: {host}\r\n{auth}{content}\
+    Ok(format!(
+        "{method} {path} HTTP/1.0\r\nHost: {authority}\r\n{auth}{content}\
          Accept: application/json\r\nConnection: close\r\n\r\n{payload}"
-    )
+    ))
 }
 
 pub(crate) async fn http_request(
@@ -369,19 +461,15 @@ pub(crate) async fn http_request(
         method,
         &path,
         &host,
+        port,
+        https,
         bearer,
         payload.as_deref().unwrap_or(""),
-    );
+    )?;
 
     let tcp = connect_endpoint(&host, port).await?;
     let raw = if https {
-        let connector = crate::imap::tls_connector();
-        let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-            .map_err(|e| CoreError::Tls(e.to_string()))?;
-        let stream = connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e| CoreError::Tls(e.to_string()))?;
+        let stream = tls_connect(&host, tcp).await?;
         read_all(stream, &req, timeout_secs).await?
     } else {
         read_all(tcp, &req, timeout_secs).await?
@@ -499,7 +587,7 @@ pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
     if apple::is_apple(base_url) {
         return Ok(vec![apple::MODEL_ID.to_string()]);
     }
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let url = endpoint_url(base_url, "models")?;
     let raw = http_get_json(&url, api_key).await?;
     let parsed: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|_| CoreError::Other("unparseable models response".into()))?;
@@ -577,7 +665,7 @@ pub fn parse_json<T: serde::de::DeserializeOwned>(out: &str) -> Option<T> {
 }
 
 async fn chat_completion(cfg: &AiConfig, body: serde_json::Value) -> Result<String> {
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let url = endpoint_url(&cfg.base_url, "chat/completions")?;
     let raw = http_post_json(&url, &cfg.api_key, &body).await?;
     let parsed: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|_| CoreError::Other("unparseable ai response".into()))?;
@@ -631,7 +719,7 @@ pub async fn chat_stream(
     if apple::is_apple(&cfg.base_url) {
         return apple_chat(cfg, chat_pairs(&messages), true, &mut on_delta).await;
     }
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let url = endpoint_url(&cfg.base_url, "chat/completions")?;
     let body = request_body(cfg, json!({ "messages": messages.clone(), "stream": true }));
     let mut noop = |_: &str| {};
     let (full, _reasoning) =
@@ -647,6 +735,11 @@ pub async fn chat_stream(
     }
     Ok(text)
 }
+
+/// Upper bound on tool calls accumulated from one streamed reply. `index` in
+/// each `tool_calls` delta is server-controlled and grows the accumulation
+/// vector by slot, so an unbounded index would exhaust memory.
+const MAX_TOOL_CALLS: usize = 64;
 
 /// One function-calling tool the model requested, with raw JSON arguments.
 #[derive(Debug, Clone)]
@@ -682,7 +775,7 @@ pub async fn chat_tools(
             "Apple Intelligence doesn't support tool calling".into(),
         ));
     }
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let url = endpoint_url(&cfg.base_url, "chat/completions")?;
     let body = request_body(
         cfg,
         json!({ "messages": messages, "tools": tools, "tool_choice": "auto" }),
@@ -736,7 +829,7 @@ pub async fn chat_tools_stream(
             "Apple Intelligence doesn't support tool calling".into(),
         ));
     }
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let url = endpoint_url(&cfg.base_url, "chat/completions")?;
     let body = request_body(
         cfg,
         json!({ "messages": messages.clone(), "tools": tools.clone(), "tool_choice": "auto", "stream": true }),
@@ -769,6 +862,12 @@ pub async fn chat_tools_stream(
             let i = tc["index"]
                 .as_u64()
                 .unwrap_or(calls.len().saturating_sub(1) as u64) as usize;
+            // `index` is server-controlled and grows `calls` by slot; bound it
+            // so a hostile or broken endpoint can't allocate absurd vectors.
+            if i >= MAX_TOOL_CALLS {
+                tracing::warn!(index = i, "ai: ignoring out-of-range tool-call index");
+                continue;
+            }
             while calls.len() <= i {
                 calls.push(Default::default());
             }
@@ -852,7 +951,7 @@ pub async fn chat_stream_json_split(
         let answer = apple_chat(cfg, pairs, true, &mut on_answer).await?;
         return Ok((answer, String::new()));
     }
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let url = endpoint_url(&cfg.base_url, "chat/completions")?;
     let body = request_body(cfg, json!({ "messages": messages, "stream": true }));
     let (answer, reasoning) =
         stream_split(&url, &cfg.api_key, &body, &mut on_answer, &mut on_reasoning).await?;
@@ -918,16 +1017,10 @@ async fn http_post_sse(
 ) -> Result<()> {
     let (host, port, https, path) = parse_endpoint(url)?;
     let payload = serde_json::to_string(body)?;
-    let req = format_request("POST", &path, &host, bearer, &payload);
+    let req = format_request("POST", &path, &host, port, https, bearer, &payload)?;
     let tcp = connect_endpoint(&host, port).await?;
     if https {
-        let connector = crate::imap::tls_connector();
-        let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-            .map_err(|e| CoreError::Tls(e.to_string()))?;
-        let stream = connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e| CoreError::Tls(e.to_string()))?;
+        let stream = tls_connect(&host, tcp).await?;
         stream_sse(stream, &req, on_chunk).await
     } else {
         stream_sse(tcp, &req, on_chunk).await
@@ -955,6 +1048,7 @@ where
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut header_done = false;
+    let mut total_bytes: usize = 0;
 
     loop {
         let n = match tokio::time::timeout(idle, stream.read(&mut chunk)).await {
@@ -975,7 +1069,17 @@ where
         if n == 0 {
             break;
         }
+        total_bytes += n;
+        if total_bytes > MAX_RESPONSE_BYTES {
+            return Err(CoreError::Other("ai stream too large".into()));
+        }
         buf.extend_from_slice(&chunk[..n]);
+        // `buf` below only holds the not-yet-newline-terminated remainder of
+        // one event (plus the header until it completes): bound it so a
+        // never-ending line can't grow memory.
+        if buf.len() > MAX_SSE_EVENT_BYTES {
+            return Err(CoreError::Other("ai stream event too large".into()));
+        }
 
         if !header_done {
             let Some(pos) = find_subslice(&buf, b"\r\n\r\n") else {
@@ -2392,5 +2496,183 @@ mod intent_tests {
         let s = parse_local_iso("2026-07-12T20:00").unwrap();
         let e = parse_local_iso("2026-07-12T21:00").unwrap();
         assert_eq!(e - s, 60 * 60 * 1000);
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn endpoint_parsing_keeps_the_query() {
+        let (host, port, https, target) =
+            parse_endpoint("https://azure.example/openai?api-version=2024-10-01-preview").unwrap();
+        assert_eq!(host, "azure.example");
+        assert_eq!(port, 443);
+        assert!(https);
+        assert_eq!(target, "/openai?api-version=2024-10-01-preview");
+        let (_, _, https, target) = parse_endpoint("http://localhost:11434/v1").unwrap();
+        assert!(!https);
+        assert_eq!(target, "/v1");
+    }
+
+    #[test]
+    fn endpoint_url_appends_subpath_before_the_query() {
+        let u = endpoint_url("https://h.example/api?api-version=1", "chat/completions").unwrap();
+        assert_eq!(u, "https://h.example/api/chat/completions?api-version=1");
+        let (_, _, _, target) = parse_endpoint(&u).unwrap();
+        assert_eq!(target, "/api/chat/completions?api-version=1");
+        // Trailing slashes and no-query bases behave as before.
+        let u = endpoint_url("http://localhost:11434/v1/", "models").unwrap();
+        assert_eq!(u, "http://localhost:11434/v1/models");
+        assert!(endpoint_url("not a url", "x").is_err());
+    }
+
+    #[test]
+    fn request_target_and_host_port_and_bearer_validation() {
+        // Non-default port appears in Host; default port does not.
+        let req = format_request("POST", "/v1?k=v", "h.example", 8443, true, "key", "").unwrap();
+        assert!(req.starts_with("POST /v1?k=v HTTP/1.0\r\n"), "{req}");
+        assert!(req.contains("Host: h.example:8443\r\n"), "{req}");
+        let req = format_request("POST", "/v1", "h.example", 443, true, "key", "").unwrap();
+        assert!(req.contains("Host: h.example\r\n"), "{req}");
+        let req = format_request("POST", "/v1", "h.example", 8080, false, "", "").unwrap();
+        assert!(req.contains("Host: h.example:8080\r\n"), "{req}");
+        assert!(!req.contains("Authorization"), "{req}");
+        // A CR or LF in the bearer must be rejected, never sent (header
+        // injection).
+        assert!(format_request("POST", "/v1", "h", 443, true, "key\r\nX: y", "").is_err());
+        assert!(format_request("POST", "/v1", "h", 443, true, "key\nZ: z", "").is_err());
+    }
+
+    /// Serve one HTTP/1.0 response on loopback and return the base URL.
+    async fn serve_once(head_and_body: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = vec![0u8; 65536];
+            let _ = s.read(&mut req).await;
+            let _ = s.write_all(head_and_body.as_bytes()).await;
+            let _ = s.shutdown().await;
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn read_all_rejects_oversized_bodies() {
+        // A response just over the 16 MB cap must error rather than grow
+        // memory unbounded.
+        let over = MAX_RESPONSE_BYTES + 64;
+        let mut buf = vec![0u8; 1024];
+        let n = {
+            let head = "HTTP/1.0 200 OK\r\n\r\n";
+            buf[..head.len()].copy_from_slice(head.as_bytes());
+            head.len()
+        };
+        let big = vec![b'x'; over];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req).await;
+            let _ = s.write_all(&buf[..n]).await;
+            let _ = s.write_all(&big).await;
+            let _ = s.shutdown().await;
+        });
+        let res = http_request(&format!("http://127.0.0.1:{port}/"), "GET", "", None, 10).await;
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stream_tool_call_index_is_capped() {
+        // One valid call at index 0 plus a hostile index far beyond the cap:
+        // the second must be dropped instead of growing a million-slot vec.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"search_inbox\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}},",
+            "{\"index\":999999,\"id\":\"b\",\"function\":{\"name\":\"evil\",\"arguments\":\"{}\"}}",
+            "]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let base = serve_once(format!(
+            "HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{sse}"
+        ))
+        .await;
+        let cfg = AiConfig {
+            base_url: base,
+            model: "m".into(),
+            api_key: String::new(),
+            language: None,
+            zero_retention: false,
+            usage_sink: None,
+        };
+        let step = chat_tools_stream(&cfg, vec![], json!([]), |_| {}, |_| {})
+            .await
+            .unwrap();
+        let ChatStep::Tools { calls, .. } = step else {
+            panic!("expected a tool-call step, got a plain answer");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search_inbox");
+    }
+
+    #[tokio::test]
+    async fn stream_sse_rejects_an_endless_event_line() {
+        use tokio::net::TcpStream;
+        // A single `data:` line beyond the 1 MiB event cap must error rather
+        // than buffer forever.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req).await;
+            s.write_all(b"HTTP/1.0 200 OK\r\n\r\ndata: ").await.unwrap();
+            let big = vec![b'x'; MAX_SSE_EVENT_BYTES + 4096];
+            let _ = s.write_all(&big).await; // no newline: one endless event
+            let _ = s.shutdown().await;
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut sink = |_: &serde_json::Value| {};
+        let err = stream_sse(stream, "GET / HTTP/1.0\r\n\r\n", &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("event too large"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stream_sse_caps_total_assembled_bytes() {
+        use tokio::net::TcpStream;
+        // Events each under the line cap but totalling over the 16 MiB total
+        // cap must error out mid-stream.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req).await;
+            s.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await.unwrap();
+            // 17 events of ~1 MiB each (newline-terminated, under the event
+            // cap) — 17 MiB total.
+            let mut line = b"data: ".to_vec();
+            line.resize(MAX_SSE_EVENT_BYTES - 8, b'x');
+            line.push(b'\n');
+            for _ in 0..17 {
+                if s.write_all(&line).await.is_err() {
+                    break; // client already errored and hung up
+                }
+            }
+            let _ = s.shutdown().await;
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut sink = |_: &serde_json::Value| {};
+        let err = stream_sse(stream, "GET / HTTP/1.0\r\n\r\n", &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
     }
 }
