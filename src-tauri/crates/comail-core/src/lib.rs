@@ -1909,8 +1909,12 @@ impl Core {
                     // This draft exists on IMAP. Move it optimistically and
                     // queue the matching remote move so the next sync cannot
                     // resurrect the local row in Drafts.
+                    // Not a "draft is gone" NotFound - the draft is still
+                    // there; the delete itself cannot proceed without
+                    // somewhere to move it, so it is rejected like the other
+                    // un-deletable cases in trash.rs.
                     let trash = repo::folders::by_role(conn, row.0, roles::TRASH)?
-                        .ok_or_else(|| CoreError::NotFound("no trash folder".into()))?;
+                        .ok_or_else(|| CoreError::DeleteRejected("no trash folder".into()))?;
                     let payload = move_identity_payload(conn, draft_id, row.2, row.3, trash.id)?;
                     repo::messages::set_uid_and_folder(conn, draft_id, trash.id, None)?;
                     repo::actions::enqueue(
@@ -6369,15 +6373,7 @@ fn action_identity_payload(
     conn: &rusqlite::Connection,
     message_id: i64,
 ) -> Result<serde_json::Value> {
-    let row = repo::messages::get_row(conn, message_id)?
-        .ok_or_else(|| CoreError::NotFound("message for action".into()))?;
-    let validity = row
-        .folder_id
-        .map(|id| repo::folders::get(conn, id))
-        .transpose()?
-        .flatten()
-        .and_then(|folder| folder.uidvalidity);
-    Ok(serde_json::json!({ "folderId": row.folder_id, "uid": row.uid, "uidValidity": validity }))
+    repo::actions::identity_payload(conn, message_id)
 }
 
 fn move_identity_payload(
