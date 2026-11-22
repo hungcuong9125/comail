@@ -42,6 +42,7 @@ pub async fn execute_due(
     ctx: &SyncCtx,
     config: &AccountConfig,
     session: &mut Session,
+    stopped: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<ActionSliceResult> {
     let account_id = config.id;
     let started = Instant::now();
@@ -54,8 +55,9 @@ pub async fn execute_due(
     let mut due = due.into_iter().peekable();
     while let Some(first) = due.next() {
         // This is a cooperative budget: never abandon an action midway through
-        // an IMAP/SMTP command, but do not start another after the slice expires.
-        if started.elapsed() >= MAX_SLICE_DURATION {
+        // an IMAP/SMTP command, but do not start another after the slice
+        // expires or the account's task set is being torn down.
+        if started.elapsed() >= MAX_SLICE_DURATION || *stopped.borrow() {
             break;
         }
 

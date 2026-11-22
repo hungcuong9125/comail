@@ -83,6 +83,11 @@ pub enum SyncCmd {
 pub struct AccountTasks {
     stop: tokio::sync::watch::Sender<bool>,
     joins: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Handles that may be waited on but never aborted: they carry units of
+    /// work that must settle once started (the mutation worker must not be
+    /// cancelled mid-action - a remote command applied but not yet recorded
+    /// would be re-applied by inflight recovery on the rollback path).
+    settle_only: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for AccountTasks {
@@ -96,6 +101,7 @@ impl AccountTasks {
         AccountTasks {
             stop: tokio::sync::watch::channel(false).0,
             joins: std::sync::Mutex::new(Vec::new()),
+            settle_only: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -113,6 +119,16 @@ impl AccountTasks {
         joins.push(join);
     }
 
+    /// Register a task that observes the stop flag between work items but
+    /// must run the current one to completion; [`AccountTasks::stop_and_join`]
+    /// waits for it up to the deadline and leaves it running rather than
+    /// aborting if it is still busy.
+    pub fn track_settle_only(&self, join: tokio::task::JoinHandle<()>) {
+        let mut joins = self.settle_only.lock().unwrap();
+        joins.retain(|j| !j.is_finished());
+        joins.push(join);
+    }
+
     /// Set the shared stop flag. Tasks observe it at their next await point;
     /// dropping the sender (handle dropped) stops them too.
     pub fn signal_stop(&self) {
@@ -124,13 +140,23 @@ impl AccountTasks {
     #[doc(hidden)]
     pub fn is_finished(&self) -> bool {
         self.joins.lock().unwrap().iter().all(|j| j.is_finished())
+            && self
+                .settle_only
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|j| j.is_finished())
     }
 
     /// Signal the stop flag, then wait for every tracked task until
     /// `deadline` (shared across callers so the whole teardown stays
     /// bounded). A task still running at the deadline - typically parked in
     /// a connect/TLS handshake to a dead server - is aborted and re-awaited
-    /// so this never returns with work still in flight.
+    /// so this never returns with work still in flight. Tasks registered
+    /// via [`AccountTasks::track_settle_only`] are never aborted: they are
+    /// given the same deadline and, if still busy, left to finish their
+    /// current unit of work (bounded by that work's own transport
+    /// timeouts) and exit on the stop flag.
     pub async fn stop_and_join(&self, deadline: tokio::time::Instant) {
         self.signal_stop();
         // A tracked task may register a child while it unwinds (the backfill
@@ -156,6 +182,21 @@ impl AccountTasks {
                 break;
             }
         }
+        // Never cancelled mid-action: wait for the current unit of work to
+        // settle (bounded by its own timeouts). If it is still running at the
+        // deadline it is left detached - the stop flag and its closed command
+        // channel make it exit at the next boundary, and its post-delete
+        // writes are all updates on rows the account cascade removed.
+        let mut settle = std::mem::take(&mut *self.settle_only.lock().unwrap());
+        for join in settle.iter_mut() {
+            if join.is_finished() || tokio::time::timeout_at(deadline, &mut *join).await.is_ok() {
+                continue;
+            }
+            tracing::warn!(
+                "settle-only task exceeded teardown deadline; left to finish its unit of work"
+            );
+        }
+        self.settle_only.lock().unwrap().append(&mut settle);
     }
 }
 
@@ -260,7 +301,9 @@ pub fn spawn_account(ctx: SyncCtx, config: AccountConfig) -> AccountHandle {
     // A replacement spawn for the same account id signals the previous
     // task set's stop flag, so no two task sets ever share an account.
     let action_lease = mutation_lease(&ctx.paths, config.id, tasks.stop.clone());
-    tasks.track(tokio::spawn(run_mutation_worker(
+    // Never aborted: execute_due's slice observes the stop flag between
+    // actions, but an in-flight IMAP/SMTP command always settles.
+    tasks.track_settle_only(tokio::spawn(run_mutation_worker(
         ctx.clone(),
         config.clone(),
         action_rx,
@@ -814,7 +857,7 @@ async fn run_mutation_worker(
         if *stopped.borrow() || rx.is_closed() {
             break;
         }
-        let outcome = queue::execute_due(&ctx, &config, session.as_mut().unwrap()).await;
+        let outcome = queue::execute_due(&ctx, &config, session.as_mut().unwrap(), &stopped).await;
         // Persistence may fail after the remote command settled. Recover before
         // the next due scan, even when only invisible inflight rows remain.
         queue_poll.slice_finished();
@@ -1475,13 +1518,16 @@ async fn run_actor(
                                 max_secs = max.as_secs(),
                                 "receive: waiting in IDLE for new mail",
                             );
-                            let idle_result = tokio::select! {
-                                // Stop fires without going through the
-                                // command channel; the in-flight IDLE future
-                                // (and its session) is dropped here.
-                                _ = stop.changed() => return,
-                                outcome = imap::idle_wait(s, &mut rx, max) => outcome,
-                            };
+                            // No stop.changed() arm here on purpose: the flag
+                            // fires together with a Shutdown command, and the
+                            // command path through idle_wait is the one that
+                            // hands the session back for a clean LOGOUT.
+                            // Selecting on the flag instead would drop the
+                            // in-flight session mid-IDLE without saying
+                            // goodbye. Every other wait point keeps its stop
+                            // arm; a bare stop_tasks() (no Shutdown) still
+                            // exits at the loop top or via teardown abort.
+                            let idle_result = imap::idle_wait(s, &mut rx, max).await;
                             match idle_result {
                                 Ok((s, outcome)) => {
                                     session = Some(s);
@@ -4379,6 +4425,106 @@ mod content_batch_tests {
         assert_eq!(content_retry_delay_ms(i64::MAX), 3_600_000);
     }
 
+    /// A worker that dies without reporting (panic) must fail the drain like
+    /// the old JoinError did - otherwise the rescan loop reconnects in a hot
+    /// loop and the failure is invisible.
+    #[tokio::test]
+    async fn panicking_body_worker_fails_the_drain() {
+        let (_root, ctx) = context().await;
+        ctx.db
+            .write(|conn| {
+                crate::db::testutil::seed_message(conn, "synthetic@test.dev", "s", false);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let config = ctx
+            .db
+            .read(|conn| Ok(repo::accounts::get_config(conn, 1)?.unwrap()))
+            .await
+            .unwrap();
+        let tasks = Arc::new(AccountTasks::new());
+        let stop = tasks.subscribe();
+        BODY_WORKER_PANIC.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = drain_missing_bodies(&ctx, &config, &stop, &tasks)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exited without reporting"),
+            "{error}"
+        );
+    }
+
+    /// recv_cmd resolves promptly when the command channel closes - the
+    /// select hits the rx arm with None, no looping.
+    #[tokio::test]
+    async fn recv_cmd_returns_none_promptly_on_channel_close_and_stop() {
+        let tasks = AccountTasks::new();
+        let mut stop = tasks.subscribe();
+        let (tx, mut rx) = mpsc::unbounded_channel::<SyncCmd>();
+        drop(tx);
+        assert!(recv_cmd(&mut rx, &mut stop).await.is_none());
+        // Same for a stop flag fired while the channel is still open.
+        tasks.signal_stop();
+        let (_tx, mut rx) = mpsc::unbounded_channel::<SyncCmd>();
+        assert!(recv_cmd(&mut rx, &mut stop).await.is_none());
+    }
+
+    /// A command queued just before the stop flag is either processed or the
+    /// task exits - it never keeps running while pretending the command was
+    /// handled. Observable property: the task finishes promptly.
+    #[tokio::test]
+    async fn command_queued_with_stop_exits_instead_of_running_forever() {
+        let (_root, ctx) = context().await;
+        let config = ctx
+            .db
+            .read(|conn| Ok(repo::accounts::get_config(conn, 1)?.unwrap()))
+            .await
+            .unwrap();
+        let tasks = Arc::new(AccountTasks::new());
+        let (body_tx, body_rx) = mpsc::unbounded_channel();
+        body_tx.send(PriorityFetchCmd::Body(1)).unwrap();
+        tasks.signal_stop();
+        tasks.track(tokio::spawn(run_body_fetcher(
+            ctx,
+            config,
+            body_rx,
+            tasks.subscribe(),
+        )));
+        tasks
+            .stop_and_join(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+        assert!(tasks.is_finished());
+    }
+
+    /// Spawning a second task set for the same account stops the first via
+    /// the shared flag (the mutation lease fires it) and starts the new one
+    /// with a fresh, unfired flag.
+    #[tokio::test]
+    async fn replacing_a_spawn_stops_the_old_set_and_starts_fresh() {
+        let (_root, ctx) = context().await;
+        let config = ctx
+            .db
+            .read(|conn| Ok(repo::accounts::get_config(conn, 1)?.unwrap()))
+            .await
+            .unwrap();
+        let first = spawn_account(ctx.clone(), config.clone());
+        let mut first_stop = first.tasks.subscribe();
+        let second = spawn_account(ctx, config);
+        let second_stop = second.tasks.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(5), first_stop.changed())
+            .await
+            .expect("old task set never got the stop flag")
+            .unwrap();
+        assert!(*first_stop.borrow());
+        assert!(!*second_stop.borrow());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        first.stop_tasks(deadline).await;
+        assert!(first.tasks_finished(), "old task set still running");
+        second.stop_tasks(deadline).await;
+        assert!(second.tasks_finished());
+    }
+
     #[tokio::test]
     async fn moved_and_tombstoned_rows_are_not_fetched_cached_or_failed() {
         let (_root, ctx) = context().await;
@@ -4735,8 +4881,14 @@ async fn drain_missing_bodies(
             }));
         }
         drop(done_tx);
+        // A panicking worker never sends on done_tx, so count reports rather
+        // than only looking at their values: fewer results than spawned
+        // workers is itself a failure (previously a JoinError) - surface it
+        // so the rescan does not immediately reconnect and spin.
         let mut worker_error = None;
+        let mut reported = 0usize;
         while let Some(result) = done_rx.recv().await {
+            reported += 1;
             match result {
                 Ok(()) => {}
                 Err(error) => {
@@ -4745,6 +4897,14 @@ async fn drain_missing_bodies(
                     }
                 }
             }
+        }
+        if reported < workers {
+            return Err(worker_error.unwrap_or_else(|| {
+                CoreError::Other(format!(
+                    "body backfill: {} of {workers} workers exited without reporting",
+                    workers - reported
+                ))
+            }));
         }
         if let Some(error) = worker_error {
             return Err(error);
@@ -4771,6 +4931,11 @@ fn mark_body_chunk_visited(
         .extend(chunk.items.iter().map(|(id, _)| *id));
 }
 
+/// Test hook: the next spawned body worker panics before connecting, so a
+/// missing done-report can be exercised from `drain_missing_bodies`.
+#[cfg(test)]
+static BODY_WORKER_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// One backfill-pool connection: pops chunks off the shared queue until it is
 /// empty or the connection breaks. On error the chunk goes back on the queue
 /// for the surviving workers (or the next round).
@@ -4782,6 +4947,10 @@ async fn body_worker(
     persisted: Arc<std::sync::atomic::AtomicU64>,
     stop: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    #[cfg(test)]
+    if BODY_WORKER_PANIC.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        panic!("injected body worker panic");
+    }
     let account_id = config.id;
     let mut session = match connect(&ctx, &config).await {
         Ok(s) => s,
