@@ -339,19 +339,35 @@ fn grid_from_range(name: String, range: &calamine::Range<calamine::Data>) -> She
     }
 }
 
-/// Build a preview grid from a streamed cell reader (xlsx / xlsb). Cells are
-/// kept only when they fall inside the display window anchored at the
-/// reported dimension start; anything beyond it truncates the preview. The
-/// scan itself is bounded, so a dense-bounding-box file can't stall it.
+/// Bounding-box area of a reported worksheet dimension, in cells. Calamine's
+/// own `Dimensions::len` subtracts u32s and underflows when a file declares
+/// an inverted range (panic in debug, wrap in release), so the arithmetic is
+/// done saturating here: an empty/inverted box reports as tiny.
+fn dims_area(d: calamine::Dimensions) -> u64 {
+    let rows = u64::from(d.end.0.saturating_sub(d.start.0).saturating_add(1));
+    let cols = u64::from(d.end.1.saturating_sub(d.start.1).saturating_add(1));
+    rows.saturating_mul(cols)
+}
+
+/// Build a preview grid from a streamed cell reader (xlsx / xlsb). The
+/// display window anchors on the first real cell, not the declared
+/// `<dimension>` start: a missing or stale dimension reports (0,0) and
+/// would hide data that actually begins beyond the window. Cells are kept
+/// only when their row falls inside the window; columns are trimmed to the
+/// narrowest MAX_COLS-wide span covering the first kept column. The scan
+/// and the retained set are both bounded, so a dense-bounding-box file
+/// can't stall or balloon it.
 fn grid_from_cell_stream<'a, E>(
     name: String,
     dims: calamine::Dimensions,
     mut next_cell: impl FnMut() -> Result<Option<calamine::Cell<calamine::DataRef<'a>>>, E>,
 ) -> SheetPreview {
-    let (row0, col0) = dims.start;
-    let row_end = row0.saturating_add(MAX_ROWS as u32);
-    let col_end = col0.saturating_add(MAX_COLS as u32);
-    let mut truncated = dims.len() > MAX_SHEET_BBOX;
+    /// Retained-cell cap while the column window is still undecided. Far
+    /// larger than the MAX_ROWS x MAX_COLS grid ever displayed, so normal
+    /// sheets never hit it.
+    const MAX_RETAINED: usize = MAX_ROWS * MAX_COLS * 4;
+    let mut truncated = dims_area(dims) > MAX_SHEET_BBOX;
+    let mut anchor_row: Option<u32> = None;
     let mut cells: std::collections::BTreeMap<(u32, u32), String> = Default::default();
     let mut scanned = 0usize;
     loop {
@@ -369,7 +385,15 @@ fn grid_from_cell_stream<'a, E>(
             break;
         }
         let (r, c) = cell.get_position();
-        if (row0..row_end).contains(&r) && (col0..col_end).contains(&c) {
+        let ar = *anchor_row.get_or_insert(r);
+        // Rows inside the window are kept for the column pass; anything
+        // before the anchor row (out-of-order records) or past the window
+        // truncates the preview.
+        if r >= ar && r < ar.saturating_add(MAX_ROWS as u32) {
+            if cells.len() >= MAX_RETAINED {
+                truncated = true;
+                break;
+            }
             let v: calamine::Data = cell.get_value().clone().into();
             let s = v.to_string();
             if !s.is_empty() {
@@ -380,9 +404,20 @@ fn grid_from_cell_stream<'a, E>(
         }
     }
     // Emit contiguous rows through the last kept cell so the grid keeps the
-    // same shape the dense-range version produced.
+    // same shape the dense-range version produced, anchored at the first
+    // real row and column.
+    let Some(&(row0, _)) = cells.keys().next() else {
+        return SheetPreview {
+            name,
+            rows: Vec::new(),
+            truncated,
+        };
+    };
+    let col0 = cells.keys().map(|&(_, c)| c).min().unwrap_or(0);
+    let col_end = col0.saturating_add(MAX_COLS as u32);
     let width = cells
         .keys()
+        .filter(|&&(_, c)| c < col_end)
         .map(|&(_, c)| c - col0)
         .max()
         .map_or(0usize, |w| w as usize + 1);
@@ -390,6 +425,10 @@ fn grid_from_cell_stream<'a, E>(
     if let Some(&(last_r, _)) = cells.keys().next_back() {
         rows.resize_with((last_r - row0) as usize + 1, Vec::new);
         for ((r, c), s) in cells {
+            if c >= col_end {
+                truncated = true;
+                continue;
+            }
             let ri = (r - row0) as usize;
             if rows[ri].is_empty() {
                 rows[ri] = vec![String::new(); width];
@@ -448,6 +487,16 @@ fn sheet_preflight_ok(bytes: &[u8]) -> bool {
                 find_subslice(&head, b"uniqueCount").and_then(|p| attr_uint(&head[p..]))
                 && n > MAX_SHARED_STRINGS
             {
+                return false;
+            }
+        } else if name.starts_with("xl/worksheets/") && name.ends_with(".xml") {
+            // Calamine's dimension parser subtracts u32s and panics on an
+            // inverted range ("B5:A1"); screen it before it gets that far.
+            let mut head = Vec::new();
+            if f.take(64 * 1024).read_to_end(&mut head).is_err() {
+                return false;
+            }
+            if !worksheet_dimensions_ok(&head) {
                 return false;
             }
         } else if name == "content.xml" {
@@ -672,29 +721,36 @@ pub(crate) fn xml_entity(r: &quick_xml::events::BytesRef) -> Option<String> {
 /// Bounded read of one zip entry against a shared inflated-bytes budget.
 /// The archive is opened once per preview; `budget` is decremented by what
 /// each entry actually produced so the total holds regardless of declared
-/// sizes. A `None` return means the entry is missing or unreadable.
+/// sizes. Returns `(bytes, truncated)`: `truncated` is true when the entry
+/// outlived the remaining budget and was cut short, so callers can mark
+/// the preview truncated instead of silently accepting half a document.
+/// A `None` return means the entry is missing or unreadable.
 fn read_entry_bounded<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     idx: usize,
     budget: &mut u64,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, bool)> {
     let file = zip.by_index(idx).ok()?;
+    let declared = file.size();
     let mut buf = Vec::new();
     file.take(*budget).read_to_end(&mut buf).ok()?;
     *budget = budget.saturating_sub(buf.len() as u64);
-    Some(buf)
+    let truncated = (buf.len() as u64) < declared;
+    Some((buf, truncated))
 }
 
 fn read_entry_bounded_by_name<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     name: &str,
     budget: &mut u64,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, bool)> {
     let file = zip.by_name(name).ok()?;
+    let declared = file.size();
     let mut buf = Vec::new();
     file.take(*budget).read_to_end(&mut buf).ok()?;
     *budget = budget.saturating_sub(buf.len() as u64);
-    Some(buf)
+    let truncated = (buf.len() as u64) < declared;
+    Some((buf, truncated))
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -708,6 +764,80 @@ fn name_boundary(rest: &[u8], needle_len: usize) -> bool {
         None => true,
         Some(&b) => !matches!(b, b'-' | b'_' | b'.' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'),
     }
+}
+
+/// Check a worksheet's declared `<dimension ref="...">` for an inverted
+/// range. Calamine's `get_dimension` computes `end - start` in u32 and
+/// panics in debug builds (wraps in release), so an inverted declaration
+/// must never reach it. Missing or unparseable dimensions are fine -
+/// calamine handles those with an ordinary error path.
+fn worksheet_dimensions_ok(xml: &[u8]) -> bool {
+    let Some(off) = find_subslice(xml, b"<dimension") else {
+        return true;
+    };
+    if !name_boundary(&xml[off..], "<dimension".len()) {
+        return true;
+    }
+    let end = find_subslice(&xml[off..], b">")
+        .map(|e| off + e)
+        .unwrap_or(xml.len());
+    let tag = &xml[off..end.min(xml.len())];
+    let Some(ri) = find_subslice(tag, b"ref") else {
+        return true;
+    };
+    let Some(val) = attr_str(&tag[ri..]) else {
+        return true;
+    };
+    let Ok(val) = std::str::from_utf8(val) else {
+        return true;
+    };
+    let mut parts = val.split(':');
+    let Some(first) = cell_ref(parts.next().unwrap_or("")) else {
+        return true;
+    };
+    let last = parts.next().map_or(Some(first), cell_ref).unwrap_or(first);
+    last.0 >= first.0 && last.1 >= first.1
+}
+
+/// Parse an "A1"-style cell reference into 0-based (row, col). Arithmetic
+/// saturates so absurd references can't wrap the indices.
+fn cell_ref(rc: &str) -> Option<(u32, u32)> {
+    let mut col = 0u32;
+    let mut row = 0u32;
+    let mut seen_digit = false;
+    for b in rc.trim().bytes() {
+        match b {
+            b'A'..=b'Z' => {
+                col = col
+                    .saturating_mul(26)
+                    .saturating_add(u32::from(b - b'A') + 1)
+            }
+            b'a'..=b'z' => {
+                col = col
+                    .saturating_mul(26)
+                    .saturating_add(u32::from(b - b'a') + 1)
+            }
+            b'0'..=b'9' => {
+                seen_digit = true;
+                row = row.saturating_mul(10).saturating_add(u32::from(b - b'0'));
+            }
+            b'$' | b' ' => {}
+            _ => return None,
+        }
+    }
+    (seen_digit && col > 0).then_some((row.saturating_sub(1), col - 1))
+}
+
+/// Parse the quoted string value of an attribute at the start of `rest`
+/// (`name="v"` or `name='v'`).
+fn attr_str(rest: &[u8]) -> Option<&[u8]> {
+    let eq = rest.iter().position(|&b| b == b'=')?;
+    let after = &rest[eq + 1..];
+    let qpos = after.iter().position(|&b| b == b'"' || b == b'\'')?;
+    let q = after[qpos];
+    let val = &after[qpos + 1..];
+    let end = val.iter().position(|&b| b == q)?;
+    Some(&val[..end])
 }
 
 /// Parse the integer value of an attribute at the start of `rest`
@@ -741,7 +871,9 @@ fn docx_preview(bytes: &[u8]) -> AttachmentPreview {
         return unsupported_parse("not a zip");
     };
     let mut budget = MAX_INFLATED_BUDGET;
-    let Some(doc) = read_entry_bounded_by_name(&mut zip, "word/document.xml", &mut budget) else {
+    let Some((doc, doc_cut)) =
+        read_entry_bounded_by_name(&mut zip, "word/document.xml", &mut budget)
+    else {
         return unsupported_parse("missing word/document.xml");
     };
     let mut reader = quick_xml::Reader::from_reader(doc.as_slice());
@@ -852,7 +984,15 @@ fn docx_preview(bytes: &[u8]) -> AttachmentPreview {
                 _ => {}
             },
             Ok(quick_xml::events::Event::Eof) => break,
-            Err(_) => return unsupported_parse("bad document.xml"),
+            Err(_) => {
+                // A budget-cut document.xml ends mid-markup: keep whatever
+                // parsed and mark it truncated rather than discarding it.
+                if doc_cut {
+                    truncated = true;
+                    break;
+                }
+                return unsupported_parse("bad document.xml");
+            }
             _ => {}
         }
         buf.clear();
@@ -860,6 +1000,9 @@ fn docx_preview(bytes: &[u8]) -> AttachmentPreview {
             truncated = true;
             break;
         }
+    }
+    if doc_cut {
+        truncated = true;
     }
     if truncated {
         if in_list {
@@ -935,10 +1078,10 @@ fn pptx_preview(bytes: &[u8]) -> AttachmentPreview {
             truncated = true;
             break;
         }
-        let Some(xml) = read_entry_bounded(&mut zip, idx, &mut budget) else {
+        let Some((xml, entry_cut)) = read_entry_bounded(&mut zip, idx, &mut budget) else {
             continue;
         };
-        if budget == 0 {
+        if entry_cut || budget == 0 {
             truncated = true;
         }
         let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
@@ -1237,6 +1380,51 @@ mod tests {
             build_preview(&bytes, Some("bomb.xlsx"), None),
             AttachmentPreview::Unsupported { .. }
         ));
+    }
+
+    #[test]
+    fn xlsx_without_dimension_anchors_on_first_real_cell() {
+        // No <dimension> element: calamine reports start (0,0), so a window
+        // anchored there shows an empty grid for data that actually starts
+        // at row 5000. The window must follow the first streamed cell.
+        const SHEET: &str = r#"<?xml version="1.0"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>
+<row r="5000"><c r="B5000"><v>7</v></c><c r="C5000"><v>8</v></c></row>
+<row r="5002"><c r="B5002"><v>9</v></c></row>
+</sheetData></worksheet>"#;
+        let bytes = xlsx_with_sheet(SHEET, &[]);
+        let p = build_preview(&bytes, Some("nodim.xlsx"), None);
+        match p {
+            AttachmentPreview::Sheet { sheets } => {
+                assert_eq!(sheets[0].rows[0], vec!["7", "8"]);
+                assert_eq!(sheets[0].rows[2][0], "9");
+            }
+            other => panic!("expected sheet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xlsx_inverted_dimension_is_refused_not_panicked() {
+        // "B5:A1" parses to start > end; calamine's get_dimension subtracts
+        // in u32 and panics (debug) / wraps (release), so the preflight
+        // refuses the file instead of ever handing it the dimension.
+        const SHEET: &str = r#"<?xml version="1.0"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<dimension ref="B5:A1"/><sheetData>
+<row r="5"><c r="B5"><v>4</v></c></row>
+</sheetData></worksheet>"#;
+        let bytes = xlsx_with_sheet(SHEET, &[]);
+        assert!(matches!(
+            build_preview(&bytes, Some("inv.xlsx"), None),
+            AttachmentPreview::Unsupported { .. }
+        ));
+        // A normal single-cell and a sane range still pass the check.
+        assert!(worksheet_dimensions_ok(b"<dimension ref=\"B5\"/>"));
+        assert!(worksheet_dimensions_ok(b"<dimension ref=\"A1:XFD10\"/>"));
+        assert!(!worksheet_dimensions_ok(b"<dimension ref=\"B5:A1\"/>"));
+        // ...and a column-only inversion is caught too.
+        assert!(!worksheet_dimensions_ok(b"<dimension ref=\"C1:A5\"/>"));
     }
 
     #[test]
