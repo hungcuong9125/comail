@@ -124,6 +124,73 @@ function checkScaling(
 const checkSanitizerScaling = (name: string, make: (size: number) => string) =>
   checkScaling(name, make, SANITIZERS);
 
+/** A seeded PRNG so failures reproduce. */
+function rng(seed: number) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 0x100000000;
+  };
+}
+
+/** Builds input only from constructs the editor allowlist keeps: allowed
+ *  tags, allowed attributes with safe values, safe URLs. The oracle below
+ *  asserts every src/href value survives unchanged - preservation is what
+ *  the timing-only tests can't see. */
+function cleanDocument(seed: number, size: number): string {
+  const rand = rng(seed);
+  const pick = <T>(xs: readonly T[]) => xs[Math.floor(rand() * xs.length)];
+  const TAGS = [
+    "div", "p", "span", "b", "strong", "i", "em", "u", "br", "ul", "ol", "li",
+    "blockquote", "table", "tr", "td", "th", "thead", "tbody", "h2", "pre", "a", "img",
+  ] as const;
+  const ATTRS = [
+    () => `align="${pick(["left", "right", "center"])}"`,
+    () => `width="${1 + Math.floor(rand() * 800)}"`,
+    () => `title="${pick(["tip", "info here", "a&amp;b"])}"`,
+    () => `style="${pick([
+      "color:#123456",
+      "font-weight:bold;margin:0px",
+      "text-align:center;line-height:1.4",
+      "border-left:1px solid rgb(204,204,204)",
+    ])}"`,
+  ] as const;
+  const hrefs = [
+    `https://example.com/${"p".repeat(10 + Math.floor(rand() * 4_000))}`,
+    `mailto:a${Math.floor(rand() * 999)}@b.co`,
+    "tel:+15551234",
+    "cid:part1.xyz@mail",
+  ];
+  const srcs = [
+    `https://cdn.example.com/i${Math.floor(rand() * 99)}.png`,
+    `data:image/png;base64,${"B".repeat(2_000 + Math.floor(rand() * 30_000))}`,
+    `data:image/jpeg;base64,${"C".repeat(5_000)}`,
+  ];
+  const out: string[] = [];
+  let len = 0;
+  while (len < size) {
+    const tag = pick(TAGS);
+    let piece: string;
+    if (tag === "a") {
+      piece = `<a href="${pick(hrefs)}">link text</a>`;
+    } else if (tag === "img") {
+      piece = `<img src="${pick(srcs)}" alt="pic">`;
+    } else if (tag === "br") {
+      piece = "<br>";
+    } else if (tag === "span" && rand() < 0.3) {
+      piece = `<span class="co-mention" contenteditable="false" data-email="x${Math.floor(rand() * 99)}@y.co">@x</span>`;
+    } else if (tag === "div" && rand() < 0.1) {
+      piece = `<div class="co-signature">sig</div>`;
+    } else {
+      const attrs = rand() < 0.5 ? ` ${pick(ATTRS)()}` : "";
+      piece = rand() < 0.5 ? `<${tag}${attrs}>text ${Math.floor(rand() * 9)}</${tag}>` : `<${tag}${attrs}>`;
+    }
+    out.push(piece);
+    len += piece.length;
+  }
+  return out.join("");
+}
+
 describe("sanitizer and body-scan complexity", () => {
   it(
     "stays linear when one fragment repeats",
@@ -182,4 +249,22 @@ describe("sanitizer and body-scan complexity", () => {
     },
     60_000,
   );
+
+  it("preserves every allowed src/href byte-for-byte", () => {
+    for (let seed = 1; seed <= 30; seed += 1) {
+      const input = cleanDocument(seed, 30_000);
+      const urls = [...input.matchAll(/(?:src|href)="([^"]*)"/g)].map((m) => m[1]);
+      expect(urls.length).toBeGreaterThan(0);
+      // Editor profile keeps everything the generator emits.
+      const editorOut = sanitizeEditorHtml(input);
+      for (const u of urls) expect(editorOut, `editor lost ${u.slice(0, 48)}`).toContain(u);
+      expect(sanitizeEditorHtml(editorOut)).toBe(editorOut);
+      // Signature profile: cid: links are outside its link allowlist.
+      const sigOut = sanitizeSignatureHtml(input);
+      for (const u of urls.filter((u) => !u.startsWith("cid:"))) {
+        expect(sigOut, `sig lost ${u.slice(0, 48)}`).toContain(u);
+      }
+      expect(sanitizeSignatureHtml(sigOut)).toBe(sigOut);
+    }
+  });
 });
