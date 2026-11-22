@@ -52,7 +52,7 @@ async fn bounded_deferrals_release_chain_without_consuming_remote_attempts() {
         let action = ctx
             .db
             .write(move |conn| {
-                assert!(repo::actions::try_claim(conn, action_id)?);
+                assert!(repo::actions::try_claim(conn, action_id, 1)?);
                 Ok(repo::actions::get(conn, action_id)?.unwrap())
             })
             .await
@@ -62,7 +62,9 @@ async fn bounded_deferrals_release_chain_without_consuming_remote_attempts() {
         );
         assert!(!terminal_failure("trash", action.attempts + 1, &error));
         assert!(!needs_fresh_session(&error));
-        record_outcomes(&ctx, &[action], &Err(error)).await.unwrap();
+        record_outcomes(&ctx, &[action], &Err(error), 1)
+            .await
+            .unwrap();
         let (stored, due) = ctx
             .db
             .read(move |conn| {
@@ -139,7 +141,7 @@ fn deferral_counter_backoff_and_source_identity_survive_database_reopen() {
     .enumerate()
     {
         let mut conn = rusqlite::Connection::open(&path).unwrap();
-        assert!(repo::actions::try_claim(&conn, id).unwrap());
+        assert!(repo::actions::try_claim(&conn, id, 1).unwrap());
         let (state, _) = record_deferral(&mut conn, id, now, "source absent")
             .unwrap()
             .unwrap();
@@ -168,11 +170,11 @@ fn elapsed_deadline_survives_reload_and_clamps_last_retry() {
     let id =
         repo::actions::enqueue(&conn, 1, "move", None, None, &serde_json::json!({}), None).unwrap();
     let first = 100_000_000_i64;
-    assert!(repo::actions::try_claim(&conn, id).unwrap());
+    assert!(repo::actions::try_claim(&conn, id, 1).unwrap());
     record_deferral(&mut conn, id, first, "source absent").unwrap();
     drop(conn);
     let mut conn = rusqlite::Connection::open(&path).unwrap();
-    assert!(repo::actions::try_claim(&conn, id).unwrap());
+    assert!(repo::actions::try_claim(&conn, id, 1).unwrap());
     let deadline = first + MAX_DEFERRAL_AGE_MS;
     record_deferral(&mut conn, id, deadline - 1_000, "still absent").unwrap();
     assert_eq!(
@@ -181,7 +183,7 @@ fn elapsed_deadline_survives_reload_and_clamps_last_retry() {
     );
     drop(conn);
     let mut conn = rusqlite::Connection::open(&path).unwrap();
-    assert!(repo::actions::try_claim(&conn, id).unwrap());
+    assert!(repo::actions::try_claim(&conn, id, 1).unwrap());
     let (state, error) = record_deferral(&mut conn, id, deadline, "lost acknowledgement")
         .unwrap()
         .unwrap();
@@ -219,7 +221,7 @@ fn already_exceeded_deferral_counter_fails_without_resetting_identity() {
             None,
         )
         .unwrap();
-        assert!(repo::actions::try_claim(&conn, id).unwrap());
+        assert!(repo::actions::try_claim(&conn, id, 1).unwrap());
         assert_eq!(
             record_deferral(&mut conn, id, 2_000, "ambiguous")
                 .unwrap()

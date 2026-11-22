@@ -25,7 +25,7 @@ async fn fixture(overrides: Value) -> Fixture {
             payload[key] = value.clone();
         }
         let id = repo::actions::enqueue(conn, 1, "trash", Some(message_id), Some(thread_id), &payload, None)?;
-        assert!(repo::actions::try_claim(conn, id)?);
+        assert!(repo::actions::try_claim(conn, id, 1)?);
         Ok((repo::actions::get(conn, id)?.unwrap(), message_id))
     }).await.unwrap();
     Fixture {
@@ -190,6 +190,7 @@ async fn absent_or_ambiguous_message_id_does_not_move_or_finish() {
             &fixture.ctx,
             std::slice::from_ref(&fixture.action),
             &outcome,
+            1,
         )
         .await
         .unwrap();
@@ -305,6 +306,7 @@ async fn lost_ack_with_absent_source_stays_pending_without_destination_guess() {
         &fixture.ctx,
         std::slice::from_ref(&fixture.action),
         &outcome,
+        1,
     )
     .await
     .unwrap();
@@ -313,7 +315,7 @@ async fn lost_ack_with_absent_source_stays_pending_without_destination_guess() {
         .ctx
         .db
         .write(move |conn| {
-            assert!(repo::actions::try_claim(conn, id)?);
+            assert!(repo::actions::try_claim(conn, id, 1)?);
             Ok(repo::actions::get(conn, id)?.unwrap())
         })
         .await
@@ -322,7 +324,7 @@ async fn lost_ack_with_absent_source_stays_pending_without_destination_guess() {
     remote.matches.clear();
     let outcome = move_action(&fixture.ctx, &mut remote, &retry).await;
     assert!(matches!(outcome, Err(CoreError::ActionDeferred(_))));
-    record_outcomes(&fixture.ctx, &[retry], &outcome)
+    record_outcomes(&fixture.ctx, &[retry], &outcome, 1)
         .await
         .unwrap();
     let stored = fixture
@@ -374,7 +376,7 @@ async fn action_losing_claim_cannot_mutate_or_emit_a_fake_pending_state() {
     let outcome = move_action(&fixture.ctx, &mut remote, &fixture.action).await;
     assert!(matches!(outcome, Err(CoreError::ActionDeferred(_))));
     assert!(remote.moved.is_empty());
-    record_outcomes(&fixture.ctx, &[fixture.action], &outcome)
+    record_outcomes(&fixture.ctx, &[fixture.action], &outcome, 1)
         .await
         .unwrap();
     let stored = fixture
@@ -421,6 +423,7 @@ async fn terminal_move_failure_restores_source_and_thread_folder() {
         &fixture.ctx,
         std::slice::from_ref(&fixture.action),
         &Err(CoreError::ActionRejected("NO rejected".into())),
+        1,
     )
     .await
     .unwrap();
@@ -451,6 +454,7 @@ async fn expired_move_deferral_rolls_back_using_persisted_source() {
         &fixture.ctx,
         std::slice::from_ref(&fixture.action),
         &Err(CoreError::ActionDeferred("waiting".into())),
+        1,
     )
     .await
     .unwrap();

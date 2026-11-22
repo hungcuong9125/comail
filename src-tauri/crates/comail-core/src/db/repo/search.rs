@@ -33,6 +33,33 @@ pub fn index_message(conn: &Connection, message_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Re-index up to `limit` of the account's messages that are missing from
+/// `messages_fts` - the repair path for a rolled-back or interrupted removal.
+/// The SELECT is the same expression `index_message` inserts (headers, and
+/// the cached body text when present, falling back to the snippet), so the
+/// restored content is identical to what normal indexing produced. The rows
+/// do not need a preceding DELETE: `NOT IN` selects only absent rowids.
+pub fn reindex_missing_batch(conn: &Connection, account_id: i64, limit: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "INSERT INTO messages_fts (rowid, subject, from_text, to_text, body)
+         SELECT m.id,
+                m.subject,
+                COALESCE(m.from_name,'') || ' ' || COALESCE(m.from_addr,''),
+                m.to_json || ' ' || m.cc_json,
+                CASE
+                  WHEN b.text_body IS NULL
+                    OR TRIM(b.text_body, char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) = ''
+                  THEN COALESCE(m.snippet, '')
+                  ELSE b.text_body
+                END
+         FROM messages m LEFT JOIN message_bodies b ON b.message_id = m.id
+         WHERE m.account_id = ?1
+           AND m.id NOT IN (SELECT rowid FROM messages_fts)
+         LIMIT ?2",
+        params![account_id, limit],
+    )?)
+}
+
 /// True when the query carries a real matcher (full-text terms or an operator),
 /// as opposed to being empty or only account-scoped. Used to decide whether the
 /// default Trash/Spam exclusion should apply.

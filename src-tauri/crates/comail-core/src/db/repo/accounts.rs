@@ -28,8 +28,46 @@ fn config_from_row(row: &Row) -> rusqlite::Result<AccountConfig> {
     })
 }
 
+/// Durable "removal in flight" marker (migration 039). Written before the
+/// first destructive step of `remove_account`; the batched FTS sweep commits
+/// per batch, so without a marker a crash or rollback would leave the
+/// account's search index silently half-destroyed. While the marker exists
+/// the account is hidden from `list` (the UI account list), start-up resumes
+/// the removal, and a failed removal repairs the index before clearing it.
+pub fn mark_removing(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO removing_accounts (account_id, marked_at)
+         VALUES (?1, ?2)",
+        params![id, now_ms()],
+    )?;
+    Ok(())
+}
+
+pub fn unmark_removing(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM removing_accounts WHERE account_id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// Account ids with a removal marker still set - read at start-up to resume
+/// interrupted removals before any account task is spawned.
+pub fn removal_markers(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT account_id FROM removing_accounts")?;
+    Ok(stmt
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 pub fn list(conn: &Connection) -> Result<Vec<Account>> {
-    let mut stmt = conn.prepare("SELECT * FROM accounts ORDER BY id")?;
+    // Accounts mid-removal are not offered as normal accounts: their tasks
+    // are stopped and their index may be partway through the sweep.
+    let mut stmt = conn.prepare(
+        "SELECT * FROM accounts
+         WHERE id NOT IN (SELECT account_id FROM removing_accounts)
+         ORDER BY id",
+    )?;
     let rows = stmt
         .query_map([], account_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -37,7 +75,14 @@ pub fn list(conn: &Connection) -> Result<Vec<Account>> {
 }
 
 pub fn list_configs(conn: &Connection) -> Result<Vec<AccountConfig>> {
-    let mut stmt = conn.prepare("SELECT * FROM accounts ORDER BY id")?;
+    // Accounts marked as removing never get tasks: either the deferred
+    // start-up resume is still finishing them, or a failed repair left the
+    // marker for the next start.
+    let mut stmt = conn.prepare(
+        "SELECT * FROM accounts
+         WHERE id NOT IN (SELECT account_id FROM removing_accounts)
+         ORDER BY id",
+    )?;
     let rows = stmt
         .query_map([], config_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -87,7 +132,58 @@ pub fn insert(conn: &Connection, a: &NewAccount) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+/// FTS rows removed per statement. The mailbox can hold hundreds of
+/// thousands of messages; batching keeps each contentless-delete index update
+/// (and the rowid subquery materialization) bounded instead of one giant
+/// delete inside the single writer's transaction.
+pub const FTS_DELETE_BATCH: i64 = 5_000;
+
+/// Delete an account and every auxiliary structure keyed to it that the FK
+/// cascade does not reach. Must run inside the caller's transaction: the FTS
+/// rows are keyed by message rowid, so they have to go BEFORE the
+/// `DELETE FROM accounts` cascades the `messages` rows that identify them.
+///
+/// Covered explicitly:
+/// - `messages_fts`: a virtual FTS5 table with no foreign key; same
+///   `DELETE ... rowid` mechanism `repo::messages::delete` uses for one
+///   message, batched by account.
+/// - `search_events`: `thread_id` is a bare integer with no FK; stale rows
+///   would lift a recycled thread id with a dead account's queries.
+///
+/// Everything else keyed by account/message/thread id (bodies, attachments,
+/// labels, snoozes, pending actions, embeddings, calendar/contacts sync
+/// state, sync_failures, notification_outbox, ...) is covered by an
+/// `ON DELETE CASCADE` back to `accounts` or `messages`.
+/// Deletes up to one batch of the account's `messages_fts` rows; returns the
+/// number deleted. Callers loop until the result is short of the batch size.
+/// Split into per-batch transactions by `remove_account` so the single FIFO
+/// writer stays responsive on large accounts.
+pub fn sweep_fts_batch(conn: &Connection, id: i64) -> Result<usize> {
+    // The LIMIT must bound the FTS rowids, not the message ids: the messages
+    // rows are only dropped by the cascade below, so limiting their SELECT
+    // would return the same first N ids on every pass and stop early.
+    Ok(conn.execute(
+        "DELETE FROM messages_fts WHERE rowid IN (
+             SELECT rowid FROM messages_fts
+             WHERE rowid IN (SELECT id FROM messages WHERE account_id = ?1)
+             LIMIT ?2)",
+        params![id, FTS_DELETE_BATCH],
+    )?)
+}
+
 pub fn delete(conn: &Connection, id: i64) -> Result<()> {
+    // Re-sweep inside the final transaction: it catches any rows re-indexed
+    // between the pre-commit sweep batches and this delete (normally none).
+    loop {
+        if sweep_fts_batch(conn, id)? < FTS_DELETE_BATCH as usize {
+            break;
+        }
+    }
+    conn.execute(
+        "DELETE FROM search_events WHERE thread_id IN (
+             SELECT id FROM threads WHERE account_id = ?1)",
+        params![id],
+    )?;
     conn.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
     Ok(())
 }
