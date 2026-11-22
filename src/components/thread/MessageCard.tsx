@@ -10,6 +10,7 @@ import { useUi } from "../../stores/ui";
 import type { Address, AttachmentMeta, MessageDetail } from "../../ipc/types";
 import { addressName, formatSize, longTime, relativeTime } from "../../lib/format";
 import { adaptDocumentForDarkMode, fixInvisibleText } from "../../lib/emailDark";
+import { bodyLinkAction } from "../../lib/emailBodyLinks";
 import {
   splitQuotedHtml,
   splitQuotedTail,
@@ -580,7 +581,6 @@ function HtmlBody({ html: fullHtml, messageId }: { html: string; messageId: numb
     return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src ${imgSrc}${upgrade}">
 <meta name="referrer" content="no-referrer">
-<base target="_top">
 <style>
   :root { color-scheme: ${scheme}; }
   /* height:auto defeats emails whose layout is sized to height:100% - against
@@ -677,6 +677,34 @@ function HtmlBody({ html: fullHtml, messageId }: { html: string; messageId: numb
   const onLoad = () => {
     const doc = iframeRef.current?.contentDocument;
     if (!doc?.body) return;
+    // The sandboxed iframe runs no scripts, so links can't reach a browser on
+    // their own. Intercept EVERY activation of an anchored link from out here:
+    // http(s)/mailto go to the OS (default browser / mail client), #anchors
+    // keep their native in-document scroll, and anything else (data:, cid:,
+    // javascript:, relative paths) is swallowed so it can never navigate the
+    // iframe or the app window. Middle-click arrives as auxclick; keyboard
+    // activation arrives as a plain click, so both paths land here.
+    //
+    // This runs FIRST on every load - before fitWidth, dark-mode adaptation
+    // and the observers below - so an exception in a later step can never
+    // leave a loaded document without link interception (in which case an
+    // http link would navigate the frame itself). Listeners attach to the
+    // fresh contentDocument, so each srcdoc reload re-registers them.
+    const onLinkActivation = (e: Event) => {
+      if (e.type === "auxclick" && (e as MouseEvent).button !== 1) return;
+      const anchor = (e.target as HTMLElement | null)?.closest?.("a[href]") as
+        | HTMLAnchorElement
+        | null;
+      if (!anchor) return;
+      const action = bodyLinkAction(anchor.getAttribute("href"));
+      if (action === "native") return;
+      e.preventDefault();
+      if (action === "external") {
+        void openUrl(anchor.href).catch(() => {});
+      }
+    };
+    doc.addEventListener("click", onLinkActivation, true);
+    doc.addEventListener("auxclick", onLinkActivation, true);
     // Fresh document (srcDoc/theme change) starts unzoomed.
     zoomRef.current = 1;
     // Blend the email into the dark theme now that its CSS has resolved. On the
@@ -747,25 +775,6 @@ function HtmlBody({ html: fullHtml, messageId }: { html: string; messageId: numb
       if (mod && (key === "a" || key === "x" || key === "v")) return;
       dispatchKeyboardEvent(e);
     });
-    // The sandboxed iframe runs no scripts, so links can't reach a browser on
-    // their own. Intercept clicks from out here and hand http(s)/mailto links to
-    // the OS (default browser / mail client). If this ever misses, the link's
-    // target="_top" escalates to a top navigation caught by the Rust
-    // on_navigation backstop.
-    doc.addEventListener(
-      "click",
-      (e) => {
-        const anchor = (e.target as HTMLElement | null)?.closest?.("a[href]") as
-          | HTMLAnchorElement
-          | null;
-        const href = anchor?.href;
-        if (href && /^(https?|mailto):/i.test(href)) {
-          e.preventDefault();
-          void openUrl(href).catch(() => {});
-        }
-      },
-      true,
-    );
   };
 
   useEffect(() => () => observerRef.current?.disconnect(), []);
@@ -857,11 +866,10 @@ function HtmlBody({ html: fullHtml, messageId }: { html: string; messageId: numb
       <iframe
         ref={iframeRef}
         data-app-iframe
-        // allow-top-navigation-by-user-activation lets a clicked link (base
-        // target="_top") escalate to a top-level navigation, which the Rust
-        // on_navigation backstop intercepts and opens in the OS browser if the
-        // JS click handler below didn't already.
-        sandbox="allow-same-origin allow-top-navigation-by-user-activation"
+        // No allow-top-navigation: every link activation is handled by the
+        // click/auxclick interception in onLoad, so nothing inside the frame
+        // ever needs to navigate the app window.
+        sandbox="allow-same-origin"
         referrerPolicy="no-referrer"
         srcDoc={srcDoc}
         onLoad={onLoad}

@@ -786,8 +786,13 @@ pub async fn ai_ask(
     state: State<'_, AppState>,
     question: String,
     request_id: String,
+    account_id: Option<i64>,
 ) -> CmdResult<AskResult> {
-    state.core.ai_ask(question, request_id).await.map_err(err)
+    state
+        .core
+        .ai_ask(question, request_id, account_id)
+        .await
+        .map_err(err)
 }
 
 // ---------- semantic search / RAG index ----------

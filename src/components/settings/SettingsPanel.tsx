@@ -24,6 +24,7 @@ import { syncNowAndRefresh, useManualSyncBusy } from "../../lib/syncNow";
 import { normalizeSyncStatus } from "../../lib/syncStatus";
 import { inboxTabOrder } from "../../lib/splitOrder";
 import { queryClient } from "../../queries/client";
+import { updateSettings } from "../../queries/settings";
 import {
   useAccounts,
   useAiModels,
@@ -164,27 +165,10 @@ const DEFAULT_SETTINGS: Settings = {
   keyboardShortcuts: {},
 };
 
-/** Optimistic settings write: cache first, backend follows, rollback on error. */
-export async function updateSettings(patch: Partial<Settings>): Promise<boolean> {
-  const cur =
-    queryClient.getQueryData<Settings>(["settings"]) ?? DEFAULT_SETTINGS;
-  const next: Settings = { ...cur, ...patch };
-  queryClient.setQueryData(["settings"], next);
-  if (patch.theme) useUi.getState().set({ theme: patch.theme });
-  try {
-    await call("set_settings", { settings: next });
-    return true;
-  } catch (err) {
-    useUi.getState().pushToast({
-      kind: "error",
-      message: i18n.t("settings:toast.settingsSaveFailed", {
-        detail: errorMessage(err),
-      }),
-    });
-    void queryClient.invalidateQueries({ queryKey: ["settings"] });
-    return false;
-  }
-}
+/** Optimistic settings write: cache first, backend follows, rollback on error.
+ *  Lives in queries/settings.ts (loads real settings, serializes writes) and
+ *  is re-exported here for the panel's callers. */
+export { updateSettings };
 
 function SettingsNavIcon({ tab }: { tab: SettingsTab }) {
   if (tab === "ai") return <Icon name="sparkle" size={18} className="co-ai-icon" />;

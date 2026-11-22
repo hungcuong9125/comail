@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import i18n from "../../i18n";
-import { errorMessage } from "../../ipc/errors";
+import { errorMessage, parseError } from "../../ipc/errors";
 import { call } from "../../ipc/commands";
 import { MOCK_MODE } from "../../ipc/mock";
 import { subscribeEvent } from "../../ipc/events";
@@ -20,10 +20,13 @@ import { decodeEntities, escapeHtml, htmlToText, isHtmlEmpty, textToHtml } from 
 import {
   pickSignature,
   replaceSignature,
+  sanitizeEditorHtml,
   signaturesForAccount,
   stripSignature,
   type ComposeMode,
 } from "../../lib/signatures";
+import { draftBodyForSave, quoteToHtml } from "../../lib/draftBody";
+import { DraftSaver } from "../../lib/draftSaver";
 import { playSound } from "../../lib/sound";
 import { RichBody, type RichBodyHandle } from "./RichBody";
 import { deleteDrafts, performThreadAction } from "../../queries/actions";
@@ -175,14 +178,6 @@ function selectionQuoteHtml(text: string): string {
   return `<blockquote>${textToHtml(text)}</blockquote><div><br></div>`;
 }
 
-/** The plain-text wire quote rendered as HTML: attribution line + blockquote. */
-function quoteToHtml(quoteText: string): string {
-  const lines = quoteText.split("\n");
-  const header = lines[0] ?? "";
-  const rest = stripQuoteMarkers(lines.slice(1).join("\n"));
-  return `<div>${escapeHtml(header)}</div><blockquote>${textToHtml(rest)}</blockquote>`;
-}
-
 export function Composer({ state, inline }: { state: ComposerState; inline?: boolean }) {
   const { t } = useTranslation();
   const hint = useShortcutHint();
@@ -213,8 +208,20 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   const [cc, setCc] = useState<Address[]>(init.cc);
   const [bcc, setBcc] = useState<Address[]>(init.bcc);
   const [subject, setSubject] = useState(init.subject);
-  /** rich HTML body (plain-text fallback is derived at save/send time) */
-  const [body, setBody] = useState(init.bodyHtml);
+  /** rich HTML body (plain-text fallback is derived at save/send time).
+   *  Sanitizing happens at the boundaries, not on the editor's own
+   *  emissions: the initial value and every NON-editor setBody (draft
+   *  load, signature swap, AI output, undo) are cleaned here, while the
+   *  editor's onChange stores its emission as-is (it already sanitized
+   *  on the way into the DOM - re-sanitizing would echo a different
+   *  string back into `value`, rewrite innerHTML and move the caret).
+   *  The save path sanitizes once more as the backstop, so save_draft
+   *  never sees raw markup even when nothing was typed. */
+  const [body, setBodyState] = useState(() => sanitizeEditorHtml(init.bodyHtml));
+  const setBody = useCallback(
+    (html: string) => setBodyState(sanitizeEditorHtml(html)),
+    [],
+  );
   const [showCc, setShowCc] = useState(init.cc.length > 0 || init.bcc.length > 0);
   const [draftId, setDraftId] = useState<number | null>(state.draftId ?? null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
@@ -307,6 +314,73 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
     quote: init.quote, quoteRemoved,
   };
 
+  // One serialized saver per composer instance: autosave, Send,
+  // save-and-close and Discard all funnel through it so at most one
+  // save_draft call is ever in flight. onSaved only fires while the composer
+  // is open, so a save completing after close can't write global state.
+  const saver = useMemo(
+    () =>
+      new DraftSaver(
+        {
+          save: async (existingId) => {
+            const f = fieldsRef.current;
+            // Backstop: the payload is sanitized here even though the body
+            // state already is - whatever reaches save_draft is clean.
+            const { bodyText, bodyHtml } = draftBodyForSave(
+              f.body,
+              f.quote,
+              f.quoteRemoved,
+            );
+            const { draftId: newId } = await call("save_draft", {
+              args: {
+                draftId: existingId,
+                accountId: f.accountId,
+                to: f.to,
+                cc: f.cc,
+                bcc: f.bcc,
+                subject: f.subject,
+                bodyText,
+                bodyHtml,
+                mode: state.mode,
+                inReplyToMessageId: state.replyTo?.id ?? null,
+                attachments: f.attachments,
+              },
+            });
+            return newId;
+          },
+          onSaved: (id, clean) => {
+            setDraftId(id);
+            fieldsRef.current.draftId = id;
+            setSavedAt(Date.now());
+            // Edits made while the save was in flight stay dirty: the Esc
+            // confirm and the next autosave tick must still see them.
+            set(
+              clean
+                ? { composerDirty: false, editingDraftId: id }
+                : { editingDraftId: id },
+            );
+            if (clean) dirtyRef.current = false;
+          },
+          // The draft vanished under us (deleted on another surface, or
+          // already sent): the saver drops the stale id and recreates.
+          isDraftGone: (err) => parseError(err).code === "not_found",
+        },
+        state.draftId ?? null,
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  // "Closed" means this composer instance is gone - and it is reversible,
+  // because StrictMode unmounts and remounts effects in dev while useMemo
+  // keeps the same saver: opening in the effect body keeps the saver alive
+  // through the fake unmount/remount cycle. A drain already in flight
+  // settles silently so Discard can still learn the created draft id.
+  useEffect(() => {
+    saver.open();
+    return () => saver.close();
+  }, [saver]);
+
   useEffect(() => {
     if (accounts && !accounts.some((a) => a.id === accountId) && accounts[0]) {
       setAccountId(accounts[0].id);
@@ -341,7 +415,9 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
     const cur = fieldsRef.current.body;
     const next = replaceSignature(cur, activeSig?.html ?? "");
     if (next === cur) return;
-    const pristine = stripSignature(cur) === init.bodyHtml || isHtmlEmpty(stripSignature(cur));
+    const pristine =
+      stripSignature(cur) === sanitizeEditorHtml(init.bodyHtml) ||
+      isHtmlEmpty(stripSignature(cur));
     setBody(next);
     // keep the caret at the top for replies so typing lands above the signature
     if (pristine && (state.mode === "reply" || state.mode === "reply_all")) {
@@ -398,48 +474,35 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   }, []);
 
   const markDirty = () => {
+    saver.markChanged();
     if (!dirtyRef.current) {
       dirtyRef.current = true;
       set({ composerDirty: true });
     }
   };
 
-  const saveDraft = useCallback(async (): Promise<number> => {
-    const f = fieldsRef.current;
-    const plain = htmlToText(f.body);
-    const withQuote = f.quote !== "" && !f.quoteRemoved;
-    const fullBody = withQuote ? `${plain.replace(/\s+$/, "")}\n\n${f.quote}` : plain;
-    const fullHtml = withQuote ? `${f.body}<br><br>${quoteToHtml(f.quote)}` : f.body;
-    const { draftId: newId } = await call("save_draft", {
-      args: {
-        draftId: f.draftId,
-        accountId: f.accountId,
-        to: f.to,
-        cc: f.cc,
-        bcc: f.bcc,
-        subject: f.subject,
-        bodyText: fullBody,
-        bodyHtml: fullHtml,
-        mode: state.mode,
-        inReplyToMessageId: state.replyTo?.id ?? null,
-        attachments: f.attachments,
-      },
-    });
-    setDraftId(newId);
-    fieldsRef.current.draftId = newId;
-    setSavedAt(Date.now());
-    dirtyRef.current = false;
-    set({ composerDirty: false, editingDraftId: newId });
-    return newId;
-  }, [state.mode, state.replyTo, set]);
-
-  // Auto-save every 3s while dirty.
+  // Auto-save every 3s while dirty. saveIfDirty queues behind any in-flight
+  // save, so a slow network can never create a second draft. Failures are
+  // surfaced like other save errors, throttled so a persistent failure
+  // doesn't toast on every tick.
+  const lastSaveErrorToast = useRef(0);
   useEffect(() => {
-    const t = setInterval(() => {
-      if (dirtyRef.current && !sending) void saveDraft();
+    const tick = setInterval(() => {
+      if (saver.dirty && !sending) {
+        void saver.saveIfDirty().catch((err: unknown) => {
+          const now = Date.now();
+          if (now - lastSaveErrorToast.current > 30_000) {
+            lastSaveErrorToast.current = now;
+            pushToast({
+              kind: "error",
+              message: t("compose:draftSaveFailed", { detail: errorMessage(err) }),
+            });
+          }
+        });
+      }
     }, 3000);
-    return () => clearInterval(t);
-  }, [saveDraft, sending]);
+    return () => clearInterval(tick);
+  }, [saver, sending, pushToast, t]);
 
   // Focus: recipients for new/forward, body for replies.
   useEffect(() => {
@@ -452,6 +515,9 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
 
   const doSend = useCallback(
     async (opts: { sendAt?: number; markDone?: boolean; instant?: boolean } = {}) => {
+      // A discard in flight owns the draft id; sending now would race the
+      // delete. No state change - the composer is closing anyway.
+      if (saver.isDiscarding) return;
       const f = fieldsRef.current;
       if (f.to.length === 0) {
         pushToast({ kind: "error", message: t("compose:addRecipient"), durationMs: 3000 });
@@ -463,13 +529,27 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
       }
       if (sending) return;
       setSending(true);
-      // Play the "whoosh" synchronously on the user's send gesture - webviews
-      // block audio started later from an async callback (no user activation).
-      playSound("send");
       try {
-        const id = await saveDraft();
+        // Await any in-flight save and persist whatever is still dirty; the
+        // draft id the last save produced is the one that gets queued, so a
+        // pending first save can't leave a duplicate draft behind.
+        const id = await saver.flush();
+        if (id == null) {
+          // Only possible if the saver was closed under us; never swallow it.
+          pushToast({
+            kind: "error",
+            message: t("compose:couldntSend", { error: t("compose:sendNoDraft") }),
+          });
+          return;
+        }
         const sendAt = opts.instant ? Date.now() : opts.sendAt;
         const res = await call("queue_send", { args: { draftId: id, sendAt } });
+        // The draft is now the send queue's: stop autosaving against it so a
+        // late tick can't resurrect a copy once it dispatches.
+        saver.close();
+        // The whoosh plays only once the send is actually queued - never on
+        // a save or queue failure.
+        playSound("send");
         const reopen: ComposerState = {
           mode: state.mode,
           draftId: id,
@@ -550,7 +630,7 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         setSending(false);
       }
     },
-    [saveDraft, sending, state.mode, state.replyTo, closeComposer, pushToast, t],
+    [saver, sending, state.mode, state.replyTo, closeComposer, pushToast, t],
   );
 
   // Merge picked/dropped paths into the attachment list, skipping dupes.
@@ -876,22 +956,36 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   };
 
   const discard = async () => {
-    if (draftId != null) {
-      try {
-        await deleteDrafts([draftId]);
-      } catch (err) {
-        pushToast({
-          kind: "error",
-          message: t("compose:discardFailed", { detail: errorMessage(err) }),
-        });
-        return;
-      }
+    // Quiesce saves and wait out an in-flight create so its draft id can be
+    // deleted instead of surviving as an orphan. If the delete fails for
+    // anything but "already gone" the saver re-opens - this composer stays
+    // on screen and must keep a working saver.
+    const result = await saver.discard(async (id) => {
+      await deleteDrafts([id]);
+    });
+    if (!result.done) {
+      pushToast({
+        kind: "error",
+        message: t("compose:discardFailed", { detail: errorMessage(result.error) }),
+      });
+      return;
     }
     closeComposer();
   };
 
   const saveAndClose = async () => {
-    await saveDraft();
+    // Same race as Send: a discard owns the draft until it resolves.
+    if (saver.isDiscarding) return;
+    try {
+      await saver.flush();
+    } catch (err) {
+      pushToast({
+        kind: "error",
+        message: t("compose:draftSaveFailed", { detail: errorMessage(err) }),
+      });
+      return;
+    }
+    saver.close();
     void queryClient.invalidateQueries({ queryKey: ["threads"] });
     void queryClient.invalidateQueries({ queryKey: ["thread"] });
     closeComposer();
@@ -1200,7 +1294,11 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
             ref={bodyRef}
             value={body}
             onChange={(html) => {
-              setBody(html);
+              // The editor's own emission, stored verbatim: it is already
+              // DOM-clean, and echoing a re-sanitized string back through
+              // `value` would trigger the external-value sync and move the
+              // caret.
+              setBodyState(html);
               markDirty();
             }}
             placeholder={t("compose:bodyPlaceholder", { mod: MOD_LABEL })}

@@ -32,6 +32,29 @@ pub struct GraphEvent<'a> {
     pub attendees: Vec<GraphAttendee>,
 }
 
+/// Build the request URL. Relative paths stay under `GRAPH_BASE`; absolute
+/// URLs (`@odata.nextLink`, stored delta links — server-supplied strings)
+/// must be https on `graph.microsoft.com` exactly, or the bearer token
+/// would be sent wherever the URL points.
+fn graph_url(path_or_url: &str) -> Result<String> {
+    if !path_or_url.contains("://") {
+        return Ok(format!("{GRAPH_BASE}{path_or_url}"));
+    }
+    let url = url::Url::parse(path_or_url)
+        .map_err(|e| CoreError::Network(format!("graph URL is invalid: {e}")))?;
+    let ok = url.scheme() == "https"
+        && url.host_str() == Some("graph.microsoft.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none();
+    if !ok {
+        return Err(CoreError::Network(
+            "graph URL is not https://graph.microsoft.com".into(),
+        ));
+    }
+    Ok(url.to_string())
+}
+
 /// Send a JSON request to Graph. `path_or_url` is either a v1.0 path
 /// (`/me/events`) or an absolute URL (delta/next links come back absolute).
 /// `401`/`403` map to `NeedsReauth` so callers can trigger consent. Returns
@@ -48,11 +71,7 @@ async fn request_raw(
         .build()
         .map_err(|e| CoreError::Network(format!("graph http client: {e}")))?;
 
-    let url = if path_or_url.contains("://") {
-        path_or_url.to_string()
-    } else {
-        format!("{GRAPH_BASE}{path_or_url}")
-    };
+    let url = graph_url(path_or_url)?;
     // reqwest is built without the `json` feature here, so set the body/headers
     // by hand rather than `.json()`.
     let mut req = client.request(method, url).bearer_auth(access_token);
@@ -527,6 +546,31 @@ mod tests {
         let ev = parse_delta_event(&v).unwrap();
         assert!(ev.removed);
         assert_eq!(ev.id, "gone1");
+    }
+
+    #[test]
+    fn absolute_urls_must_be_graph_https() {
+        // Relative paths are prefixed with GRAPH_BASE.
+        assert_eq!(
+            graph_url("/me/events").unwrap(),
+            "https://graph.microsoft.com/v1.0/me/events"
+        );
+        // Real Graph links pass.
+        let next = "https://graph.microsoft.com/v1.0/me/calendars?$skiptoken=abc";
+        assert_eq!(graph_url(next).unwrap(), next);
+        assert!(graph_url("https://graph.microsoft.com/beta/me").is_ok());
+        // Everything else is refused before the token is attached.
+        for bad in [
+            "http://graph.microsoft.com/v1.0/me",      // no TLS
+            "https://graph.microsoft.com.evil.com/me", // lookalike host
+            "https://graph.microsoft.com@evil.com/me", // userinfo trick
+            "https://evil.com/me",
+            "https://graph.microsoft.com:8443/me", // non-default port
+            "https://127.0.0.1/me",
+            "not a url://x",
+        ] {
+            assert!(graph_url(bad).is_err(), "{bad} must be refused");
+        }
     }
 
     #[test]

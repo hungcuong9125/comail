@@ -20,6 +20,7 @@ pub mod imap;
 pub mod mcp;
 pub mod mime;
 pub mod models;
+pub mod netguard;
 pub mod oauth;
 pub mod otp;
 pub mod preview;
@@ -288,6 +289,22 @@ impl Core {
             .await
         {
             Ok(n) if n > 0 => tracing::info!("recovered {n} orphaned in-flight action(s)"),
+            _ => {}
+        }
+        // Reclaim staged draft attachments whose rows are gone (crashed saves,
+        // pre-fix deletes/sends). The one-hour grace keeps an in-flight save's
+        // not-yet-committed staging safe.
+        match sweep_draft_attachment_staging(
+            &core.db,
+            &core.paths.draft_attachments_dir(),
+            std::time::Duration::from_secs(60 * 60),
+        )
+        .await
+        {
+            Ok(n) if n > 0 => {
+                tracing::info!("swept {n} unreferenced draft-attachment dir(s)")
+            }
+            Err(error) => tracing::warn!(%error, "draft-attachment sweep failed"),
             _ => {}
         }
         match core
@@ -862,14 +879,37 @@ impl Core {
         }
         self.cal_handles.write().await.remove(&account_id);
         self.contacts_handles.write().await.remove(&account_id);
-        credentials::delete_all(account_id);
-        self.db
+        // Credential deletion and token-cache clearing happen atomically
+        // under the account's refresh lock: a grant still in flight completes
+        // first and its writes are erased by the purge, and a grant queued
+        // behind it finds no refresh token — no rotated token can be written
+        // back into the keyring and no cache entry resurrected for a removed
+        // account (account ids are recycled).
+        self.tokens.purge(account_id).await;
+        let staged_paths = self
+            .db
             .write(move |conn| {
                 // Unwind address-book names before the cascade drops the cards.
                 repo::carddav::delete_config(conn, account_id)?;
-                repo::accounts::delete(conn, account_id)
+                // The account cascade drops draft_attachments rows; collect
+                // their staged paths first so the files can go with them.
+                let staged: Vec<String> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT da.file_path FROM draft_attachments da
+                         JOIN messages m ON m.id = da.draft_id
+                         WHERE m.account_id = ?1",
+                    )?;
+                    stmt.query_map(rusqlite::params![account_id], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                repo::accounts::delete(conn, account_id)?;
+                Ok(staged)
             })
             .await?;
+        // Root-confined like every staged-path delete: rows pointing outside
+        // the staging root are ignored, and nothing is unlinked until the
+        // account delete has succeeded.
+        remove_staged_draft_files(&self.paths.draft_attachments_dir(), &staged_paths).await;
         let _ = tokio::fs::remove_dir_all(self.paths.mail_dir(account_id)).await;
         let _ = tokio::fs::remove_dir_all(self.paths.attachments_dir(account_id)).await;
         Ok(())
@@ -1205,11 +1245,33 @@ impl Core {
             _ => return html,
         };
         let mut fetched = Vec::new();
+        // Total raw bytes one call may embed; once exhausted, remaining parts
+        // keep their cid: reference and render as the browser's broken-image
+        // affordance (alt text where the sender set one) rather than loading.
+        let mut budget = crate::mime::InlineImageBudget::default();
         for (attachment_id, content_id, mime) in atts {
-            if let Ok(path) = self.get_attachment(attachment_id).await {
-                if let Ok(bytes) = tokio::fs::read(path).await {
-                    fetched.push((content_id, mime, bytes));
-                }
+            // Only image-ish parts are candidates; anything else keeps its
+            // cid: reference and is not even fetched for this.
+            if !crate::mime::inline_image_candidate(mime.as_deref()) {
+                continue;
+            }
+            let Ok(path) = self.get_attachment(attachment_id).await else {
+                continue;
+            };
+            // Size check on file metadata BEFORE the part is read.
+            let Ok(meta) = tokio::fs::metadata(&path).await else {
+                continue;
+            };
+            if meta.len() > crate::mime::INLINE_IMAGE_MAX_BYTES {
+                continue;
+            }
+            // The emitted data: URI always uses the sniffed type - a part
+            // labelled image/png that is really SVG/HTML is refused.
+            if let Ok(bytes) = tokio::fs::read(&path).await
+                && let Some(mime) = crate::mime::sniff_image_mime(&bytes)
+                && budget.try_reserve(bytes.len() as u64)
+            {
+                fetched.push((content_id, mime, bytes));
             }
         }
         if fetched.is_empty() {
@@ -1221,7 +1283,6 @@ impl Core {
             use base64::Engine;
             let mut map = std::collections::HashMap::new();
             for (content_id, mime, bytes) in fetched {
-                let mime = mime.unwrap_or_else(|| "application/octet-stream".to_string());
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 map.insert(
                     crate::mime::normalize_cid(&content_id),
@@ -1290,16 +1351,51 @@ impl Core {
             return out;
         }
 
-        let mut fetched: Vec<(i64, String, Option<String>, Vec<u8>)> = Vec::new();
+        let mut fetched: Vec<(i64, String, &'static str, Vec<u8>)> = Vec::new();
         let mut missing: Vec<i64> = Vec::new();
+        // Total raw bytes one call may embed; once exhausted, remaining parts
+        // keep their cid: reference and render as the browser's broken-image
+        // affordance (alt text where the sender set one) rather than loading.
+        let mut budget = crate::mime::InlineImageBudget::default();
         for (message_id, attachment_id, content_id, mime, file_path) in atts {
-            let bytes = match file_path {
-                Some(path) => tokio::fs::read(path).await.ok(),
+            // Only image-ish parts are candidates; anything else keeps its
+            // cid: reference and is not even fetched for this.
+            if !crate::mime::inline_image_candidate(mime.as_deref()) {
+                continue;
+            }
+            // Unavailable means "on disk but unreadable/absent" and earns a
+            // refetch below; an on-disk part over the per-image cap instead
+            // leaves the cid: reference unresolved on purpose.
+            let mut unavailable = file_path.is_none();
+            let bytes = match &file_path {
+                Some(path) => match tokio::fs::metadata(path).await {
+                    // The size check runs on metadata BEFORE the part is
+                    // read into memory.
+                    Ok(meta) if meta.len() <= crate::mime::INLINE_IMAGE_MAX_BYTES => {
+                        let bytes = tokio::fs::read(path).await.ok();
+                        unavailable = bytes.is_none();
+                        bytes
+                    }
+                    Ok(_) => None,
+                    Err(_) => {
+                        unavailable = true;
+                        None
+                    }
+                },
                 None => None,
             };
             match bytes {
-                Some(bytes) => fetched.push((message_id, content_id, mime, bytes)),
-                None => missing.push(attachment_id),
+                // The emitted data: URI always uses the sniffed type - a part
+                // labelled image/png that is really SVG/HTML is refused.
+                Some(bytes) => {
+                    if let Some(mime) = crate::mime::sniff_image_mime(&bytes)
+                        && budget.try_reserve(bytes.len() as u64)
+                    {
+                        fetched.push((message_id, content_id, mime, bytes));
+                    }
+                }
+                None if unavailable => missing.push(attachment_id),
+                None => {}
             }
         }
         if !missing.is_empty() {
@@ -1327,7 +1423,6 @@ impl Core {
             use base64::Engine;
             let mut maps: HashMap<i64, HashMap<String, String>> = HashMap::new();
             for (message_id, content_id, mime, bytes) in fetched {
-                let mime = mime.unwrap_or_else(|| "application/octet-stream".to_string());
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 maps.entry(message_id).or_default().insert(
                     crate::mime::normalize_cid(&content_id),
@@ -1507,15 +1602,28 @@ impl Core {
         let staging_root = self.paths.draft_attachments_dir();
         let mut staged: Vec<crate::models::DraftAttachmentIn> =
             Vec::with_capacity(args.attachments.len());
+        // Copies this call created; removed if the save is rejected (they are
+        // referenced by nothing until the transaction commits).
+        let mut fresh_paths: Vec<String> = Vec::new();
         for att in &args.attachments {
-            let file_path =
-                stage_draft_attachment(&staging_root, &att.file_path, &att.filename).await?;
-            staged.push(crate::models::DraftAttachmentIn {
-                file_path,
-                filename: att.filename.clone(),
-            });
+            match stage_draft_attachment(&staging_root, &att.file_path, &att.filename).await {
+                Ok(staged_file) => {
+                    if staged_file.fresh {
+                        fresh_paths.push(staged_file.path.clone());
+                    }
+                    staged.push(crate::models::DraftAttachmentIn {
+                        file_path: staged_file.path,
+                        filename: att.filename.clone(),
+                    });
+                }
+                Err(e) => {
+                    remove_staged_draft_files(&staging_root, &fresh_paths).await;
+                    return Err(e);
+                }
+            }
         }
-        let (draft_id, thread_id) = self
+        let new_paths: HashSet<String> = staged.iter().map(|a| a.file_path.clone()).collect();
+        let result = self
             .db
             .write(move |conn| {
                 let tx = conn.transaction()?;
@@ -1532,7 +1640,12 @@ impl Core {
 
                 let draft_id = match args.draft_id {
                     Some(id) => {
-                        tx.execute(
+                        // The is_draft predicate gates the whole update: a 0-row
+                        // write means the id is not (or no longer) a draft -
+                        // e.g. it was sent or arrived since the caller read it.
+                        // Fail now so the transaction rolls back instead of
+                        // overwriting a real message's body and attachments.
+                        let updated = tx.execute(
                             "UPDATE messages SET subject = ?2, to_json = ?3, cc_json = ?4,
                                     bcc_json = ?5, date = ?6 WHERE id = ?1 AND is_draft = 1",
                             rusqlite::params![
@@ -1544,6 +1657,9 @@ impl Core {
                                 now_ms(),
                             ],
                         )?;
+                        if updated == 0 {
+                            return Err(CoreError::NotFound("draft".into()));
+                        }
                         id
                     }
                     None => {
@@ -1611,7 +1727,16 @@ impl Core {
                     "UPDATE messages SET body_state = 'cached', snippet = ?2 WHERE id = ?1",
                     rusqlite::params![draft_id, crate::mime::make_snippet(&args.body_text)],
                 )?;
-                // Staged outgoing attachments: replace on every save.
+                // Staged outgoing attachments: replace on every save. Remember
+                // the previous staged paths so files this save orphans can be
+                // deleted once the transaction commits.
+                let old_paths: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT file_path FROM draft_attachments WHERE draft_id = ?1",
+                    )?;
+                    stmt.query_map(rusqlite::params![draft_id], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
                 tx.execute(
                     "DELETE FROM draft_attachments WHERE draft_id = ?1",
                     rusqlite::params![draft_id],
@@ -1632,9 +1757,33 @@ impl Core {
                     repo::threads::recompute(&tx, tid)?;
                 }
                 tx.commit()?;
-                Ok((draft_id, thread_id))
+                Ok((draft_id, thread_id, old_paths))
             })
-            .await?;
+            .await;
+        let (draft_id, thread_id, old_paths) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                // Rejected save: the freshly staged copies belong to no draft.
+                remove_staged_draft_files(&staging_root, &fresh_paths).await;
+                return Err(e);
+            }
+        };
+        // Committed: drop staged files the draft no longer references (e.g. an
+        // attachment removed between saves). Old paths come from the DB and
+        // may not be canonical (staging canonicalises on the way in), so the
+        // comparison resolves both sides - a non-canonical alias of a kept
+        // file must not be "orphaned" out from under the new row.
+        let mut orphaned: Vec<String> = Vec::new();
+        for old in old_paths {
+            let canon = tokio::fs::canonicalize(&old)
+                .await
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| old.clone());
+            if !new_paths.contains(&canon) {
+                orphaned.push(old);
+            }
+        }
+        remove_staged_draft_files(&staging_root, &orphaned).await;
         if let Some(thread_id) = thread_id {
             self.bus.emit(CoreEvent::MailUpdated {
                 thread_ids: vec![thread_id],
@@ -1707,10 +1856,16 @@ impl Core {
     }
 
     pub async fn delete_draft(&self, draft_id: i64) -> Result<()> {
-        let (thread_id, nudge_account) = self
+        let (thread_id, nudge_account, staged_paths) = self
             .db
             .write(move |conn| {
-                let row = conn
+                // One transaction: the send cancellation, attachment-row
+                // delete and message delete/move either all commit or none
+                // do. A mid-closure failure (no Trash folder, a payload that
+                // cannot be built) must not leave the draft half-deleted -
+                // its queued send cancelled and its attachment rows gone.
+                let tx = conn.transaction()?;
+                let row = tx
                     .query_row(
                         "SELECT m.account_id, m.thread_id, m.folder_id, m.uid, m.is_draft,
                                 COALESCE(f.role, '')
@@ -1734,17 +1889,77 @@ impl Core {
                     return Err(CoreError::NotFound("draft".into()));
                 }
 
+                // A queued send for this draft must not outlive the delete:
+                // the dispatch reads the draft_attachments rows dropped below
+                // and would deliver the message without its files (or, for a
+                // server draft moved to Trash, send at all). Pending sends
+                // are cancelled here - the same pending->cancelled
+                // transition undo-send uses - inside this write so the
+                // dispatcher's claim cannot slip between them. A send
+                // already claimed is mid-flight, so the delete is refused
+                // rather than racing its attachment read.
+                let send_actions: Vec<(i64, String)> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT id, state FROM pending_actions
+                         WHERE kind = 'send' AND message_id = ?1
+                           AND state IN ('pending','inflight')",
+                    )?;
+                    stmt.query_map(rusqlite::params![draft_id], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                if send_actions.iter().any(|(_, s)| s == "inflight") {
+                    return Err(CoreError::ActionRejected(
+                        "this draft is already being sent".into(),
+                    ));
+                }
+
+                // Fail-fast reads BEFORE any mutation: a server draft needs
+                // a Trash folder and a buildable identity payload, and when
+                // either fails the draft must come out of this call
+                // untouched - not with its send cancelled and its rows gone.
+                let remote_plan = if row.3.is_some() && row.5 != roles::TRASH {
+                    // This draft exists on IMAP and will be moved to Trash.
+                    // Not a "draft is gone" NotFound - the draft is still
+                    // there; the delete itself cannot proceed without
+                    // somewhere to move it, so it is rejected like the other
+                    // un-deletable cases in trash.rs.
+                    let trash = repo::folders::by_role(&tx, row.0, roles::TRASH)?
+                        .ok_or_else(|| CoreError::DeleteRejected("no trash folder".into()))?;
+                    let payload = move_identity_payload(&tx, draft_id, row.2, row.3, trash.id)?;
+                    Some((trash.id, payload))
+                } else {
+                    None
+                };
+
+                // Staged attachment rows never outlive the draft: the local
+                // delete cascades them, but the IMAP-move branch keeps the
+                // message row (in Trash), so drop them explicitly either way.
+                // Their files are removed once the write succeeds.
+                let staged_paths: Vec<String> = {
+                    let mut stmt =
+                        tx.prepare("SELECT file_path FROM draft_attachments WHERE draft_id = ?1")?;
+                    stmt.query_map(rusqlite::params![draft_id], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+
+                for (action_id, _) in send_actions {
+                    repo::actions::try_cancel(&tx, action_id)?;
+                }
+                tx.execute(
+                    "DELETE FROM draft_attachments WHERE draft_id = ?1",
+                    rusqlite::params![draft_id],
+                )?;
+
                 let mut nudge_account = None;
-                if row.3.is_some() && row.5 != roles::TRASH {
-                    // This draft exists on IMAP. Move it optimistically and
-                    // queue the matching remote move so the next sync cannot
-                    // resurrect the local row in Drafts.
-                    let trash = repo::folders::by_role(conn, row.0, roles::TRASH)?
-                        .ok_or_else(|| CoreError::NotFound("no trash folder".into()))?;
-                    let payload = move_identity_payload(conn, draft_id, row.2, row.3, trash.id)?;
-                    repo::messages::set_uid_and_folder(conn, draft_id, trash.id, None)?;
+                if let Some((trash_id, payload)) = remote_plan {
+                    // Move it optimistically and queue the matching remote
+                    // move so the next sync cannot resurrect the local row
+                    // in Drafts.
+                    repo::messages::set_uid_and_folder(&tx, draft_id, trash_id, None)?;
                     repo::actions::enqueue(
-                        conn,
+                        &tx,
                         row.0,
                         "trash",
                         Some(draft_id),
@@ -1755,14 +1970,16 @@ impl Core {
                     nudge_account = Some(row.0);
                 } else {
                     // Purely local drafts have no remote copy to preserve.
-                    repo::messages::delete(conn, draft_id)?;
+                    repo::messages::delete(&tx, draft_id)?;
                 }
                 if let Some(tid) = row.1 {
-                    repo::threads::recompute(conn, tid)?;
+                    repo::threads::recompute(&tx, tid)?;
                 }
-                Ok((row.1, nudge_account))
+                tx.commit()?;
+                Ok((row.1, nudge_account, staged_paths))
             })
             .await?;
+        remove_staged_draft_files(&self.paths.draft_attachments_dir(), &staged_paths).await;
         if let Some(thread_id) = thread_id {
             self.bus.emit(CoreEvent::MailUpdated {
                 thread_ids: vec![thread_id],
@@ -3732,7 +3949,7 @@ impl Core {
     /// most relevant to `query`, for few-shot voice imitation. Prefers semantic
     /// retrieval; falls back to recent sent mail when the index is empty.
     async fn voice_examples(&self, query: &str, k: usize) -> Result<Vec<(String, String)>> {
-        let hits = self.vector_hits(query, 40).await.unwrap_or_default();
+        let hits = self.vector_hits(query, 40, None).await.unwrap_or_default();
         let hit_ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
         self.db
             .read(move |conn| {
@@ -3788,7 +4005,7 @@ impl Core {
             if parsed.text.chars().count() < 3 {
                 Vec::new()
             } else {
-                self.vector_hits(&parsed.text, 200)
+                self.vector_hits(&parsed.text, 200, parsed.account_id)
                     .await
                     .unwrap_or_default()
             }
@@ -3851,8 +4068,14 @@ impl Core {
     /// Embed `text` as a query and return the top-`k` (message_id, score) hits
     /// from the in-memory index. Empty when no local model is loaded. Query
     /// embeddings are cached, so repeated or backspaced-over queries skip the
-    /// model forward pass entirely.
-    async fn vector_hits(&self, text: &str, k: usize) -> Result<Vec<(i64, f32)>> {
+    /// model forward pass entirely. `account_id` scopes the hits to one
+    /// account; `None` searches the whole index.
+    async fn vector_hits(
+        &self,
+        text: &str,
+        k: usize,
+        account_id: Option<i64>,
+    ) -> Result<Vec<(i64, f32)>> {
         let Some(embedder) = self.embed.embedder().await else {
             return Ok(Vec::new());
         };
@@ -3867,8 +4090,68 @@ impl Core {
                 v
             }
         };
-        let idx = self.embed.index.read().await;
-        Ok(idx.search(&qv, k))
+        let Some(account) = account_id else {
+            let idx = self.embed.index.read().await;
+            return Ok(idx.search(&qv, k));
+        };
+        // The index is global (no per-account partition): when scoped, widen
+        // the candidate pool adaptively — an account holding only a small
+        // share of the index may need many more candidates before k of its
+        // own hits surface. The pool grows up to SCOPE_WIDEN_ROUNDS times
+        // until k in-account hits are found or the index is exhausted. If the
+        // index is extremely skewed this can still return fewer than k hits;
+        // keyword retrieval then remains the account's coverage.
+        const SCOPE_WIDEN_ROUNDS: usize = 3;
+        let mut pool = k.saturating_mul(8).clamp(k, 2_000);
+        let mut scoped = Vec::new();
+        for _ in 0..=SCOPE_WIDEN_ROUNDS {
+            let (hits, idx_len) = {
+                let idx = self.embed.index.read().await;
+                (idx.search(&qv, pool.min(idx.len())), idx.len())
+            };
+            scoped = self.scope_hits_to_account(hits, account).await?;
+            if scoped.len() >= k || pool >= idx_len {
+                break;
+            }
+            pool = pool.saturating_mul(4).min(idx_len);
+        }
+        Ok(scoped.into_iter().take(k).collect())
+    }
+
+    /// Keep only vector hits whose message lives in `account` (score order
+    /// preserved). The in-memory index stores message ids only, so account
+    /// scoping is a DB lookup; the ids are from our own index and safe to
+    /// inline like `repo::search`'s candidate queries do.
+    async fn scope_hits_to_account(
+        &self,
+        hits: Vec<(i64, f32)>,
+        account_id: i64,
+    ) -> Result<Vec<(i64, f32)>> {
+        if hits.is_empty() {
+            return Ok(hits);
+        }
+        let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+        let keep: HashSet<i64> = self
+            .db
+            .read(move |conn| {
+                let id_list = ids
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT id FROM visible_messages WHERE account_id = ?1 AND id IN ({id_list})"
+                ))?;
+                let set = stmt
+                    .query_map(rusqlite::params![account_id], |r| r.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<HashSet<i64>>>()?;
+                Ok::<_, CoreError>(set)
+            })
+            .await?;
+        Ok(hits
+            .into_iter()
+            .filter(|(id, _)| keep.contains(id))
+            .collect())
     }
 
     /// Pre-compute and cache the query embedding for `query` while the user is
@@ -3932,7 +4215,14 @@ impl Core {
     /// reformulate queries and read whole threads before answering. Every round
     /// streams. Falls back to a plain
     /// one-shot RAG answer if the model/endpoint doesn't support tool calling.
-    pub async fn ai_ask(&self, question: String, request_id: String) -> Result<AskResult> {
+    /// `account_id` scopes retrieval to one account (the sidebar filter);
+    /// `None` searches every account.
+    pub async fn ai_ask(
+        &self,
+        question: String,
+        request_id: String,
+        account_id: Option<i64>,
+    ) -> Result<AskResult> {
         const MAX_ROUNDS: usize = 6;
         let cfg = self.ai_config(Scenario::Ask).await?;
 
@@ -3942,7 +4232,7 @@ impl Core {
 
         // RAG seed: the model always starts from the best hybrid matches.
         let seed = if on_device { 4 } else { 8 };
-        let sources = self.retrieve_search(&question, seed).await?;
+        let sources = self.retrieve_search(&question, seed, account_id).await?;
         if sources.is_empty() {
             return Ok(AskResult {
                 answer: "I couldn't find anything relevant in your mailbox. \
@@ -4034,12 +4324,22 @@ impl Core {
                     for call in calls {
                         let (result, added) = match call.name.as_str() {
                             "search_inbox" => {
-                                self.run_search_inbox(&call.arguments, &mut sources, &reasoning)
-                                    .await
+                                self.run_search_inbox(
+                                    &call.arguments,
+                                    &mut sources,
+                                    account_id,
+                                    &reasoning,
+                                )
+                                .await
                             }
                             "read_email" => (
-                                self.run_read_email(&call.arguments, &sources, &reasoning)
-                                    .await,
+                                self.run_read_email(
+                                    &call.arguments,
+                                    &sources,
+                                    account_id,
+                                    &reasoning,
+                                )
+                                .await,
                                 0,
                             ),
                             other => (format!("Unknown tool: {other}"), 0),
@@ -4127,11 +4427,21 @@ impl Core {
     /// `subject:`/`is:`/`has:` keyword filters) hydrated to message details for
     /// citation. Powers both the Ask RAG seed and the agentic `search_inbox`
     /// tool, so the model can search by meaning, sender, recipient, and more.
-    async fn retrieve_search(&self, query: &str, k: usize) -> Result<Vec<MessageDetail>> {
-        let parsed = crate::search::parse(query);
+    /// `account_id` scopes every branch to one account; `None` searches all.
+    async fn retrieve_search(
+        &self,
+        query: &str,
+        k: usize,
+        account_id: Option<i64>,
+    ) -> Result<Vec<MessageDetail>> {
+        let mut parsed = crate::search::parse(query);
+        // The account filter is a query operator for the repo layer: it narrows
+        // the lexical branch and the semantic hits alike (see
+        // `repo::search::message_hits`).
+        parsed.account_id = account_id;
         // Semantic branch only carries meaning for queries of a few chars+.
         let vec_hits = if parsed.text.chars().count() >= 3 {
-            self.vector_hits(&parsed.text, 200)
+            self.vector_hits(&parsed.text, 200, account_id)
                 .await
                 .unwrap_or_default()
         } else {
@@ -4155,10 +4465,12 @@ impl Core {
     /// Execute a `search_inbox` tool call: run the search, append any *new*
     /// messages to `sources` with stable citation numbers, and return the
     /// excerpt block for the model plus how many new sources were added.
+    /// `account_id` keeps the tool inside the sidebar's account filter.
     async fn run_search_inbox(
         &self,
         arguments: &str,
         sources: &mut Vec<MessageDetail>,
+        account_id: Option<i64>,
         progress: &impl Fn(String),
     ) -> (String, usize) {
         let args: serde_json::Value =
@@ -4176,12 +4488,17 @@ impl Core {
         progress(format!("\nSearching \u{201c}{query}\u{201d}\n"));
         let limit = args["limit"].as_u64().unwrap_or(6).clamp(1, 8) as usize;
         let details = self
-            .retrieve_search(&query, limit)
+            .retrieve_search(&query, limit, account_id)
             .await
             .unwrap_or_default();
         let details: Vec<MessageDetail> = details
             .into_iter()
-            .filter(|d| !sources.iter().any(|s| s.id == d.id))
+            .filter(|d| {
+                // Retrieval is already account-scoped; the explicit check
+                // keeps another account's mail out even if that ever regresses.
+                account_id.is_none_or(|a| d.account_id == a)
+                    && !sources.iter().any(|s| s.id == d.id)
+            })
             .collect();
         let details = self.ensure_bodies(details).await;
 
@@ -4208,10 +4525,12 @@ impl Core {
 
     /// Execute a `read_email` tool call: the whole thread behind citation `n`,
     /// with full bodies (fetched now if they haven't downloaded yet).
+    /// `account_id` keeps the tool inside the sidebar's account filter.
     async fn run_read_email(
         &self,
         arguments: &str,
         sources: &[MessageDetail],
+        account_id: Option<i64>,
         progress: &impl Fn(String),
     ) -> String {
         let args: serde_json::Value =
@@ -4227,9 +4546,14 @@ impl Core {
         let Some(src) = n.checked_sub(1).and_then(|i| sources.get(i)) else {
             return format!("No excerpt [{n}]. Valid numbers are 1-{}.", sources.len());
         };
+        // Sources are account-scoped already, but never serve another
+        // account's content when a filter is set.
+        if account_id.is_some_and(|a| src.account_id != a) {
+            return format!("Excerpt [{n}] is outside the selected account.");
+        }
         progress(format!("\nReading \u{201c}{}\u{201d}\n", src.subject));
         let thread_id = src.thread_id;
-        let messages = match self
+        let mut messages = match self
             .db
             .read(move |conn| repo::messages::list_for_thread(conn, thread_id))
             .await
@@ -4237,6 +4561,12 @@ impl Core {
             Ok(m) if !m.is_empty() => m,
             _ => vec![src.clone()],
         };
+        if let Some(a) = account_id {
+            messages.retain(|m| m.account_id == a);
+            if messages.is_empty() {
+                messages = vec![src.clone()];
+            }
+        }
         let messages = self.ensure_bodies(messages).await;
         format!(
             "Full conversation for [{n}] (Subject: {}):\n\n{}",
@@ -5712,17 +6042,31 @@ fn safe_filename(name: &str) -> String {
     }
 }
 
+/// One file staged into the draft-attachment staging area.
+struct StagedAttachment {
+    /// Canonicalised absolute path of the staged copy.
+    path: String,
+    /// True when this call created the copy; false when the source was
+    /// already inside the staging root and nothing was written.
+    fresh: bool,
+}
+
 /// Copy a composer-picked file into the app-managed draft-attachment staging
 /// area and return the staged absolute path. A path already inside the staging
 /// root (a reloaded draft round-tripping its own staged path) is returned
-/// unchanged. This guarantees dispatch only ever reads files the app itself
-/// wrote, closing an arbitrary local-file read/exfiltration path through the
-/// `save_draft` IPC command.
+/// unchanged.
+///
+/// What this does and does not guarantee: dispatch only ever reads files
+/// under the staging root, so a `draft_attachments` row cannot point SMTP at
+/// an arbitrary path. But any *readable* path the frontend hands to
+/// `save_draft` is still copied into staging and mailed - picking files is a
+/// user gesture the renderer is trusted with, so this is not a boundary
+/// against a compromised renderer exfiltrating files it can read.
 async fn stage_draft_attachment(
     root: &std::path::Path,
     src: &str,
     filename: &str,
-) -> Result<String> {
+) -> Result<StagedAttachment> {
     tokio::fs::create_dir_all(root).await?;
     let root = tokio::fs::canonicalize(root).await?;
     let canon_src = tokio::fs::canonicalize(src)
@@ -5730,13 +6074,120 @@ async fn stage_draft_attachment(
         .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
     if canon_src.starts_with(&root) {
         // Already staged (e.g. re-saving a draft reloaded from the DB).
-        return Ok(canon_src.to_string_lossy().into_owned());
+        return Ok(StagedAttachment {
+            path: canon_src.to_string_lossy().into_owned(),
+            fresh: false,
+        });
     }
     let sub = root.join(crate::mime::rand_token());
     tokio::fs::create_dir_all(&sub).await?;
     let dst = sub.join(safe_filename(filename));
     tokio::fs::copy(&canon_src, &dst).await?;
-    Ok(dst.to_string_lossy().into_owned())
+    Ok(StagedAttachment {
+        path: dst.to_string_lossy().into_owned(),
+        fresh: true,
+    })
+}
+
+/// Delete staged attachment files, but only paths that canonicalise inside
+/// `root` - entries in `paths` come from the DB and are untrusted, so anything
+/// resolving outside the staging area is left alone. Each file lives in its
+/// own random subdirectory; the directory is removed too once it is empty.
+/// Deletion is best-effort: leftovers are reclaimed by the startup sweep.
+pub(crate) async fn remove_staged_draft_files(root: &std::path::Path, paths: &[String]) {
+    let Ok(root) = tokio::fs::canonicalize(root).await else {
+        return;
+    };
+    for path in paths {
+        let Ok(canon) = tokio::fs::canonicalize(path).await else {
+            continue;
+        };
+        if !canon.starts_with(&root) {
+            tracing::warn!(
+                path,
+                "refusing to remove attachment outside draft staging area"
+            );
+            continue;
+        }
+        if let Err(e) = tokio::fs::remove_file(&canon).await {
+            tracing::debug!(path, error = %e, "staged draft attachment already gone");
+        }
+        // The per-file subdirectory: drop it only when this was the last file.
+        if let Some(dir) = canon.parent()
+            && dir != root
+            && dir.starts_with(&root)
+        {
+            let _ = tokio::fs::remove_dir(dir).await;
+        }
+    }
+}
+
+/// Startup GC for the draft-attachment staging area. Staged files whose
+/// `draft_attachments` row is gone can never be read again - cleanup between a
+/// committing transaction and file removal is best-effort, and a crash leaves
+/// them behind. Removes top-level subdirectories that no row references,
+/// skipping anything modified within `min_age` so a save racing startup (it
+/// stages files before its transaction commits) is never undercut.
+/// All deletion is confined to canonicalised children of `root`; the root
+/// itself is never touched.
+pub async fn sweep_draft_attachment_staging(
+    db: &crate::db::Db,
+    root: &std::path::Path,
+    min_age: std::time::Duration,
+) -> Result<usize> {
+    let referenced: HashSet<std::path::PathBuf> = db
+        .read(|conn| {
+            let mut stmt = conn.prepare("SELECT file_path FROM draft_attachments")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Ok(rows)
+        })
+        .await?
+        .into_iter()
+        .filter_map(|p| std::path::PathBuf::from(p).canonicalize().ok())
+        .collect();
+
+    let Ok(root) = tokio::fs::canonicalize(root).await else {
+        return Ok(0);
+    };
+    let mut removed = 0usize;
+    let mut entries = tokio::fs::read_dir(&root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        // A recently-touched directory may belong to an in-flight save; one
+        // whose mtime is unreadable or lies in the future is kept too -
+        // assume fresh rather than risk deleting a save's staging.
+        let fresh = match meta.modified() {
+            Err(_) => true,
+            Ok(m) => m.elapsed().map_or(true, |age| age < min_age),
+        };
+        if fresh {
+            continue;
+        }
+        let Ok(canon) = tokio::fs::canonicalize(&path).await else {
+            continue;
+        };
+        if !canon.starts_with(&root) {
+            continue;
+        }
+        if referenced.iter().any(|r| r.starts_with(&canon)) {
+            continue;
+        }
+        if meta.is_dir() {
+            tokio::fs::remove_dir_all(&canon).await?;
+        } else {
+            tokio::fs::remove_file(&canon).await?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// Plain-text body for an outgoing invite email (the ICS carries the real
@@ -6073,19 +6524,164 @@ mod trash_regression_tests {
     }
 }
 
+#[cfg(test)]
+mod ask_scope_tests {
+    use super::*;
+    use crate::db::testutil;
+
+    /// A minimal `Core` over a fresh tempdir DB - enough to run the Ask
+    /// retrieval path (no actors, no embedder, no network).
+    async fn test_core() -> (Core, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::for_tests(root.path());
+        paths.ensure().unwrap();
+        let core = Core {
+            db: Db::open(&paths.db_file()).unwrap(),
+            bus: EventBus::new(),
+            paths: Arc::new(paths),
+            tokens: TokenProvider::new(),
+            handles: Arc::new(RwLock::new(HashMap::new())),
+            cal_handles: Arc::new(RwLock::new(HashMap::new())),
+            contacts_handles: Arc::new(RwLock::new(HashMap::new())),
+            attachment_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            embed: Arc::new(embed::EmbedState::new()),
+            oauth_cancel: Arc::new(tokio::sync::Notify::new()),
+            ui_ready: Arc::new(tokio::sync::Notify::new()),
+            ai_router_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mcp: Arc::new(mcp::McpManager::default()),
+        };
+        (core, root)
+    }
+
+    /// Two accounts, each with one indexed message sharing `sharedterm`.
+    /// Returns (account-1 message id, account-2 message id).
+    async fn seed_two_accounts(db: &Db) -> (i64, i64) {
+        db.write(|conn| {
+            testutil::seed_account(conn);
+            let (_, m1) = testutil::seed_message(conn, "a@one.dev", "sharedterm alpha", false);
+            repo::search::index_message(conn, m1)?;
+            // A body keeps `ensure_bodies` from kicking off (and waiting on)
+            // a network fetch in tests.
+            repo::messages::store_body(conn, m1, Some("alpha body"), None, None, false, None)?;
+            conn.execute(
+                "INSERT INTO accounts (id, email, provider, auth_kind, username,
+                 imap_host, imap_port, smtp_host, smtp_port, created_at)
+                 VALUES (2,'me2@test.dev','imap','password','me2','h',993,'h',587,0)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO folders (id, account_id, imap_name, role) VALUES (2,2,'INBOX','inbox')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO threads (id, account_id, subject_norm, unread_count, last_message_at)
+                 VALUES (99, 2, 'sharedterm beta', 1, 1000)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO messages (thread_id, account_id, folder_id, uid, message_id, subject,
+                 from_addr, date, is_read, is_automated, is_draft, is_outgoing)
+                 VALUES (99, 2, 2, 99, 'mid-99', 'sharedterm beta', 'b@two.dev', 1000, 0, 0, 0, 0)",
+                [],
+            )?;
+            let m2 = conn.last_insert_rowid();
+            repo::search::index_message(conn, m2)?;
+            repo::messages::store_body(conn, m2, Some("beta body"), None, None, false, None)?;
+            Ok::<_, CoreError>((m1, m2))
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn retrieve_search_scopes_keyword_hits_to_the_account() {
+        let (core, _tmp) = test_core().await;
+        let (m1, m2) = seed_two_accounts(&core.db).await;
+
+        let all = core.retrieve_search("sharedterm", 10, None).await.unwrap();
+        assert!(all.iter().any(|m| m.id == m1));
+        assert!(all.iter().any(|m| m.id == m2));
+
+        let one = core
+            .retrieve_search("sharedterm", 10, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(one.iter().map(|m| m.id).collect::<Vec<_>>(), vec![m1]);
+        let two = core
+            .retrieve_search("sharedterm", 10, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(two.iter().map(|m| m.id).collect::<Vec<_>>(), vec![m2]);
+    }
+
+    #[tokio::test]
+    async fn vector_hit_scoping_drops_other_accounts() {
+        let (core, _tmp) = test_core().await;
+        let (m1, m2) = seed_two_accounts(&core.db).await;
+
+        let hits = vec![(m2, 0.9f32), (m1, 0.8)];
+        let one = core.scope_hits_to_account(hits.clone(), 1).await.unwrap();
+        assert_eq!(one, vec![(m1, 0.8)]);
+        let two = core.scope_hits_to_account(hits, 2).await.unwrap();
+        assert_eq!(two, vec![(m2, 0.9)]);
+        // Ids not in the DB at all are dropped too.
+        let gone = core
+            .scope_hits_to_account(vec![(999_999, 0.7), (m1, 0.6)], 1)
+            .await
+            .unwrap();
+        assert_eq!(gone, vec![(m1, 0.6)]);
+    }
+
+    #[tokio::test]
+    async fn search_inbox_tool_respects_account_scope() {
+        let (core, _tmp) = test_core().await;
+        let (m1, _m2) = seed_two_accounts(&core.db).await;
+        let mut sources = Vec::new();
+        let noop = |_| {};
+        let (text, added) = core
+            .run_search_inbox(r#"{"query":"sharedterm"}"#, &mut sources, Some(1), &noop)
+            .await;
+        assert_eq!(added, 1);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, m1);
+        assert!(!text.contains("sharedterm beta"));
+    }
+
+    #[tokio::test]
+    async fn read_email_tool_refuses_out_of_scope_source() {
+        let (core, _tmp) = test_core().await;
+        let (_m1, m2) = seed_two_accounts(&core.db).await;
+        let mut sources = core
+            .retrieve_search("sharedterm", 10, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+        // A foreign-account detail slipped into the citation list must not be
+        // readable while the filter is on (scoped retrieval can't produce one,
+        // but the guard holds even if it ever did).
+        let foreign = core
+            .db
+            .read(move |conn| repo::messages::detail(conn, m2))
+            .await
+            .unwrap();
+        sources.push(foreign);
+        let noop = |_| {};
+        let out = core
+            .run_read_email(r#"{"n":2}"#, &sources, Some(1), &noop)
+            .await;
+        assert!(out.contains("outside the selected account"));
+        let out = core
+            .run_read_email(r#"{"n":1}"#, &sources, Some(1), &noop)
+            .await;
+        assert!(out.contains("sharedterm alpha"));
+    }
+}
+
 fn action_identity_payload(
     conn: &rusqlite::Connection,
     message_id: i64,
 ) -> Result<serde_json::Value> {
-    let row = repo::messages::get_row(conn, message_id)?
-        .ok_or_else(|| CoreError::NotFound("message for action".into()))?;
-    let validity = row
-        .folder_id
-        .map(|id| repo::folders::get(conn, id))
-        .transpose()?
-        .flatten()
-        .and_then(|folder| folder.uidvalidity);
-    Ok(serde_json::json!({ "folderId": row.folder_id, "uid": row.uid, "uidValidity": validity }))
+    repo::actions::identity_payload(conn, message_id)
 }
 
 fn move_identity_payload(

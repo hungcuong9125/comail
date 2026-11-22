@@ -544,6 +544,9 @@ async fn fetch_headers_inner(
     behavior: &dyn crate::provider::MailboxBehavior,
     with_structure: bool,
 ) -> Result<Vec<FetchedHeader>> {
+    if !valid_uid_set(uid_set) {
+        return Err(CoreError::Imap(format!("invalid UID set: {uid_set}")));
+    }
     let query = header_fetch_query(behavior.identity_fetch_items(), with_structure);
     let mut out = Vec::new();
     {
@@ -899,14 +902,36 @@ async fn uid_search_all_inner(session: &mut Session) -> Result<Vec<u32>> {
     Ok(v)
 }
 
+/// Strict UID-set check shared by the search/fetch wrappers: digits, `:`,
+/// `,` only. `*` is deliberately rejected - the only legitimate open-ended
+/// form is built from a number inside [`uid_search_from`].
+pub(crate) fn valid_uid_set(set: &str) -> bool {
+    !set.is_empty()
+        && set
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b':' || b == b',')
+}
+
+/// `UID SEARCH UID {start}:*`: the open-ended form used when the server
+/// omits UIDNEXT. Builds the range from a number, so a caller-supplied
+/// string never needs `*` past [`valid_uid_set`].
+pub async fn uid_search_from(session: &mut Session, start: u32) -> Result<Vec<u32>> {
+    with_deadline("UID SEARCH UID", METADATA_TIMEOUT, async {
+        let set = session
+            .uid_search(format!("UID {start}:*"))
+            .await
+            .map_err(imap_error)?;
+        let mut v: Vec<u32> = set.into_iter().collect();
+        v.sort_unstable();
+        Ok(v)
+    })
+    .await
+}
+
 /// The UIDs in `uid_set` (e.g. "100:599") that exist in the selected folder,
 /// sorted.
 pub async fn uid_search_in(session: &mut Session, uid_set: &str) -> Result<Vec<u32>> {
-    if uid_set.is_empty()
-        || !uid_set
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b == b':' || b == b',')
-    {
+    if !valid_uid_set(uid_set) {
         return Err(CoreError::Imap(format!("invalid UID set: {uid_set}")));
     }
     with_deadline("UID SEARCH UID", METADATA_TIMEOUT, async {

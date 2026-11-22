@@ -11,6 +11,8 @@
   "mime": "Message format error",
   "not_found": "Not found",
   "offline": "You're offline",
+  "delete_rejected": "This can't be deleted",
+  "action_rejected": "That can't be done right now",
   "ai_not_configured": "AI is not configured. Add an API key in Settings (not needed for local endpoints like LM Studio).",
   "ai_key_rejected": "Your AI provider rejected the API key. Open Settings → AI and paste a valid key.",
   "other": "Something went wrong",
