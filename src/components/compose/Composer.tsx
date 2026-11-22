@@ -20,10 +20,12 @@ import { decodeEntities, escapeHtml, htmlToText, isHtmlEmpty, textToHtml } from 
 import {
   pickSignature,
   replaceSignature,
+  sanitizeEditorHtml,
   signaturesForAccount,
   stripSignature,
   type ComposeMode,
 } from "../../lib/signatures";
+import { draftBodyForSave, quoteToHtml } from "../../lib/draftBody";
 import { DraftSaver } from "../../lib/draftSaver";
 import { playSound } from "../../lib/sound";
 import { RichBody, type RichBodyHandle } from "./RichBody";
@@ -176,14 +178,6 @@ function selectionQuoteHtml(text: string): string {
   return `<blockquote>${textToHtml(text)}</blockquote><div><br></div>`;
 }
 
-/** The plain-text wire quote rendered as HTML: attribution line + blockquote. */
-function quoteToHtml(quoteText: string): string {
-  const lines = quoteText.split("\n");
-  const header = lines[0] ?? "";
-  const rest = stripQuoteMarkers(lines.slice(1).join("\n"));
-  return `<div>${escapeHtml(header)}</div><blockquote>${textToHtml(rest)}</blockquote>`;
-}
-
 export function Composer({ state, inline }: { state: ComposerState; inline?: boolean }) {
   const { t } = useTranslation();
   const hint = useShortcutHint();
@@ -214,8 +208,18 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   const [cc, setCc] = useState<Address[]>(init.cc);
   const [bcc, setBcc] = useState<Address[]>(init.bcc);
   const [subject, setSubject] = useState(init.subject);
-  /** rich HTML body (plain-text fallback is derived at save/send time) */
-  const [body, setBody] = useState(init.bodyHtml);
+  /** rich HTML body (plain-text fallback is derived at save/send time).
+   *  Only editor-safe HTML enters state: the initial value and every
+   *  external setBody (draft load, signature swap, AI output, undo) are
+   *  sanitized at this boundary, so a save of an untouched composer never
+   *  emits raw markup. The editor's own emissions are already clean and
+   *  sanitizeEditorHtml is idempotent, so the extra pass cannot rewrite
+   *  the DOM, move the caret, or mark a pristine draft dirty. */
+  const [body, setBodyState] = useState(() => sanitizeEditorHtml(init.bodyHtml));
+  const setBody = useCallback(
+    (html: string) => setBodyState(sanitizeEditorHtml(html)),
+    [],
+  );
   const [showCc, setShowCc] = useState(init.cc.length > 0 || init.bcc.length > 0);
   const [draftId, setDraftId] = useState<number | null>(state.draftId ?? null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
@@ -318,12 +322,13 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         {
           save: async (existingId) => {
             const f = fieldsRef.current;
-            const plain = htmlToText(f.body);
-            const withQuote = f.quote !== "" && !f.quoteRemoved;
-            const fullBody = withQuote
-              ? `${plain.replace(/\s+$/, "")}\n\n${f.quote}`
-              : plain;
-            const fullHtml = withQuote ? `${f.body}<br><br>${quoteToHtml(f.quote)}` : f.body;
+            // Backstop: the payload is sanitized here even though the body
+            // state already is - whatever reaches save_draft is clean.
+            const { bodyText, bodyHtml } = draftBodyForSave(
+              f.body,
+              f.quote,
+              f.quoteRemoved,
+            );
             const { draftId: newId } = await call("save_draft", {
               args: {
                 draftId: existingId,
@@ -332,8 +337,8 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
                 cc: f.cc,
                 bcc: f.bcc,
                 subject: f.subject,
-                bodyText: fullBody,
-                bodyHtml: fullHtml,
+                bodyText,
+                bodyHtml,
                 mode: state.mode,
                 inReplyToMessageId: state.replyTo?.id ?? null,
                 attachments: f.attachments,
@@ -408,7 +413,9 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
     const cur = fieldsRef.current.body;
     const next = replaceSignature(cur, activeSig?.html ?? "");
     if (next === cur) return;
-    const pristine = stripSignature(cur) === init.bodyHtml || isHtmlEmpty(stripSignature(cur));
+    const pristine =
+      stripSignature(cur) === sanitizeEditorHtml(init.bodyHtml) ||
+      isHtmlEmpty(stripSignature(cur));
     setBody(next);
     // keep the caret at the top for replies so typing lands above the signature
     if (pristine && (state.mode === "reply" || state.mode === "reply_all")) {
@@ -506,6 +513,9 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
 
   const doSend = useCallback(
     async (opts: { sendAt?: number; markDone?: boolean; instant?: boolean } = {}) => {
+      // A discard in flight owns the draft id; sending now would race the
+      // delete. No state change - the composer is closing anyway.
+      if (saver.isDiscarding) return;
       const f = fieldsRef.current;
       if (f.to.length === 0) {
         pushToast({ kind: "error", message: t("compose:addRecipient"), durationMs: 3000 });
@@ -962,6 +972,8 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   };
 
   const saveAndClose = async () => {
+    // Same race as Send: a discard owns the draft until it resolves.
+    if (saver.isDiscarding) return;
     try {
       await saver.flush();
     } catch (err) {

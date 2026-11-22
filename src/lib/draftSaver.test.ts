@@ -242,3 +242,34 @@ describe("DraftSaver lifecycle", () => {
     expect(saver.isClosed).toBe(true);
   });
 });
+
+describe("DraftSaver discard/send race", () => {
+  it("flush returns null while a discard is in flight", async () => {
+    const gate = deferred<void>();
+    const saver = new DraftSaver({ save: async () => 5 });
+    saver.markChanged();
+    await saver.saveIfDirty();
+    const pending = saver.discard(() => gate.promise);
+    expect(saver.isDiscarding).toBe(true);
+    // Send/save-and-close racing the discard must not get the doomed id.
+    expect(await saver.flush()).toBeNull();
+    gate.resolve();
+    expect((await pending).done).toBe(true);
+  });
+
+  it("a discard rejected with a non-gone error clears the discarding flag", async () => {
+    const saver = new DraftSaver({ save: async () => 5 });
+    saver.markChanged();
+    await saver.saveIfDirty();
+    const res = await saver.discard(() =>
+      Promise.reject({ code: "delete_rejected", message: "no trash folder" }),
+    );
+    expect(res.done).toBe(false);
+    expect(saver.isDiscarding).toBe(false);
+    expect(saver.isClosed).toBe(false);
+    // ...and a later save still works against the same draft.
+    saver.markChanged();
+    await saver.saveIfDirty();
+    expect(saver.id).toBe(5);
+  });
+});

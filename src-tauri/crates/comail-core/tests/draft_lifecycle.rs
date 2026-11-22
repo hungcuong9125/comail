@@ -409,3 +409,39 @@ async fn delete_draft_refuses_while_its_send_is_in_flight() {
     assert_eq!(is_draft, 1);
     assert_eq!(state, "inflight");
 }
+
+#[tokio::test]
+async fn deleting_a_remote_draft_without_a_trash_folder_is_rejected_not_gone() {
+    let (_tmp, core) = setup().await;
+    let draft_id = core.save_draft(args(None)).await.unwrap();
+    core.db
+        .write(move |conn| {
+            conn.execute("UPDATE messages SET uid = 42 WHERE id = ?1", [draft_id])?;
+            conn.execute("DELETE FROM folders WHERE role = 'trash'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // The draft is still there; the delete cannot proceed - "delete
+    // rejected", not "draft gone", so callers must not treat it as already
+    // deleted.
+    let err = core.delete_draft(draft_id).await.unwrap_err();
+    assert!(
+        matches!(err, comail_core::error::CoreError::DeleteRejected(_)),
+        "expected DeleteRejected, got {err:?}"
+    );
+    let (is_draft, uid): (i64, Option<i64>) = core
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT is_draft, uid FROM messages WHERE id = ?1",
+                [draft_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!((is_draft, uid), (1, Some(42)), "draft must be untouched");
+}
