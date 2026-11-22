@@ -40,25 +40,33 @@ enum NavDecision {
     Deny,
 }
 
-/// Strict allowlist for webview navigations. The app loads itself from
-/// `tauri://localhost` (custom protocol - macOS, iOS, Linux where the scheme
-/// registers), `http(s)://tauri.localhost` (the wry fallback origin used on
-/// Windows and wherever the custom scheme is unavailable), and the dev-server
-/// URL from tauri.conf.json in debug builds. `about:` documents must pass
-/// because the callback is also invoked for subframe loads on some engines
-/// (wry does not filter to the main frame: on macOS it hooks
+/// Strict allowlist for webview navigations, mirroring
+/// `AppManager::get_app_url`: the configured `devUrl` under `cfg(dev)` (the
+/// same flag tauri-build and `get_app_url` use, not just a debug build), or a
+/// `frontendDist` of the `Url` form otherwise. Falling back, the real app
+/// origins per `tauri_protocol_url` are `tauri://localhost` (everywhere the
+/// custom scheme registers - macOS/iOS/Linux, and Windows under the
+/// dev-server proxy) and `http(s)://tauri.localhost` (Windows/Android);
+/// both must match exactly with no explicit port. `about:` is limited to
+/// exactly `about:blank`/`about:srcdoc` because wry does not filter the
+/// callback to the main frame: on macOS it hooks
 /// `decidePolicyForNavigationAction`, which WKWebView raises for any frame,
-/// so the `about:srcdoc`/`about:blank` loads of the sandboxed email-body
-/// iframe report here too; WebView2's `NavigationStarting` is main-frame
-/// only).
-fn nav_decision(url: &tauri::Url, dev_url: Option<&tauri::Url>) -> NavDecision {
+/// so the subframe loads of the sandboxed email-body iframe report here too
+/// (WebView2's `NavigationStarting` is main-frame only).
+fn nav_decision(
+    url: &tauri::Url,
+    dev_url: Option<&tauri::Url>,
+    dist_url: Option<&tauri::Url>,
+) -> NavDecision {
+    // The app URL the platform may actually load, mirroring `get_app_url`:
+    // devUrl under cfg(dev), else a URL-form frontendDist.
+    let configured = if cfg!(dev) { dev_url } else { dist_url };
     let app_url = match url.scheme() {
-        "tauri" => url.host_str() == Some("localhost"),
-        "about" => true,
+        "tauri" => url.host_str() == Some("localhost") && url.port().is_none(),
+        "about" => matches!(url.path(), "blank" | "srcdoc") && url.host_str().is_none(),
         "http" | "https" => {
-            url.host_str() == Some("tauri.localhost")
-                || (cfg!(debug_assertions)
-                    && dev_url.is_some_and(|dev| url.origin() == dev.origin()))
+            (url.host_str() == Some("tauri.localhost") && url.port().is_none())
+                || configured.is_some_and(|d| url.origin() == d.origin())
         }
         _ => false,
     };
@@ -254,7 +262,12 @@ pub fn run() {
             // inferred. Without this the config type param can't be resolved.
             tauri::plugin::Builder::<_, ()>::new("comail-external-links")
                 .on_navigation(|webview, url| {
-                    match nav_decision(url, webview.config().build.dev_url.as_ref()) {
+                    let build = &webview.config().build;
+                    let dist_url = match build.frontend_dist.as_ref() {
+                        Some(tauri::utils::config::FrontendDist::Url(u)) => Some(u),
+                        _ => None,
+                    };
+                    match nav_decision(url, build.dev_url.as_ref(), dist_url) {
                         NavDecision::Allow => true,
                         NavDecision::OpenExternal => {
                             let _ = tauri_plugin_opener::open_url(url.as_str(), None::<&str>);
@@ -545,32 +558,60 @@ mod tests {
     const DEV: &str = "http://localhost:1420";
 
     fn decision(url: &str) -> NavDecision {
-        nav_decision(&Url::parse(url).unwrap(), Some(&Url::parse(DEV).unwrap()))
+        nav_decision(
+            &Url::parse(url).unwrap(),
+            Some(&Url::parse(DEV).unwrap()),
+            None,
+        )
     }
 
-    /// The dev-server allowance is compiled to debug builds only; assert the
-    /// variant this build actually implements.
+    /// The devUrl arm is compiled under cfg(dev) - the same flag tauri-build
+    /// and get_app_url use. A plain `cargo test` build has it off.
     fn dev_expected() -> NavDecision {
-        if cfg!(debug_assertions) {
+        if cfg!(dev) {
             NavDecision::Allow
         } else {
             NavDecision::OpenExternal
         }
     }
 
+    /// A prod-style frontendDist URL is the app origin when devUrl is not in
+    /// play.
+    fn decision_dist(url: &str) -> NavDecision {
+        nav_decision(
+            &Url::parse(url).unwrap(),
+            Some(&Url::parse(DEV).unwrap()),
+            Some(&Url::parse("https://app.example.com").unwrap()),
+        )
+    }
+
+    fn dist_expected() -> NavDecision {
+        if cfg!(dev) {
+            NavDecision::OpenExternal
+        } else {
+            NavDecision::Allow
+        }
+    }
+
     #[test]
     fn navigation_allowlist() {
         for (url, expected) in [
-            // App origins per platform.
+            // App origins per platform (exact host, no explicit port).
             ("tauri://localhost", NavDecision::Allow),
             ("tauri://localhost/", NavDecision::Allow),
             ("tauri://localhost/index.html", NavDecision::Allow),
+            ("tauri://localhost:1234", NavDecision::Deny),
             ("http://tauri.localhost", NavDecision::Allow),
             ("https://tauri.localhost/", NavDecision::Allow),
             ("https://tauri.localhost/index.html", NavDecision::Allow),
-            // Subframe documents reported through the same hook.
+            ("http://tauri.localhost:8080", NavDecision::OpenExternal),
+            ("https://tauri.localhost:444", NavDecision::OpenExternal),
+            // Only the two subframe documents an iframe may load.
             ("about:blank", NavDecision::Allow),
             ("about:srcdoc", NavDecision::Allow),
+            ("about:blank?x=1", NavDecision::Allow),
+            ("about:config", NavDecision::Deny),
+            ("about://blank", NavDecision::Deny),
             // External web and mailto links go to the OS handler.
             ("https://example.com", NavDecision::OpenExternal),
             ("http://example.com/path?q=1", NavDecision::OpenExternal),
@@ -600,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn dev_server_url_is_allowed_only_in_debug() {
+    fn dev_server_url_is_allowed_only_in_dev() {
         assert_eq!(decision(DEV), dev_expected());
         assert_eq!(decision("http://localhost:1420/"), dev_expected());
         // A different port on the same host is not the dev server.
@@ -608,8 +649,26 @@ mod tests {
     }
 
     #[test]
+    fn frontend_dist_url_is_app_origin_outside_dev() {
+        assert_eq!(decision_dist("https://app.example.com"), dist_expected());
+        assert_eq!(
+            decision_dist("https://app.example.com/index.html"),
+            dist_expected()
+        );
+        // The dist URL's origin only - a different port or host is not it.
+        assert_eq!(
+            decision_dist("https://app.example.com:8443"),
+            NavDecision::OpenExternal
+        );
+        assert_eq!(
+            decision_dist("https://cdn.example.com"),
+            NavDecision::OpenExternal
+        );
+    }
+
+    #[test]
     fn no_configured_dev_url_means_no_localhost() {
         let url = Url::parse(DEV).unwrap();
-        assert_eq!(nav_decision(&url, None), NavDecision::OpenExternal);
+        assert_eq!(nav_decision(&url, None, None), NavDecision::OpenExternal);
     }
 }
