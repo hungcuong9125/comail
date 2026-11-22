@@ -8,7 +8,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import i18n from "../i18n";
 import { call } from "../ipc/commands";
 import { errorMessage } from "../ipc/errors";
-import { MOCK_MODE } from "../ipc/mock";
+import { MOCK_MODE } from "../ipc/mockMode";
 import type { MessageDetail } from "../ipc/types";
 import { queryClient } from "../queries/client";
 import { useUi } from "../stores/ui";

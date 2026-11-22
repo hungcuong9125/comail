@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { call } from "../../ipc/commands";
 import { errorMessage } from "../../ipc/errors";
-import { MOCK_MODE } from "../../ipc/mock";
+import { MOCK_MODE } from "../../ipc/mockMode";
 import type { AttachmentMeta, AttachmentPreview } from "../../ipc/types";
 import { fileKind, type FileKind } from "../../lib/fileKind";
 import { addressName, formatSize, longTime } from "../../lib/format";

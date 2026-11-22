@@ -1,4 +1,4 @@
-import { MOCK_MODE } from "./mock";
+import { MOCK_MODE } from "./mockMode";
 
 /** Download progress for the in-flight update, emitted as bytes arrive. */
 export interface DownloadProgress {

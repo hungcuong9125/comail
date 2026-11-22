@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import i18n from "../../i18n";
 import { call } from "../../ipc/commands";
 import { errorMessage } from "../../ipc/errors";
-import { MOCK_MODE } from "../../ipc/mock";
+import { MOCK_MODE } from "../../ipc/mockMode";
 import { useSettings } from "../../queries/hooks";
 import { useUi } from "../../stores/ui";
 import type { Address, AttachmentMeta, MessageDetail } from "../../ipc/types";

@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import i18n from "../i18n";
 import { call } from "../ipc/commands";
 import { onEvent, subscribeEvent } from "../ipc/events";
-import { MOCK_MODE } from "../ipc/mock";
+import { MOCK_MODE } from "../ipc/mockMode";
 import type {
   AccountStateEvent,
   CalendarEvent,
