@@ -5842,6 +5842,10 @@ impl Core {
         self.db
             .write(move |conn| repo::settings::strip_legacy_secret_key(conn, key))
             .await?;
+        // The flag is known exactly even with no client ID saved yet —
+        // `apply` drops empty-id entries, which would skip the update.
+        let present = !matches!(state, oauth::providers::SecretState::Unset);
+        oauth::providers::set_secret_presence(provider, present);
         // Refresh the resolver so a cleared secret stops being served and
         // the legacy fallback mirrors what the row still carries.
         let settings = self.db.read(|conn| repo::settings::get(conn)).await?;
@@ -6349,6 +6353,11 @@ async fn apply_oauth_settings(
         let secret = match fresh.iter().find(|(p, _)| *p == provider) {
             Some((_, state)) => state.clone(),
             None => match oauth::providers::cached_secret_state(provider) {
+                // A stale Unavailable gets a fresh probe on every save — a
+                // user action is a fine moment to notice an unlocked keychain.
+                Some(oauth::providers::SecretState::Unavailable) if !id.trim().is_empty() => {
+                    oauth::providers::probe_secret(provider).await
+                }
                 Some(state) => state,
                 None if !id.trim().is_empty() => oauth::providers::probe_secret(provider).await,
                 None => oauth::providers::SecretState::Unset,
@@ -6390,9 +6399,7 @@ async fn migrate_oauth_secret(
     provider: Provider,
     field: &mut String,
 ) -> Option<oauth::providers::SecretState> {
-    let Some(slot) = oauth::providers::client_secret_slot(provider) else {
-        return None;
-    };
+    let slot = oauth::providers::client_secret_slot(provider)?;
     let value = field.trim().to_string();
     if value.is_empty() {
         return None;

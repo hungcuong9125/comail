@@ -13,15 +13,23 @@ use comail_core::config::Paths;
 use comail_core::db::{Db, repo};
 use comail_core::error::CoreError;
 use comail_core::models::{Provider, Settings};
-use comail_core::oauth::providers::{SecretState, resolve_credentials, set_configured};
+use comail_core::oauth::providers::{
+    SecretState, reset_provider_config, resolve_credentials, set_configured, set_reprobe_interval,
+};
 use std::path::Path;
+use std::time::Duration;
 
 static CREDS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Point the insecure-file credential backend at `path` and hold the guard
-/// serializing every credential-touching test.
+/// serializing every credential-touching test. The process-global resolver
+/// cache is reset so tests cannot see each other's state, and the re-probe
+/// interval starts effectively infinite — tests that exercise recovery
+/// shrink it explicitly.
 async fn creds_env(path: &Path) -> tokio::sync::MutexGuard<'static, ()> {
     let guard = CREDS_LOCK.lock().await;
+    reset_provider_config();
+    set_reprobe_interval(Duration::from_secs(86_400));
     // SAFETY: the guard serializes every use of the shared backend file.
     unsafe { std::env::set_var("COMAIL_CREDENTIALS_INSECURE_FILE", path) };
     guard
@@ -111,10 +119,10 @@ async fn migration_moves_secrets_to_keyring() {
     assert!(!wire.contains("msClientSecret"));
 
     // The OAuth config resolver returns the keyring values.
-    let (id, secret) = resolve_credentials(Provider::Gmail).unwrap();
+    let (id, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
     assert_eq!(id, "g-id");
     assert_eq!(secret.as_deref(), Some("g-secret"));
-    let (id, secret) = resolve_credentials(Provider::Microsoft).unwrap();
+    let (id, secret) = resolve_credentials(Provider::Microsoft).await.unwrap();
     assert_eq!(id, "ms-id");
     assert_eq!(secret.as_deref(), Some("ms-secret"));
 
@@ -123,7 +131,7 @@ async fn migration_moves_secrets_to_keyring() {
     let json = row_json(&db).await;
     assert!(json.get("googleClientSecret").is_none());
     assert!(json.get("msClientSecret").is_none());
-    let (_, secret) = resolve_credentials(Provider::Gmail).unwrap();
+    let (_, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
     assert_eq!(secret.as_deref(), Some("g-secret"));
 }
 
@@ -151,9 +159,9 @@ async fn failed_keyring_write_keeps_row_secret_working() {
         assert_eq!(json["msClientSecret"], "ms-secret");
 
         // The legacy copy still signs in, and the flag still reports "set".
-        let (_, secret) = resolve_credentials(Provider::Gmail).unwrap();
+        let (_, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
         assert_eq!(secret.as_deref(), Some("g-secret"));
-        let (_, secret) = resolve_credentials(Provider::Microsoft).unwrap();
+        let (_, secret) = resolve_credentials(Provider::Microsoft).await.unwrap();
         assert_eq!(secret.as_deref(), Some("ms-secret"));
         let settings = core.get_settings().await.unwrap();
         assert!(settings.has_google_client_secret);
@@ -170,9 +178,9 @@ async fn failed_keyring_write_keeps_row_secret_working() {
         let json = row_json(&db).await;
         assert_eq!(json["googleClientSecret"], "g-secret");
         assert_eq!(json["msClientSecret"], "ms-secret");
-        let (_, secret) = resolve_credentials(Provider::Gmail).unwrap();
+        let (_, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
         assert_eq!(secret.as_deref(), Some("g-secret"));
-        let (_, secret) = resolve_credentials(Provider::Microsoft).unwrap();
+        let (_, secret) = resolve_credentials(Provider::Microsoft).await.unwrap();
         assert_eq!(secret.as_deref(), Some("ms-secret"));
     }
 
@@ -186,7 +194,7 @@ async fn failed_keyring_write_keeps_row_secret_working() {
         credentials::load(0, Slot::GoogleClientSecret).unwrap(),
         "g-secret"
     );
-    let (_, secret) = resolve_credentials(Provider::Microsoft).unwrap();
+    let (_, secret) = resolve_credentials(Provider::Microsoft).await.unwrap();
     assert_eq!(secret.as_deref(), Some("ms-secret"));
 }
 
@@ -204,7 +212,7 @@ async fn settings_write_never_clears_stored_secrets() {
     let mut s: Settings = core.get_settings().await.unwrap();
     s.theme = "carbon".into();
     core.set_settings(s).await.unwrap();
-    let (_, secret) = resolve_credentials(Provider::Gmail).unwrap();
+    let (_, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
     assert_eq!(secret.as_deref(), Some("g-secret"));
     let json = row_json(&db).await;
     assert!(json.get("googleClientSecret").is_none());
@@ -213,17 +221,17 @@ async fn settings_write_never_clears_stored_secrets() {
     core.set_oauth_client_secret("google".into(), "new-secret".into())
         .await
         .unwrap();
-    let (_, secret) = resolve_credentials(Provider::Gmail).unwrap();
+    let (_, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
     assert_eq!(secret.as_deref(), Some("new-secret"));
     // ...and clears it (flag flips, nothing falls back to an old copy).
     core.set_oauth_client_secret("google".into(), String::new())
         .await
         .unwrap();
-    let (_, secret) = resolve_credentials(Provider::Gmail).unwrap();
+    let (_, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
     assert_eq!(secret, None);
     assert!(!core.get_settings().await.unwrap().has_google_client_secret);
     // Microsoft is untouched.
-    let (_, secret) = resolve_credentials(Provider::Microsoft).unwrap();
+    let (_, secret) = resolve_credentials(Provider::Microsoft).await.unwrap();
     assert_eq!(secret.as_deref(), Some("ms-secret"));
 }
 
@@ -259,7 +267,7 @@ async fn set_settings_ignores_inline_secret_fields() {
     );
     let json = row_json(&db).await;
     assert!(json.get("googleClientSecret").is_none());
-    let (_, secret) = resolve_credentials(Provider::Gmail).unwrap();
+    let (_, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
     assert_eq!(secret.as_deref(), Some("live-secret"));
     assert!(core.get_settings().await.unwrap().has_google_client_secret);
 }
@@ -287,7 +295,7 @@ async fn migration_keyring_wins_over_stale_row_copy() {
     );
     let json = row_json(&db).await;
     assert!(json.get("googleClientSecret").is_none());
-    let (_, secret) = resolve_credentials(Provider::Gmail).unwrap();
+    let (_, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
     assert_eq!(secret.as_deref(), Some("newer-secret"));
     // Microsoft migrated normally.
     assert_eq!(
@@ -362,7 +370,7 @@ async fn keyring_errors_are_transient_and_surfaced() {
     // secret" — a token request without client_secret would return an auth
     // error and flag the account needs_reauth.
     set_configured(Provider::Gmail, "g-id", None, SecretState::Unavailable);
-    match resolve_credentials(Provider::Gmail) {
+    match resolve_credentials(Provider::Gmail).await {
         Err(CoreError::Keyring(_)) => {}
         other => panic!("expected transient keyring error, got {other:?}"),
     }
@@ -380,4 +388,56 @@ async fn keyring_errors_are_transient_and_surfaced() {
         .await
         .unwrap_err();
     assert!(matches!(err, CoreError::Io(_)) || matches!(err, CoreError::Other(_)));
+}
+
+/// `Unavailable` is not sticky: once the credential store works again the
+/// resolver re-probes (rate-limited, single-flight) and recovers without a
+/// restart or a settings write — completing a pending migration when the
+/// keyring reads back empty but a row copy is cached.
+#[tokio::test(flavor = "multi_thread")]
+async fn unavailable_state_heals_via_reprobe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let broken = tmp.path().join("creds-is-a-dir");
+    std::fs::create_dir(&broken).unwrap();
+    let good = tmp.path().join("credentials.json");
+    let db = Db::open(&paths(&tmp).db_file()).unwrap();
+    seed_legacy_settings(&db).await;
+
+    // Start with an unusable store: migration fails, both providers sit in
+    // Unavailable with their legacy row copies as the working fallback.
+    let _guard = creds_env(&broken).await;
+    let core = Core::start(paths(&tmp)).await.unwrap();
+    let (_, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
+    assert_eq!(secret.as_deref(), Some("g-secret"));
+
+    // The store works again — but inside the rate-limit window no re-probe
+    // runs: the keyring still holds nothing.
+    unsafe { std::env::set_var("COMAIL_CREDENTIALS_INSECURE_FILE", &good) };
+    let (_, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
+    assert_eq!(secret.as_deref(), Some("g-secret"));
+    assert!(credentials::load(0, Slot::GoogleClientSecret).is_err());
+
+    // Past the interval the resolver re-probes: the keyring reads empty, the
+    // cached row copy completes the pending migration, and the value is
+    // served from the store — no restart, no set_settings.
+    set_reprobe_interval(Duration::ZERO);
+    let (_, secret) = resolve_credentials(Provider::Gmail).await.unwrap();
+    assert_eq!(secret.as_deref(), Some("g-secret"));
+    assert_eq!(
+        credentials::load(0, Slot::GoogleClientSecret).unwrap(),
+        "g-secret"
+    );
+    // The pending row key is cleaned up by the next routine migration pass.
+    core.migrate_oauth_client_secrets().await;
+    let json = row_json(&db).await;
+    assert!(json.get("googleClientSecret").is_none());
+
+    // Unavailable with no legacy at all also heals: seed the state by hand
+    // (a read-side keyring error can't be produced by the file backend —
+    // missing and unreadable entries both read as empty), then let the real
+    // re-probe find the recovered value.
+    set_configured(Provider::Microsoft, "ms-id", None, SecretState::Unavailable);
+    credentials::store(0, Slot::MsClientSecret, "recovered").unwrap();
+    let (_, secret) = resolve_credentials(Provider::Microsoft).await.unwrap();
+    assert_eq!(secret.as_deref(), Some("recovered"));
 }

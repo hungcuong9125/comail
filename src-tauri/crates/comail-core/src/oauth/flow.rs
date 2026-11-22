@@ -73,7 +73,7 @@ pub async fn authorize_with(
 ) -> Result<OAuthOutcome> {
     let cfg = for_provider(provider)
         .ok_or_else(|| CoreError::Auth("provider does not use oauth".into()))?;
-    let (client_id, client_secret) = crate::oauth::providers::resolve_credentials(provider)?;
+    let (client_id, client_secret) = crate::oauth::providers::resolve_credentials(provider).await?;
 
     let verifier = random_string(64);
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD

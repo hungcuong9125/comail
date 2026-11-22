@@ -20,6 +20,7 @@ pub const MS_ONLINE_MEETINGS_SCOPE: &str = "https://graph.microsoft.com/OnlineMe
 pub const MS_CALENDARS_SCOPE: &str = "https://graph.microsoft.com/Calendars.ReadWrite";
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 pub struct OAuthProviderConfig {
     pub auth_url: &'static str,
@@ -76,7 +77,7 @@ pub fn client_secret_slot(provider: Provider) -> Option<Slot> {
 /// The last known state of `provider`'s keyring-held client secret. Cached
 /// in memory — refreshed by the startup migration and `set_oauth_client_secret`
 /// — so token grants and `get_settings` never touch the OS keyring.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SecretState {
     /// No secret is stored (or the provider was never probed).
     Unset,
@@ -89,21 +90,89 @@ pub enum SecretState {
     Unavailable,
 }
 
+impl std::fmt::Debug for SecretState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretState::Unset => f.write_str("Unset"),
+            SecretState::Value(_) => f.write_str("Value(***)"),
+            SecretState::Unavailable => f.write_str("Unavailable"),
+        }
+    }
+}
+
 /// Client credentials the user entered in Settings: the client id, the
 /// cached keyring secret state, and a legacy inline copy kept only until the
 /// startup migration moves it into the OS keyring (usable while the keyring
 /// stays unavailable). Refreshed on startup and whenever settings change;
 /// env vars still take precedence at resolve time.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Configured {
     pub id: String,
     pub legacy: Option<String>,
     pub secret: SecretState,
 }
 
-fn configured() -> &'static RwLock<HashMap<Provider, Configured>> {
-    static MAP: OnceLock<RwLock<HashMap<Provider, Configured>>> = OnceLock::new();
+impl std::fmt::Debug for Configured {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Configured")
+            .field("id", &self.id)
+            .field("legacy", &self.legacy.as_ref().map(|_| "***"))
+            .field("secret", &self.secret)
+            .finish()
+    }
+}
+
+/// One provider's cache slot: the configured credentials plus when the last
+/// `Unavailable` probe ran — the rate limiter for re-probes.
+struct ProviderEntry {
+    configured: Configured,
+    unavailable_since: Option<Instant>,
+}
+
+fn configured() -> &'static RwLock<HashMap<Provider, ProviderEntry>> {
+    static MAP: OnceLock<RwLock<HashMap<Provider, ProviderEntry>>> = OnceLock::new();
     MAP.get_or_init(Default::default)
+}
+
+/// Whether a usable secret exists per provider, tracked independently of the
+/// resolver entry — a secret stored before its client ID still counts (the
+/// entry is dropped when the id is empty, but the flag and Clear button
+/// should not vanish).
+fn secret_presence() -> &'static RwLock<HashMap<Provider, bool>> {
+    static MAP: OnceLock<RwLock<HashMap<Provider, bool>>> = OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+
+/// How long an `Unavailable` outcome suppresses re-probes. Long enough that
+/// a persistently broken keyring is not hit on every token refresh, short
+/// enough that an unlocked keychain recovers without an app restart.
+const DEFAULT_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+fn reprobe_interval_cell() -> &'static RwLock<Duration> {
+    static INTERVAL: OnceLock<RwLock<Duration>> = OnceLock::new();
+    INTERVAL.get_or_init(|| RwLock::new(DEFAULT_REPROBE_INTERVAL))
+}
+
+/// Override the `Unavailable` re-probe interval (test support).
+pub fn set_reprobe_interval(interval: Duration) {
+    *reprobe_interval_cell().write().unwrap() = interval;
+}
+
+/// One re-probe at a time per provider; waiters re-check before probing.
+fn reprobe_lock(provider: Provider) -> &'static tokio::sync::Mutex<()> {
+    static GMAIL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static MS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static OTHER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    match provider {
+        Provider::Gmail => &GMAIL,
+        Provider::Microsoft => &MS,
+        Provider::Imap => &OTHER,
+    }
+}
+
+fn mark_presence(provider: Provider, c: &Configured) {
+    let present = matches!(c.secret, SecretState::Value(_)) || c.legacy.is_some();
+    secret_presence().write().unwrap().insert(provider, present);
 }
 
 pub fn set_configured(
@@ -112,20 +181,29 @@ pub fn set_configured(
     legacy: Option<&str>,
     secret: SecretState,
 ) {
+    let entry = Configured {
+        id: client_id.trim().to_string(),
+        legacy: legacy
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        secret,
+    };
     let mut map = configured().write().unwrap();
-    let id = client_id.trim();
-    if id.is_empty() {
+    if entry.id.is_empty() {
+        // Drop the resolver entry but leave the presence flag: a secret
+        // stored before its client ID still exists in the keyring.
         map.remove(&provider);
     } else {
+        mark_presence(provider, &entry);
         map.insert(
             provider,
-            Configured {
-                id: id.to_string(),
-                legacy: legacy
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string),
-                secret,
+            ProviderEntry {
+                // A fresh Unavailable was just probed by the caller — the
+                // rate limit starts now.
+                unavailable_since: matches!(entry.secret, SecretState::Unavailable)
+                    .then(Instant::now),
+                configured: entry,
             },
         );
     }
@@ -137,7 +215,15 @@ pub fn cached_secret_state(provider: Provider) -> Option<SecretState> {
         .read()
         .unwrap()
         .get(&provider)
-        .map(|c| c.secret.clone())
+        .map(|e| e.configured.secret.clone())
+}
+
+/// Drop every cached entry and presence flag (test support — the cache is a
+/// process-global because `TokenProvider` and the flow code resolve without
+/// a `Core` instance).
+pub fn reset_provider_config() {
+    configured().write().unwrap().clear();
+    secret_presence().write().unwrap().clear();
 }
 
 /// Read `provider`'s client secret from the keyring once, distinguishing a
@@ -157,31 +243,104 @@ pub async fn probe_secret(provider: Provider) -> SecretState {
 /// Whether the user has a client secret configured for `provider` — the key
 /// behind the `has*ClientSecret` IPC flags. Reads only the in-memory cache.
 pub fn has_client_secret(provider: Provider) -> bool {
-    configured()
+    secret_presence()
         .read()
         .unwrap()
         .get(&provider)
-        .map(|c| matches!(c.secret, SecretState::Value(_)) || c.legacy.is_some())
+        .copied()
         .unwrap_or(false)
+}
+
+/// Record the presence flag directly — used by `set_oauth_client_secret`,
+/// which always knows the truth even when the provider has no client ID yet
+/// (and so has no resolver entry for `apply` to update the flag through).
+pub fn set_secret_presence(provider: Provider, present: bool) {
+    secret_presence().write().unwrap().insert(provider, present);
+}
+
+/// The cached state is `Unavailable` and the rate limit allows a re-probe.
+fn unavailable_due(provider: Provider) -> bool {
+    let map = configured().read().unwrap();
+    match map.get(&provider) {
+        Some(e) if matches!(e.configured.secret, SecretState::Unavailable) => e
+            .unavailable_since
+            .map(|t| t.elapsed() >= *reprobe_interval_cell().read().unwrap())
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
+/// Heal an `Unavailable` cache entry: re-probe the keyring (via the blocking
+/// credential API, never on the runtime's threads), at most once per
+/// interval and single-flight per provider. If the store now answers empty
+/// while a legacy row copy is still cached, the pending migration completes
+/// right here — the row key itself is stripped by the next
+/// `migrate_oauth_client_secrets` pass.
+async fn reprobe_unavailable(provider: Provider) {
+    let _permit = reprobe_lock(provider).lock().await;
+    // A waiter may have healed the entry while we queued for the lock.
+    if !unavailable_due(provider) {
+        return;
+    }
+    if let Some(e) = configured().write().unwrap().get_mut(&provider) {
+        e.unavailable_since = Some(Instant::now());
+    }
+    let mut state = probe_secret(provider).await;
+    let mut migrated_legacy = false;
+    if matches!(state, SecretState::Unset) {
+        let pending = configured()
+            .read()
+            .unwrap()
+            .get(&provider)
+            .and_then(|e| e.configured.legacy.clone());
+        if let (Some(value), Some(slot)) = (pending, client_secret_slot(provider)) {
+            let verified = credentials::store_async(0, slot, value.clone())
+                .await
+                .is_ok()
+                && matches!(
+                    credentials::try_load_async(0, slot).await,
+                    Ok(Some(back)) if back == value
+                );
+            if verified {
+                state = SecretState::Value(value);
+                migrated_legacy = true;
+            }
+        }
+    }
+    if let Some(e) = configured().write().unwrap().get_mut(&provider) {
+        e.configured.secret = state.clone();
+        if migrated_legacy {
+            e.configured.legacy = None;
+        }
+        if !matches!(state, SecretState::Unavailable) {
+            e.unavailable_since = None;
+        }
+        let c = e.configured.clone();
+        mark_presence(provider, &c);
+    }
 }
 
 /// (client_id, client_secret) for an OAuth provider: env vars first, then
 /// the client id configured in Settings with the secret served from the
-/// in-memory cache the migration/`set_oauth_client_secret` maintain — token
-/// grants never read the keyring. A keyring probe failure (`Unavailable`)
-/// falls back to a not-yet-migrated inline copy, or fails as a transient
-/// `Keyring` error that sync treats as retryable — never `needs_reauth`.
-pub fn resolve_credentials(provider: Provider) -> Result<(String, Option<String>)> {
+/// in-memory cache the migration/`set_oauth_client_secret` maintain. A stale
+/// `Unavailable` is re-probed (rate-limited, single-flight) so an unlocked
+/// keychain recovers without a restart; while still down it falls back to a
+/// not-yet-migrated inline copy, or fails as a transient `Keyring` error
+/// that sync treats as retryable — never `needs_reauth`.
+pub async fn resolve_credentials(provider: Provider) -> Result<(String, Option<String>)> {
     let cfg = for_provider(provider)
         .ok_or_else(|| CoreError::Auth("provider does not use oauth".into()))?;
     if let Ok(id) = std::env::var(cfg.client_id_env) {
         return Ok((id, std::env::var(cfg.client_secret_env).ok()));
     }
+    if unavailable_due(provider) {
+        reprobe_unavailable(provider).await;
+    }
     let c = configured()
         .read()
         .unwrap()
         .get(&provider)
-        .cloned()
+        .map(|e| e.configured.clone())
         .ok_or_else(|| {
             CoreError::Auth(format!(
                 "no OAuth app configured for {}: add a client ID in Settings → Accounts, or set {}",
@@ -206,10 +365,10 @@ pub fn resolve_credentials(provider: Provider) -> Result<(String, Option<String>
 mod tests {
     use super::*;
 
-    #[test]
-    fn resolve_uses_configured_values_and_clears() {
+    #[tokio::test]
+    async fn resolve_uses_configured_values_and_clears() {
         set_configured(Provider::Microsoft, "  ms-id  ", None, SecretState::Unset);
-        let (id, secret) = resolve_credentials(Provider::Microsoft).unwrap();
+        let (id, secret) = resolve_credentials(Provider::Microsoft).await.unwrap();
         assert_eq!(id, "ms-id");
         assert_eq!(secret, None);
 
@@ -221,7 +380,7 @@ mod tests {
             SecretState::Value("new".into()),
         );
         assert_eq!(
-            resolve_credentials(Provider::Microsoft).unwrap().1,
+            resolve_credentials(Provider::Microsoft).await.unwrap().1,
             Some("new".into())
         );
 
@@ -233,7 +392,7 @@ mod tests {
             SecretState::Unset,
         );
         assert_eq!(
-            resolve_credentials(Provider::Microsoft).unwrap().1,
+            resolve_credentials(Provider::Microsoft).await.unwrap().1,
             Some("s3cret".into())
         );
 
@@ -246,12 +405,14 @@ mod tests {
             SecretState::Unavailable,
         );
         assert_eq!(
-            resolve_credentials(Provider::Microsoft).unwrap().1,
+            resolve_credentials(Provider::Microsoft).await.unwrap().1,
             Some("s3cret".into())
         );
         set_configured(Provider::Microsoft, "ms-id", None, SecretState::Unavailable);
+        // A fresh Unavailable is rate-limited from re-probing immediately, so
+        // this deterministically errors without touching the keyring.
         assert!(matches!(
-            resolve_credentials(Provider::Microsoft),
+            resolve_credentials(Provider::Microsoft).await,
             Err(CoreError::Keyring(_))
         ));
 
@@ -262,16 +423,17 @@ mod tests {
             Some("whatever"),
             SecretState::Unset,
         );
-        assert!(resolve_credentials(Provider::Microsoft).is_err());
+        assert!(resolve_credentials(Provider::Microsoft).await.is_err());
     }
 
-    #[test]
-    fn resolve_rejects_non_oauth_provider() {
-        assert!(resolve_credentials(Provider::Imap).is_err());
+    #[tokio::test]
+    async fn resolve_rejects_non_oauth_provider() {
+        assert!(resolve_credentials(Provider::Imap).await.is_err());
     }
 
     #[test]
     fn has_secret_flag_matches_cache() {
+        reset_provider_config();
         set_configured(Provider::Gmail, "g-id", None, SecretState::Unset);
         assert!(!has_client_secret(Provider::Gmail));
         set_configured(Provider::Gmail, "g-id", Some("pending"), SecretState::Unset);
@@ -283,7 +445,25 @@ mod tests {
             SecretState::Value("s".into()),
         );
         assert!(has_client_secret(Provider::Gmail));
-        set_configured(Provider::Gmail, "", None, SecretState::Unset);
+        // A secret stored before its client ID still reports "stored": an
+        // empty id drops the resolver entry but leaves the flag.
+        set_configured(Provider::Gmail, "", None, SecretState::Value("s".into()));
+        assert!(has_client_secret(Provider::Gmail));
+        // Clearing goes through set_oauth_client_secret, which flags it.
+        set_secret_presence(Provider::Gmail, false);
         assert!(!has_client_secret(Provider::Gmail));
+    }
+
+    #[test]
+    fn debug_does_not_leak_secrets() {
+        let c = Configured {
+            id: "id".into(),
+            legacy: Some("legacy-secret".into()),
+            secret: SecretState::Value("live-secret".into()),
+        };
+        let out = format!("{c:?} {:?}", c.secret);
+        assert!(out.contains("***"));
+        assert!(!out.contains("legacy-secret"));
+        assert!(!out.contains("live-secret"));
     }
 }
