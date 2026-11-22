@@ -332,11 +332,60 @@ pub struct ActionResult {
     pub action_ids: Vec<i64>,
 }
 
+/// How a draft attachment reaches the staging area. The webview can never
+/// name a source path: a compromised renderer with path-passing ability
+/// could attach (and then send) any readable local file. Every variant
+/// therefore refers to something Rust has authority over.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum DraftAttachmentIn {
+    /// A file the user approved through a trusted Rust path - the native
+    /// file dialog, an OS drop exchanged via `claim_dropped_attachments`, or
+    /// a forward source resolved by `prepare_forward_attachment`. The token
+    /// is opaque, single-use-on-commit and expires (see `approval.rs`); the
+    /// staged copy is taken at save time.
+    Token { token: String },
+    /// A file already staged under the staging root that THIS draft already
+    /// references - the shape `get_draft` and `save_draft` return, echoed
+    /// back on re-save - or a staged file this same composer session
+    /// produced earlier (draft-recreated adoption). `filename` is echoed for
+    /// display only; the persisted name comes from the draft's existing row.
+    Staged { file_path: String, filename: String },
+}
+
+/// A user-approved attachment source: what `pick_draft_attachments`,
+/// `claim_dropped_attachments` and `prepare_forward_attachment` return.
+/// `token` is the only part `save_draft` can consume; the rest is display
+/// metadata for the attachment chip. No source path ever crosses to the
+/// webview - `source` is an opaque session alias for dedupe only.
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DraftAttachmentIn {
-    pub file_path: String,
+pub struct ApprovedAttachment {
+    pub token: String,
     pub filename: String,
+    /// Opaque per-source-file alias, stable within the session: two
+    /// approvals of the same canonical file share it. Dedupe only.
+    pub source: String,
+    pub size: u64,
+    pub mime_type: Option<String>,
+}
+
+/// What `claim_dropped_attachments` returns: tokens for the usable files the
+/// OS dropped, plus the observed-but-unusable entries (a folder, a file that
+/// vanished) the UI should surface rather than silently drop.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropClaim {
+    pub approved: Vec<ApprovedAttachment>,
+    pub skipped: Vec<SkippedDrop>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedDrop {
+    /// The path as reported by the OS drop event (never used for staging).
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +405,36 @@ pub struct SaveDraftArgs {
     pub in_reply_to_message_id: Option<i64>,
     #[serde(default)]
     pub attachments: Vec<DraftAttachmentIn>,
+    /// The composer session nonce the attachment tokens were minted for.
+    /// Internal saves (calendar invites, MCP drafts) leave it `None`, which
+    /// also matches nonce-less internal approvals.
+    #[serde(default)]
+    pub composer_nonce: Option<String>,
+}
+
+/// The persisted outcome of ONE `save_draft` attachment entry, in request
+/// order. `staged` is the ref the composer echoes on re-save (a one-shot
+/// `Token` entry must never be replayed); `refused` means the entry was
+/// rejected per-entry (e.g. over the per-draft size limit) while the rest
+/// of the draft saved - the composer marks that chip failed and leaves it
+/// out of the wire on the next save.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SavedAttachment {
+    #[serde(rename = "staged")]
+    Staged { file_path: String, filename: String },
+    #[serde(rename = "refused")]
+    Refused { reason: String },
+}
+
+/// What `save_draft` returns: the draft id plus one `SavedAttachment` per
+/// request entry, aligned by index - request order IS the mapping, so the
+/// composer zips them onto the chips the request was built from.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveDraftResult {
+    pub draft_id: i64,
+    pub attachments: Vec<SavedAttachment>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -363,6 +442,12 @@ pub struct SaveDraftArgs {
 pub struct QueueSendArgs {
     pub draft_id: i64,
     pub send_at: Option<i64>,
+    /// The staged paths the composer believes this draft holds. Optional
+    /// backstop: when present, queueing is refused if the draft's
+    /// `draft_attachments` rows differ - the draft that goes out must be the
+    /// one the composer shows. Internal callers (MCP) leave it unset.
+    #[serde(default)]
+    pub expected_attachments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

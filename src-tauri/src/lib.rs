@@ -423,6 +423,18 @@ pub fn run() {
                 }
             }
         })
+        // Register OS file drops on the Rust side. This is what makes a drop a
+        // real user gesture: the webview's own drag/drop events still fire
+        // (this listener is additive - the built-in emission runs first), but
+        // `claim_dropped_attachments` only mints tokens for paths observed
+        // here, so the webview can't nominate files it claims were dropped.
+        .on_webview_event(|webview, event| {
+            if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                if let Some(state) = webview.try_state::<AppState>() {
+                    state.core.record_os_drop(paths);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::ui_ready,
             commands::cinema_close,
@@ -450,6 +462,9 @@ pub fn run() {
             commands::undo_last,
             commands::cancel_send,
             commands::send_now,
+            commands::pick_draft_attachments,
+            commands::claim_dropped_attachments,
+            commands::prepare_forward_attachment,
             commands::save_draft,
             commands::get_draft,
             commands::delete_draft,

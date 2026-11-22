@@ -4,6 +4,7 @@
 pub mod accounts;
 pub mod addr;
 pub mod ai;
+pub mod approval;
 pub mod autolabel;
 pub mod avatars;
 pub mod caldav;
@@ -242,6 +243,10 @@ pub struct Core {
     /// Serializes AI routing passes so the background router and an inline
     /// re-sort never classify the same 'pending' threads twice.
     ai_router_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Session registry of user-approved local files attachable to drafts
+    /// (see `approval`). Only trusted Rust paths mint approvals; `save_draft`
+    /// consumes their tokens.
+    approvals: Arc<approval::AttachmentApprovals>,
     /// Local MCP server for AI clients (see `mcp`).
     mcp: Arc<mcp::McpManager>,
 }
@@ -272,6 +277,7 @@ impl Core {
             oauth_cancel: Arc::new(tokio::sync::Notify::new()),
             ui_ready: Arc::new(tokio::sync::Notify::new()),
             ai_router_lock: Arc::new(tokio::sync::Mutex::new(())),
+            approvals: Arc::new(approval::AttachmentApprovals::default()),
             mcp: Arc::new(mcp::McpManager::default()),
         };
 
@@ -1593,36 +1599,342 @@ impl Core {
 
     // ---------- compose ----------
 
-    pub async fn save_draft(&self, args: SaveDraftArgs) -> Result<i64> {
+    /// Mint approval tokens for local files a trusted Rust path approved -
+    /// the native file dialog (`pick_draft_attachments`) or internal code
+    /// that generated the file itself (e.g. a calendar invite). The webview
+    /// cannot call this: there is no command that takes a path to approve.
+    /// `nonce` binds the tokens to the composer session that asked.
+    pub fn approve_attachment_sources(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+        nonce: Option<String>,
+    ) -> Result<Vec<ApprovedAttachment>> {
+        self.approvals.approve(paths, nonce)
+    }
+
+    /// [`approve_attachment_sources`] bounded by the caller's draft totals:
+    /// candidates that would push the draft past its attachment limits are
+    /// not minted and come back as `skipped` (display name + reason).
+    pub fn approve_attachment_sources_bounded(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+        nonce: Option<String>,
+        current_count: usize,
+        current_bytes: u64,
+    ) -> Result<(Vec<ApprovedAttachment>, Vec<SkippedDrop>)> {
+        let mut budget = approval::AttachmentBudget {
+            count: current_count,
+            bytes: current_bytes,
+        };
+        self.approvals.approve_budgeted(paths, nonce, &mut budget)
+    }
+
+    /// Record paths the OS reports as dropped on a window. Called from the
+    /// Rust webview-event handler only; this is what turns a drop into a
+    /// real user gesture the webview can then exchange via
+    /// `claim_dropped_attachments`.
+    pub fn record_os_drop(&self, paths: &[std::path::PathBuf]) {
+        self.approvals.record_drop(paths);
+    }
+
+    /// Exchange OS-observed drop paths for approval tokens. Every path must
+    /// be one the Rust drop handler already saw; observed-but-unusable
+    /// entries and ones that would exceed the draft's attachment limits
+    /// come back in `skipped` so the UI can report them.
+    pub fn claim_dropped_attachments(
+        &self,
+        paths: &[String],
+        nonce: Option<String>,
+        current_count: usize,
+        current_bytes: u64,
+    ) -> Result<crate::models::DropClaim> {
+        let mut budget = approval::AttachmentBudget {
+            count: current_count,
+            bytes: current_bytes,
+        };
+        self.approvals.claim_drops(paths, nonce, Some(&mut budget))
+    }
+
+    /// Resolve a received attachment to an approval token so a forward can
+    /// carry it: the bytes come from the app's own attachment cache via
+    /// `get_attachment` (downloading over IMAP if needed) - done here,
+    /// outside `save_draft`, so a failing download fails just this chip,
+    /// never the whole draft save. The token stages the copy under the
+    /// original attachment's filename, not the cache file's.
+    /// `current_count`/`current_bytes` are the draft's present attachment
+    /// totals (composer-supplied, advisory): a prepared file that would
+    /// exceed the per-draft bounds is refused here rather than at save.
+    pub async fn prepare_forward_attachment(
+        &self,
+        attachment_id: i64,
+        nonce: Option<String>,
+        current_count: usize,
+        current_bytes: u64,
+    ) -> Result<ApprovedAttachment> {
+        let (raw_name, mime_type) = self
+            .db
+            .read(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT filename, mime_type FROM attachments WHERE id = ?1",
+                        rusqlite::params![attachment_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, Option<String>>(0)?,
+                                r.get::<_, Option<String>>(1)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                row.ok_or_else(|| CoreError::NotFound("attachment".into()))
+            })
+            .await?;
+        let mut filename = raw_name
+            .map(|n| display_filename(&crate::mime::decode_encoded_words(&n)))
+            .unwrap_or_else(|| format!("attachment-{attachment_id}"));
+        // Body parts may carry no filename; give the staged copy the same
+        // extension fix `get_attachment` applies (an invite becomes *.ics,
+        // not a bare name).
+        if std::path::Path::new(&filename).extension().is_none()
+            && let Some(ext) = mime_type.as_deref().and_then(ext_for_mime)
+        {
+            filename.push('.');
+            filename.push_str(ext);
+        }
+        let cached = self.get_attachment(attachment_id).await?;
+        // Bound the bytes a session can queue as unconsumed forwards so a
+        // prepare->save loop cannot grow disk usage without bound, and
+        // refuse early when the file would exceed the per-draft limits.
+        let size = std::fs::metadata(&cached).map(|m| m.len()).unwrap_or(0);
+        if self.approvals.pending_bytes(&nonce).saturating_add(size) > MAX_SESSION_PREPARED_BYTES {
+            return Err(CoreError::ActionRejected(format!(
+                "attachment {filename}: prepared forwards pending for this draft exceed {} MB",
+                MAX_SESSION_PREPARED_BYTES / (1024 * 1024)
+            )));
+        }
+        if !(approval::AttachmentBudget {
+            count: current_count,
+            bytes: current_bytes,
+        })
+        .room_for(size)
+        {
+            return Err(CoreError::ActionRejected(format!(
+                "attachment {filename}: {}",
+                approval::AttachmentBudget::over_limit_reason()
+            )));
+        }
+        self.approvals
+            .approve_named(std::path::PathBuf::from(&cached), &filename, nonce)
+    }
+
+    /// The session approval registry (integration tests drive it directly).
+    #[doc(hidden)]
+    pub fn attachment_approvals(&self) -> &approval::AttachmentApprovals {
+        &self.approvals
+    }
+
+    /// Resolve one `save_draft` attachment entry. `owned` maps this draft's
+    /// existing canonical staged paths to their stored display names;
+    /// `budget` counts what the draft will hold after this save - `Staged`
+    /// entries always join it (they are already the draft's content), while
+    /// a `Token` that would exceed the per-draft bounds is refused
+    /// per-entry instead of failing the whole save. A resolved `Token` is
+    /// checked out here and tracked on `tokens`, so a failed save rolls the
+    /// checkout back.
+    async fn resolve_draft_attachment(
+        &self,
+        staging_root: &std::path::Path,
+        att: &DraftAttachmentIn,
+        draft_id: Option<i64>,
+        owned: &HashMap<String, String>,
+        nonce: &Option<String>,
+        tokens: &mut approval::TokenGuard<'_>,
+        budget: &mut approval::AttachmentBudget,
+    ) -> Result<ResolvedAttachment> {
+        match att {
+            DraftAttachmentIn::Token { token } => {
+                let approval = self.approvals.checkout(token, nonce)?;
+                // Per-entry bound check BEFORE the copy: a file that would
+                // push the draft over its limits is refused, the checkout
+                // rolls straight back, and the rest of the draft saves.
+                let size = tokio::fs::metadata(&approval.canonical_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(approval.size);
+                if !budget.room_for(size) {
+                    self.approvals.rollback(std::slice::from_ref(token));
+                    return Ok(ResolvedAttachment::Refused {
+                        reason: format!(
+                            "attachment {}: {}",
+                            approval.filename,
+                            approval::AttachmentBudget::over_limit_reason()
+                        ),
+                    });
+                }
+                tokens.track(token);
+                let staged = stage_approved_attachment(staging_root, &approval).await?;
+                budget.consume(size);
+                tokens.track_fresh(std::path::PathBuf::from(&staged.path));
+                Ok(ResolvedAttachment::Staged(staged))
+            }
+            DraftAttachmentIn::Staged {
+                file_path,
+                filename,
+            } => {
+                // A staged path is only valid echoed back for a draft that
+                // already references it, or adopted by the composer session
+                // that produced it (draft deleted and recreated). Binding
+                // the claim this way means a staged path can never be
+                // claimed by guessing it, and a path outside staging is
+                // refused outright.
+                let canon = tokio::fs::canonicalize(file_path)
+                    .await
+                    .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
+                if !canon.starts_with(staging_root) {
+                    return Err(CoreError::ActionRejected(format!(
+                        "attachment {filename}: not an approved attachment source"
+                    )));
+                }
+                let canon_str = canon.to_string_lossy().into_owned();
+                // Existing staged content counts toward the draft's totals
+                // (a new token entry must fit around it) but is never itself
+                // refused: a draft already over the limits from before this
+                // change stays savable - only ADDING is refused.
+                let size = tokio::fs::metadata(&canon)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let resolved = if draft_id.is_some() {
+                    match owned.get(&canon_str) {
+                        Some(name) => Ok(ResolvedAttachment::Staged(StagedAttachment {
+                            path: canon_str,
+                            filename: name.clone(),
+                        })),
+                        None => Err(CoreError::ActionRejected(format!(
+                            "attachment {filename}: does not belong to this draft"
+                        ))),
+                    }
+                } else if self.approvals.produced_by(&canon, nonce)
+                    && !self.staged_path_referenced(&canon_str).await?
+                {
+                    // Same-session adoption: this composer session produced
+                    // the staged copy for a draft that no longer exists, so
+                    // the recreated draft may keep it rather than restage.
+                    // The DB check is the real guard: produced is a session
+                    // cache, but adoption may only take a file no live
+                    // draft references - a staged file is owned by at most
+                    // one draft at a time.
+                    Ok(ResolvedAttachment::Staged(StagedAttachment {
+                        path: canon_str,
+                        filename: display_filename(filename),
+                    }))
+                } else {
+                    Err(CoreError::ActionRejected(format!(
+                        "attachment {filename}: only files already attached to this draft may be re-used"
+                    )))
+                }?;
+                budget.consume(size);
+                Ok(resolved)
+            }
+        }
+    }
+
+    /// Whether ANY `draft_attachments` row (any draft) references this
+    /// canonical staged path. Enforces the invariant every cleanup path
+    /// assumes: a staged file is referenced by at most one draft.
+    async fn staged_path_referenced(&self, canon_str: &str) -> Result<bool> {
+        let canon_str = canon_str.to_string();
+        self.db
+            .read(move |conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM draft_attachments WHERE file_path = ?1",
+                    rusqlite::params![canon_str],
+                    |r| r.get(0),
+                )?;
+                Ok(count > 0)
+            })
+            .await
+    }
+
+    pub async fn save_draft(&self, args: SaveDraftArgs) -> Result<SaveDraftResult> {
         // Stage every attachment into an app-managed dir up front, so the paths
         // persisted to `draft_attachments` (and later read at dispatch) are
         // always files the app itself copied - never an arbitrary path handed
         // in by the frontend. Snapshotting here also fixes the sent bytes at
         // compose time rather than whatever the source file becomes later.
         let staging_root = self.paths.draft_attachments_dir();
-        let mut staged: Vec<crate::models::DraftAttachmentIn> =
+        tokio::fs::create_dir_all(&staging_root).await?;
+        let staging_root = tokio::fs::canonicalize(&staging_root).await?;
+        // Canonical staged paths this draft already owns -> stored display
+        // name. `Staged` claims bind to this map; anything else must arrive
+        // as a Token or a Forward reference.
+        let owned: HashMap<String, String> = match args.draft_id {
+            Some(draft_id) => {
+                self.db
+                    .read(move |conn| {
+                        let mut stmt = conn.prepare(
+                            "SELECT file_path, filename FROM draft_attachments WHERE draft_id = ?1",
+                        )?;
+                        let rows = stmt
+                            .query_map(rusqlite::params![draft_id], |r| {
+                                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        Ok(rows
+                            .into_iter()
+                            .map(|(p, name)| {
+                                (
+                                    std::path::PathBuf::from(&p)
+                                        .canonicalize()
+                                        .map(|c| c.to_string_lossy().into_owned())
+                                        .unwrap_or(p),
+                                    name,
+                                )
+                            })
+                            .collect())
+                    })
+                    .await?
+            }
+            None => HashMap::new(),
+        };
+        let mut staged: Vec<StagedAttachment> = Vec::with_capacity(args.attachments.len());
+        // Per-request-entry outcomes (staged ref or per-entry refusal),
+        // aligned by index - request order IS the mapping back to chips.
+        let mut saved_attachments: Vec<SavedAttachment> =
             Vec::with_capacity(args.attachments.len());
-        // Copies this call created; removed if the save is rejected (they are
-        // referenced by nothing until the transaction commits).
-        let mut fresh_paths: Vec<String> = Vec::new();
+        // What the draft will hold once this save commits; starts empty and
+        // each accepted entry contributes its count/bytes.
+        let mut budget = approval::AttachmentBudget { count: 0, bytes: 0 };
+        // Tokens checked out and staged copies written so far: consumed on
+        // commit; the guard's drop rolls tokens back AND deletes the copies
+        // on any failure, abort or dropped future.
+        let mut tokens = approval::TokenGuard::new(&self.approvals, staging_root.clone());
         for att in &args.attachments {
-            match stage_draft_attachment(&staging_root, &att.file_path, &att.filename).await {
-                Ok(staged_file) => {
-                    if staged_file.fresh {
-                        fresh_paths.push(staged_file.path.clone());
-                    }
-                    staged.push(crate::models::DraftAttachmentIn {
-                        file_path: staged_file.path,
-                        filename: att.filename.clone(),
+            match self
+                .resolve_draft_attachment(
+                    &staging_root,
+                    att,
+                    args.draft_id,
+                    &owned,
+                    &args.composer_nonce,
+                    &mut tokens,
+                    &mut budget,
+                )
+                .await?
+            {
+                ResolvedAttachment::Staged(staged_file) => {
+                    saved_attachments.push(SavedAttachment::Staged {
+                        file_path: staged_file.path.clone(),
+                        filename: staged_file.filename.clone(),
                     });
+                    staged.push(staged_file);
                 }
-                Err(e) => {
-                    remove_staged_draft_files(&staging_root, &fresh_paths).await;
-                    return Err(e);
+                ResolvedAttachment::Refused { reason } => {
+                    saved_attachments.push(SavedAttachment::Refused { reason });
                 }
             }
         }
-        let new_paths: HashSet<String> = staged.iter().map(|a| a.file_path.clone()).collect();
+        let new_paths: HashSet<String> = staged.iter().map(|a| a.path.clone()).collect();
         let result = self
             .db
             .write(move |conn| {
@@ -1742,9 +2054,24 @@ impl Core {
                     rusqlite::params![draft_id],
                 )?;
                 for att in &staged {
+                    // A staged file may be referenced by at most one draft:
+                    // every cleanup path deletes files the saving draft
+                    // stops referencing, so sharing one staged path would
+                    // silently break whichever draft is re-saved first.
+                    let shared: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM draft_attachments WHERE file_path = ?1 AND draft_id != ?2",
+                        rusqlite::params![att.path, draft_id],
+                        |r| r.get(0),
+                    )?;
+                    if shared > 0 {
+                        return Err(CoreError::ActionRejected(format!(
+                            "attachment {}: already attached to another draft",
+                            att.filename
+                        )));
+                    }
                     tx.execute(
                         "INSERT INTO draft_attachments (draft_id, file_path, filename) VALUES (?1,?2,?3)",
-                        rusqlite::params![draft_id, att.file_path, att.filename],
+                        rusqlite::params![draft_id, att.path, att.filename],
                     )?;
                 }
                 tx.execute(
@@ -1760,14 +2087,16 @@ impl Core {
                 Ok((draft_id, thread_id, old_paths))
             })
             .await;
-        let (draft_id, thread_id, old_paths) = match result {
-            Ok(v) => v,
-            Err(e) => {
-                // Rejected save: the freshly staged copies belong to no draft.
-                remove_staged_draft_files(&staging_root, &fresh_paths).await;
-                return Err(e);
-            }
-        };
+        let (draft_id, thread_id, old_paths) = result?;
+        // Committed: the tokens are spent for real now, and the staged
+        // paths this save freshly created are recorded against this
+        // composer session so a deleted-and-recreated draft can adopt them
+        // later. Only fresh copies count - recording echoed `Staged` refs
+        // would let a save "produce" (and later adopt) a file another live
+        // draft already owns.
+        let fresh_paths = tokens.commit();
+        self.approvals
+            .record_produced(&fresh_paths, &args.composer_nonce);
         // Committed: drop staged files the draft no longer references (e.g. an
         // attachment removed between saves). Old paths come from the DB and
         // may not be canonical (staging canonicalises on the way in), so the
@@ -1789,7 +2118,10 @@ impl Core {
                 thread_ids: vec![thread_id],
             });
         }
-        Ok(draft_id)
+        Ok(SaveDraftResult {
+            draft_id,
+            attachments: saved_attachments,
+        })
     }
 
     /// Load the complete editable state for a saved draft. Message detail omits
@@ -1827,6 +2159,7 @@ impl Core {
                                     mode: row.get(7)?,
                                     in_reply_to_message_id: row.get(8)?,
                                     attachments: Vec::new(),
+                                    composer_nonce: None,
                                 },
                                 is_draft,
                             ))
@@ -1844,7 +2177,7 @@ impl Core {
                 )?;
                 draft.0.attachments = stmt
                     .query_map(rusqlite::params![draft_id], |row| {
-                        Ok(crate::models::DraftAttachmentIn {
+                        Ok(crate::models::DraftAttachmentIn::Staged {
                             file_path: row.get(0)?,
                             filename: row.get(1)?,
                         })
@@ -1998,11 +2331,41 @@ impl Core {
             .unwrap_or_else(|| now_ms() + settings.undo_send_seconds * 1000);
 
         let draft_id = args.draft_id;
+        let expected = args.expected_attachments;
         let (action_id, account_id) = self
             .db
             .write(move |conn| {
                 let row = repo::messages::get_row(conn, draft_id)?
                     .ok_or_else(|| CoreError::NotFound("draft".into()))?;
+                // Backstop for the composer's send gate: when the caller
+                // states which staged files it believes the draft holds,
+                // refuse to queue a draft whose real rows differ - the mail
+                // that goes out must be the one the composer showed.
+                if let Some(expected) = &expected {
+                    let mut actual: Vec<String> = {
+                        let mut stmt = conn.prepare(
+                            "SELECT file_path FROM draft_attachments WHERE draft_id = ?1",
+                        )?;
+                        stmt.query_map(rusqlite::params![draft_id], |r| {
+                            r.get::<_, String>(0)
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    let canon = |p: &String| {
+                        std::fs::canonicalize(p)
+                            .map(|c| c.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| p.clone())
+                    };
+                    actual = actual.iter().map(canon).collect();
+                    let mut want: Vec<String> = expected.iter().map(canon).collect();
+                    actual.sort();
+                    want.sort();
+                    if actual != want {
+                        return Err(CoreError::ActionRejected(
+                            "the draft's attachments changed since it was last saved; save again and retry".into(),
+                        ));
+                    }
+                }
                 let payload = serde_json::json!({ "draftId": draft_id });
                 let aid = repo::actions::enqueue(
                     conn,
@@ -3377,12 +3740,36 @@ impl Core {
         body_text: String,
         ics: &str,
     ) -> Result<()> {
-        let tmp_dir = self.paths.data_dir.join("tmp");
+        // A unique temp DIR keeps the name recipients see `invite.ics`
+        // without clobbering a sibling call's file.
+        let tmp_dir = self
+            .paths
+            .data_dir
+            .join("tmp")
+            .join(crate::mime::rand_token());
         tokio::fs::create_dir_all(&tmp_dir).await?;
-        let tmp_path = tmp_dir.join(format!("invite-{}.ics", crate::mime::rand_token()));
-        tokio::fs::write(&tmp_path, ics.as_bytes()).await?;
+        let tmp_path = tmp_dir.join("invite.ics");
+        let cleanup = async |_: ()| {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            let _ = tokio::fs::remove_dir(&tmp_dir).await;
+        };
+        if let Err(e) = tokio::fs::write(&tmp_path, ics.as_bytes()).await {
+            cleanup(()).await;
+            return Err(e.into());
+        }
 
-        let draft_id = self
+        // The invite is Rust-generated content, so it gets an approval token
+        // like a picked file; `save_draft` no longer takes raw paths.
+        let token = match self.approve_attachment_sources(vec![tmp_path.clone()], None) {
+            Ok(mut approved) if !approved.is_empty() => approved.remove(0).token,
+            _ => {
+                cleanup(()).await;
+                return Err(CoreError::Other(
+                    "could not approve generated invite".into(),
+                ));
+            }
+        };
+        let saved = self
             .save_draft(SaveDraftArgs {
                 draft_id: None,
                 account_id,
@@ -3394,17 +3781,24 @@ impl Core {
                 body_html: None,
                 mode: "new".into(),
                 in_reply_to_message_id: None,
-                attachments: vec![DraftAttachmentIn {
-                    file_path: tmp_path.to_string_lossy().into_owned(),
-                    filename: "invite.ics".into(),
-                }],
+                attachments: vec![DraftAttachmentIn::Token { token }],
+                composer_nonce: None,
             })
-            .await?;
+            .await;
+        let draft_id = match saved {
+            Ok(result) => result.draft_id,
+            Err(e) => {
+                cleanup(()).await;
+                return Err(e);
+            }
+        };
         // The draft staged its own copy; the temp file can go.
-        let _ = tokio::fs::remove_file(&tmp_path).await;
+        cleanup(()).await;
         self.queue_send(QueueSendArgs {
             draft_id,
             send_at: None,
+
+            expected_attachments: None,
         })
         .await?;
         Ok(())
@@ -6147,51 +6541,89 @@ fn safe_filename(name: &str) -> String {
     }
 }
 
+/// Per-draft attachment bounds, consistent with what mail providers accept
+/// (e.g. ~150 MB total message size): generous for real use, small enough
+/// that a misbehaving caller cannot fill the disk via repeated staging.
+/// Enforced at mint (`pick`/`claim`/`prepare`) as UX guidance and at
+/// `save_draft` per entry as the authoritative check.
+pub(crate) const MAX_DRAFT_ATTACHMENTS: usize = 100;
+pub(crate) const MAX_DRAFT_ATTACHMENT_BYTES: u64 = 150 * 1024 * 1024;
+/// Total source bytes of not-yet-consumed prepared forwards one composer
+/// session may queue. Each staged copy is per-draft capped already; this
+/// caps the in-flight queue so a prepare->save loop cannot grow it.
+const MAX_SESSION_PREPARED_BYTES: u64 = 512 * 1024 * 1024;
+
 /// One file staged into the draft-attachment staging area.
 struct StagedAttachment {
     /// Canonicalised absolute path of the staged copy.
     path: String,
-    /// True when this call created the copy; false when the source was
-    /// already inside the staging root and nothing was written.
-    fresh: bool,
+    /// Display name persisted next to the path.
+    filename: String,
 }
 
-/// Copy a composer-picked file into the app-managed draft-attachment staging
-/// area and return the staged absolute path. A path already inside the staging
-/// root (a reloaded draft round-tripping its own staged path) is returned
-/// unchanged.
+/// The resolution of one `save_draft` request entry: either it became (or
+/// already was) a staged file, or it was refused per-entry with a reason
+/// the caller shows on that chip - a refusal never fails the whole save.
+enum ResolvedAttachment {
+    Staged(StagedAttachment),
+    Refused { reason: String },
+}
+
+/// Copy an already-canonical source file into the app-managed
+/// draft-attachment staging area and return the staged absolute path.
+/// `root` must already be canonicalised.
 ///
-/// What this does and does not guarantee: dispatch only ever reads files
-/// under the staging root, so a `draft_attachments` row cannot point SMTP at
-/// an arbitrary path. But any *readable* path the frontend hands to
-/// `save_draft` is still copied into staging and mailed - picking files is a
-/// user gesture the renderer is trusted with, so this is not a boundary
-/// against a compromised renderer exfiltrating files it can read.
-async fn stage_draft_attachment(
+/// What this guarantees: dispatch only ever reads files under the staging
+/// root, so a `draft_attachments` row cannot point SMTP at an arbitrary
+/// path. Who may reach this function is the security boundary: callers are
+/// `save_draft`'s resolution of approval tokens (user picked/dropped the
+/// file), forward references (bytes from the app's own attachment cache) and
+/// staged-file re-use bound to the owning draft - never a raw path from the
+/// webview.
+async fn stage_copy_into(
     root: &std::path::Path,
-    src: &str,
+    canon_src: &std::path::Path,
     filename: &str,
 ) -> Result<StagedAttachment> {
-    tokio::fs::create_dir_all(root).await?;
-    let root = tokio::fs::canonicalize(root).await?;
-    let canon_src = tokio::fs::canonicalize(src)
-        .await
-        .map_err(|e| CoreError::Other(format!("attachment {filename}: {e}")))?;
-    if canon_src.starts_with(&root) {
-        // Already staged (e.g. re-saving a draft reloaded from the DB).
-        return Ok(StagedAttachment {
-            path: canon_src.to_string_lossy().into_owned(),
-            fresh: false,
-        });
-    }
     let sub = root.join(crate::mime::rand_token());
     tokio::fs::create_dir_all(&sub).await?;
     let dst = sub.join(safe_filename(filename));
-    tokio::fs::copy(&canon_src, &dst).await?;
+    tokio::fs::copy(canon_src, &dst).await?;
     Ok(StagedAttachment {
         path: dst.to_string_lossy().into_owned(),
-        fresh: true,
+        filename: filename.to_string(),
     })
+}
+
+/// Stage a file the user approved through the token registry. Re-validates
+/// at use time: the source must still exist, still canonicalise to the path
+/// recorded at approval (a symlink swapped in after the pick would resolve
+/// elsewhere and must not redirect the copy), and still be a regular file -
+/// directories, devices and FIFOs are refused even though the registry also
+/// skips them at mint time.
+async fn stage_approved_attachment(
+    root: &std::path::Path,
+    approval: &approval::Approval,
+) -> Result<StagedAttachment> {
+    let canon_now = tokio::fs::canonicalize(&approval.canonical_path)
+        .await
+        .map_err(|e| CoreError::Other(format!("attachment {}: {e}", approval.filename)))?;
+    if canon_now != approval.canonical_path {
+        return Err(CoreError::ActionRejected(format!(
+            "attachment {}: the file changed since it was picked",
+            approval.filename
+        )));
+    }
+    let meta = tokio::fs::metadata(&canon_now)
+        .await
+        .map_err(|e| CoreError::Other(format!("attachment {}: {e}", approval.filename)))?;
+    if !meta.file_type().is_file() {
+        return Err(CoreError::ActionRejected(format!(
+            "attachment {}: not a file",
+            approval.filename
+        )));
+    }
+    stage_copy_into(root, &canon_now, &approval.filename).await
 }
 
 /// Delete staged attachment files, but only paths that canonicalise inside
@@ -6795,6 +7227,7 @@ mod ask_scope_tests {
             oauth_cancel: Arc::new(tokio::sync::Notify::new()),
             ui_ready: Arc::new(tokio::sync::Notify::new()),
             ai_router_lock: Arc::new(tokio::sync::Mutex::new(())),
+            approvals: Arc::new(approval::AttachmentApprovals::default()),
             mcp: Arc::new(mcp::McpManager::default()),
         };
         (core, root)

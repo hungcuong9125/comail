@@ -19,12 +19,14 @@
 
 export interface DraftSaverHooks {
   /**
-   * Persist the current field snapshot; resolve with the draft id the
-   * backend returned. Must snapshot the fields synchronously at call time -
-   * the saver captures the change version at the same instant, so the
-   * callback sees exactly what the version covers.
+   * Persist the current field snapshot. Must snapshot the fields
+   * synchronously at call time - the saver captures the change version at
+   * the same instant, so the callback sees exactly what the version covers.
+   * Resolves with the draft id the backend returned AND the exact payload
+   * it sent: the saver remembers it as `savedPayload` so `dirty` can be
+   * answered by comparing the live probe against what was persisted.
    */
-  save: (draftId: number | null) => Promise<number>;
+  save: (draftId: number | null) => Promise<{ id: number; payload: string }>;
   /**
    * After each completed save, but only while the saver is open. `clean` is
    * true when nothing changed since the persisted snapshot.
@@ -37,6 +39,14 @@ export interface DraftSaverHooks {
    * already deleted.
    */
   isDraftGone?: (err: unknown) => boolean;
+  /**
+   * Derives the payload a save would send RIGHT NOW, serialized the same
+   * way `save` returns it. When provided, `dirty` is answered by comparing
+   * this probe with the last persisted payload - the version counter
+   * becomes a fast-path optimisation, not the source of truth, so a change
+   * whose markChanged() was missed still saves.
+   */
+  probe?: () => string;
 }
 
 export class DraftSaver {
@@ -44,6 +54,10 @@ export class DraftSaver {
   private version = 0;
   /** Highest version proven persisted. */
   private savedVersion = 0;
+  /** The exact payload the last successful save sent. Compared against
+   *  `hooks.probe()` to derive dirtiness - the version counter is an
+   *  optimisation, this is the ground truth. */
+  private savedPayload: string | null = null;
   private draftIdValue: number | null;
   /** Serializes drains; never rejects (each `run` promise carries errors). */
   private chain: Promise<unknown> = Promise.resolve();
@@ -64,9 +78,18 @@ export class DraftSaver {
     return this.draftIdValue;
   }
 
-  /** Unpersisted changes exist: drives the unsaved indicator and Esc confirm. */
+  /** Unpersisted changes exist: drives the unsaved indicator and Esc
+   *  confirm. Derived, not remembered: the version counter answers the
+   *  common case fast, and when `probe` is set, the last persisted payload
+   *  is compared against what a save would send now - a change that no
+   *  code path remembered to mark dirty still shows up. */
   get dirty(): boolean {
-    return this.version !== this.savedVersion;
+    if (this.version !== this.savedVersion) return true;
+    return (
+      this.savedPayload !== null &&
+      this.hooks.probe !== undefined &&
+      this.hooks.probe() !== this.savedPayload
+    );
   }
 
   get isClosed(): boolean {
@@ -159,11 +182,20 @@ export class DraftSaver {
   private async drain(): Promise<number | null> {
     // `draftIdValue == null` forces one save even when clean: `flush()` on a
     // never-saved composer still owes the backend a draft to queue/send.
-    while (this.version !== this.savedVersion || this.draftIdValue == null) {
+    // `dirty` (not the raw version check) so a change detected only by the
+    // payload probe still drains.
+    while (this.dirty || this.draftIdValue == null) {
       const v = this.version;
       let id: number;
       try {
-        id = await this.hooks.save(this.draftIdValue);
+        const res = await this.hooks.save(this.draftIdValue);
+        if (typeof res.id !== "number") {
+          // A malformed save result would leave draftIdValue null and spin
+          // this drain forever - fail loudly instead.
+          throw new Error("save returned no draft id");
+        }
+        id = res.id;
+        this.savedPayload = res.payload;
       } catch (err) {
         // The draft disappeared under us (deleted or sent elsewhere): drop
         // the stale id and recreate from the current content. A "gone"
@@ -179,6 +211,16 @@ export class DraftSaver {
       // The snapshot covered version v; edits past it stay dirty and the
       // loop persists them next.
       this.savedVersion = Math.max(this.savedVersion, v);
+      // The version counter is only a fast path: a save's own bookkeeping
+      // (e.g. refs swapped for what the backend persisted) may have bumped
+      // it mid-flight. If the live probe already equals the persisted
+      // payload, nothing is actually unsaved - absorb the bump.
+      if (
+        this.hooks.probe !== undefined &&
+        this.savedPayload === this.hooks.probe()
+      ) {
+        this.savedVersion = this.version;
+      }
       if (!this.closedFlag) {
         this.hooks.onSaved?.(id, !this.dirty);
       }

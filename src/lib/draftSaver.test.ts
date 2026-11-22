@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { DraftSaver } from "./draftSaver";
 
+const ok = (id: number) => ({ id, payload: "" });
+
 function deferred<T>() {
   let resolve!: (v: T) => void;
   let reject!: (e: unknown) => void;
@@ -17,7 +19,7 @@ describe("DraftSaver", () => {
     const saver = new DraftSaver({
       save: async (draftId) => {
         calls.push(draftId);
-        return 7;
+        return ok(7);
       },
     });
     saver.markChanged();
@@ -34,7 +36,7 @@ describe("DraftSaver", () => {
     const saver = new DraftSaver({
       save: (draftId) => {
         calls.push(draftId);
-        return calls.length === 1 ? gate.promise : Promise.resolve(42);
+        return calls.length === 1 ? gate.promise.then(ok) : Promise.resolve(ok(42));
       },
     });
     saver.markChanged();
@@ -54,7 +56,7 @@ describe("DraftSaver", () => {
     const gate = deferred<number>();
     const onSaved = vi.fn();
     const saver = new DraftSaver({
-      save: (draftId) => (draftId === null ? gate.promise : Promise.resolve(9)),
+      save: (draftId) => (draftId === null ? gate.promise.then(ok) : Promise.resolve(ok(9))),
       onSaved,
     });
     saver.markChanged();
@@ -73,7 +75,7 @@ describe("DraftSaver", () => {
   it("discard during an in-flight create still learns the new draft id", async () => {
     const gate = deferred<number>();
     const onSaved = vi.fn();
-    const saver = new DraftSaver({ save: () => gate.promise, onSaved });
+    const saver = new DraftSaver({ save: () => gate.promise.then(ok), onSaved });
     saver.markChanged();
     void saver.saveIfDirty();
     saver.close();
@@ -87,7 +89,7 @@ describe("DraftSaver", () => {
 
   it("reports saves while open and stops after close", async () => {
     const onSaved = vi.fn();
-    const saver = new DraftSaver({ save: async () => 5, onSaved });
+    const saver = new DraftSaver({ save: async () => ok(5), onSaved });
     saver.markChanged();
     await saver.saveIfDirty();
     expect(onSaved).toHaveBeenCalledWith(5, true);
@@ -99,7 +101,7 @@ describe("DraftSaver", () => {
     const saver = new DraftSaver({
       save: (draftId) => {
         calls.push(draftId);
-        return gate.promise;
+        return gate.promise.then(ok);
       },
     });
     saver.markChanged();
@@ -116,7 +118,7 @@ describe("DraftSaver", () => {
       save: async () => {
         attempt += 1;
         if (attempt === 1) throw new Error("offline");
-        return 3;
+        return ok(3);
       },
     });
     saver.markChanged();
@@ -128,7 +130,7 @@ describe("DraftSaver", () => {
   });
 
   it("ignores saves requested after close", async () => {
-    const save = vi.fn().mockResolvedValue(1);
+    const save = vi.fn().mockResolvedValue(ok(1));
     const saver = new DraftSaver({ save });
     saver.close();
     saver.markChanged();
@@ -142,7 +144,7 @@ describe("DraftSaver lifecycle", () => {
   const gone = (e: unknown) => (e as { code?: string }).code === "not_found";
 
   it("close then open restores saving (StrictMode effect re-run)", async () => {
-    const save = vi.fn().mockResolvedValue(7);
+    const save = vi.fn().mockResolvedValue(ok(7));
     const saver = new DraftSaver({ save });
     saver.close(); // cleanup of the fake unmount
     saver.open(); // setup of the remount
@@ -154,13 +156,13 @@ describe("DraftSaver lifecycle", () => {
   });
 
   it("flush creates a draft for a composer that has never saved", async () => {
-    const saver = new DraftSaver({ save: async () => 11 });
+    const saver = new DraftSaver({ save: async () => ok(11) });
     expect(saver.dirty).toBe(false);
     expect(await saver.flush()).toBe(11);
   });
 
   it("autosave still refuses to create a draft for untouched fields", async () => {
-    const save = vi.fn().mockResolvedValue(1);
+    const save = vi.fn().mockResolvedValue(ok(1));
     const saver = new DraftSaver({ save });
     await saver.saveIfDirty();
     expect(save).not.toHaveBeenCalled();
@@ -174,7 +176,7 @@ describe("DraftSaver lifecycle", () => {
         calls.push(draftId);
         if (draftId === 5) return Promise.reject(notFound());
         nextId = draftId === null ? (nextId === 0 ? 5 : 9) : draftId;
-        return Promise.resolve(nextId);
+        return Promise.resolve(ok(nextId));
       },
       isDraftGone: gone,
     });
@@ -201,7 +203,7 @@ describe("DraftSaver lifecycle", () => {
   it("discard deletes the draft an in-flight create produced", async () => {
     const gate = deferred<number>();
     const deleted: number[] = [];
-    const saver = new DraftSaver({ save: () => gate.promise });
+    const saver = new DraftSaver({ save: () => gate.promise.then(ok) });
     saver.markChanged();
     void saver.saveIfDirty();
     const pending = saver.discard(async (id) => {
@@ -218,7 +220,7 @@ describe("DraftSaver lifecycle", () => {
     const saver = new DraftSaver({
       save: (draftId) => {
         calls.push(draftId);
-        return Promise.resolve(5);
+        return Promise.resolve(ok(5));
       },
     });
     saver.markChanged();
@@ -234,7 +236,7 @@ describe("DraftSaver lifecycle", () => {
   });
 
   it("a discard hitting 'draft gone' closes as already deleted", async () => {
-    const saver = new DraftSaver({ save: async () => 5, isDraftGone: gone });
+    const saver = new DraftSaver({ save: async () => ok(5), isDraftGone: gone });
     saver.markChanged();
     await saver.saveIfDirty();
     const res = await saver.discard(() => Promise.reject(notFound()));
@@ -246,7 +248,7 @@ describe("DraftSaver lifecycle", () => {
 describe("DraftSaver discard/send race", () => {
   it("flush returns null while a discard is in flight", async () => {
     const gate = deferred<void>();
-    const saver = new DraftSaver({ save: async () => 5 });
+    const saver = new DraftSaver({ save: async () => ok(5) });
     saver.markChanged();
     await saver.saveIfDirty();
     const pending = saver.discard(() => gate.promise);
@@ -258,7 +260,7 @@ describe("DraftSaver discard/send race", () => {
   });
 
   it("a discard rejected with a non-gone error clears the discarding flag", async () => {
-    const saver = new DraftSaver({ save: async () => 5 });
+    const saver = new DraftSaver({ save: async () => ok(5) });
     saver.markChanged();
     await saver.saveIfDirty();
     const res = await saver.discard(() =>

@@ -75,6 +75,7 @@
   "couldntSend": "无法发送：{{error}}",
   "sendNoDraft": "没有可发送的草稿",
   "couldntPickFiles": "无法选择文件：{{error}}",
+  "attachmentSkipped": "已跳过 {{name}}：{{reason}}",
   "showQuoted": "显示引用内容",
   "hideQuoted": "隐藏",
   "removeQuoted": "移除",

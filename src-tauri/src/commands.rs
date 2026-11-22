@@ -2,7 +2,7 @@
 
 use crate::AppState;
 use comail_core::models::*;
-use tauri::State;
+use tauri::{Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 type CmdResult<T> = Result<T, String>;
@@ -202,13 +202,119 @@ pub async fn send_now(state: State<'_, AppState>, action_id: i64) -> CmdResult<s
 
 // ---------- compose ----------
 
+/// Namespace every webview-supplied composer nonce so IPC can never produce
+/// the `None` scope internal approvals use: an internal token (a generated
+/// calendar invite) is then unreachable from any webview save, no matter
+/// what `composer_nonce` it sends.
+fn webview_nonce(composer_nonce: Option<String>) -> Option<String> {
+    Some(format!("js:{}", composer_nonce.unwrap_or_default()))
+}
+
+/// Open the native multi-select file dialog from Rust and register the
+/// user's picks as approved attachment sources. Returns opaque tokens plus
+/// display metadata - never the raw paths the webview could replay into
+/// `save_draft`. The only line of the approval flow that cannot run in tests
+/// is the dialog call itself; everything after it is `approve_attachment_sources`.
+/// `current_count`/`current_bytes` are the draft's current attachment
+/// totals: picks that would push it past the per-draft limits come back in
+/// `skipped` instead of becoming chips that would fail every save.
+#[tauri::command]
+pub async fn pick_draft_attachments(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    composer_nonce: Option<String>,
+    current_count: Option<usize>,
+    current_bytes: Option<u64>,
+) -> CmdResult<DropClaim> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut builder = app.dialog().file();
+    if let Some(window) = app.get_webview_window("main") {
+        builder = builder.set_parent(&window);
+    }
+    builder.pick_files(move |picked| {
+        let _ = tx.send(picked);
+    });
+    let picked = rx
+        .await
+        .map_err(|_| "file picker closed without an answer".to_string())?;
+    let Some(picked) = picked else {
+        // Cancelled dialog: no chips.
+        return Ok(DropClaim {
+            approved: Vec::new(),
+            skipped: Vec::new(),
+        });
+    };
+    let paths = picked
+        .into_iter()
+        .filter_map(|f| f.into_path().ok())
+        .collect::<Vec<_>>();
+    let (approved, skipped) = state
+        .core
+        .approve_attachment_sources_bounded(
+            paths,
+            webview_nonce(composer_nonce),
+            current_count.unwrap_or(0),
+            current_bytes.unwrap_or(0),
+        )
+        .map_err(err)?;
+    Ok(DropClaim { approved, skipped })
+}
+
+/// Exchange paths from an OS drop event for attachment tokens. Only paths
+/// the Rust webview-event handler observed fall on the window are accepted -
+/// the webview cannot mint approvals for paths it merely claims were
+/// dropped. `composer_nonce` binds the tokens to this composer session;
+/// `current_count`/`current_bytes` bound what a drop may add to the draft.
+#[tauri::command]
+pub async fn claim_dropped_attachments(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+    composer_nonce: Option<String>,
+    current_count: Option<usize>,
+    current_bytes: Option<u64>,
+) -> CmdResult<DropClaim> {
+    state
+        .core
+        .claim_dropped_attachments(
+            &paths,
+            webview_nonce(composer_nonce),
+            current_count.unwrap_or(0),
+            current_bytes.unwrap_or(0),
+        )
+        .map_err(err)
+}
+
+/// Resolve a received attachment (by row id) to an approval token so a
+/// forward chip can carry it. The download/copy happens here, outside
+/// `save_draft`, so a failure fails just this attachment.
+#[tauri::command]
+pub async fn prepare_forward_attachment(
+    state: State<'_, AppState>,
+    attachment_id: i64,
+    composer_nonce: Option<String>,
+    current_count: Option<usize>,
+    current_bytes: Option<u64>,
+) -> CmdResult<ApprovedAttachment> {
+    state
+        .core
+        .prepare_forward_attachment(
+            attachment_id,
+            webview_nonce(composer_nonce),
+            current_count.unwrap_or(0),
+            current_bytes.unwrap_or(0),
+        )
+        .await
+        .map_err(err)
+}
+
 #[tauri::command]
 pub async fn save_draft(
     state: State<'_, AppState>,
-    args: SaveDraftArgs,
-) -> CmdResult<serde_json::Value> {
-    let draft_id = state.core.save_draft(args).await.map_err(err)?;
-    Ok(serde_json::json!({ "draftId": draft_id }))
+    mut args: SaveDraftArgs,
+) -> CmdResult<SaveDraftResult> {
+    args.composer_nonce = webview_nonce(args.composer_nonce);
+    state.core.save_draft(args).await.map_err(err)
 }
 
 #[tauri::command]

@@ -75,6 +75,7 @@
   "couldntSend": "Không thể gửi: {{error}}",
   "sendNoDraft": "Không có bản nháp để gửi",
   "couldntPickFiles": "Không thể chọn tệp: {{error}}",
+  "attachmentSkipped": "Đã bỏ qua {{name}}: {{reason}}",
   "showQuoted": "Hiện văn bản trích dẫn",
   "hideQuoted": "Ẩn",
   "removeQuoted": "Xóa",

@@ -128,13 +128,17 @@ async fn reply_send_reaches_smtp_and_sent_folder() {
             mode: "reply".into(),
             in_reply_to_message_id: Some(parent.id),
             attachments: vec![],
+            composer_nonce: None,
         })
         .await
-        .expect("save draft");
+        .expect("save draft")
+        .draft_id;
     let result = core
         .queue_send(QueueSendArgs {
             draft_id,
             send_at: Some(now_ms()),
+
+            expected_attachments: None,
         })
         .await
         .expect("queue send");
