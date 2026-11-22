@@ -1206,11 +1206,33 @@ impl Core {
             _ => return html,
         };
         let mut fetched = Vec::new();
+        // Total raw bytes one call may embed; once exhausted, remaining parts
+        // keep their cid: reference and render as the browser's broken-image
+        // affordance (alt text where the sender set one) rather than loading.
+        let mut budget = crate::mime::InlineImageBudget::default();
         for (attachment_id, content_id, mime) in atts {
-            if let Ok(path) = self.get_attachment(attachment_id).await {
-                if let Ok(bytes) = tokio::fs::read(path).await {
-                    fetched.push((content_id, mime, bytes));
-                }
+            // Only image-ish parts are candidates; anything else keeps its
+            // cid: reference and is not even fetched for this.
+            if !crate::mime::inline_image_candidate(mime.as_deref()) {
+                continue;
+            }
+            let Ok(path) = self.get_attachment(attachment_id).await else {
+                continue;
+            };
+            // Size check on file metadata BEFORE the part is read.
+            let Ok(meta) = tokio::fs::metadata(&path).await else {
+                continue;
+            };
+            if meta.len() > crate::mime::INLINE_IMAGE_MAX_BYTES {
+                continue;
+            }
+            // The emitted data: URI always uses the sniffed type - a part
+            // labelled image/png that is really SVG/HTML is refused.
+            if let Ok(bytes) = tokio::fs::read(&path).await
+                && let Some(mime) = crate::mime::sniff_image_mime(&bytes)
+                && budget.try_reserve(bytes.len() as u64)
+            {
+                fetched.push((content_id, mime, bytes));
             }
         }
         if fetched.is_empty() {
@@ -1222,7 +1244,6 @@ impl Core {
             use base64::Engine;
             let mut map = std::collections::HashMap::new();
             for (content_id, mime, bytes) in fetched {
-                let mime = mime.unwrap_or_else(|| "application/octet-stream".to_string());
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 map.insert(
                     crate::mime::normalize_cid(&content_id),
@@ -1291,16 +1312,51 @@ impl Core {
             return out;
         }
 
-        let mut fetched: Vec<(i64, String, Option<String>, Vec<u8>)> = Vec::new();
+        let mut fetched: Vec<(i64, String, &'static str, Vec<u8>)> = Vec::new();
         let mut missing: Vec<i64> = Vec::new();
+        // Total raw bytes one call may embed; once exhausted, remaining parts
+        // keep their cid: reference and render as the browser's broken-image
+        // affordance (alt text where the sender set one) rather than loading.
+        let mut budget = crate::mime::InlineImageBudget::default();
         for (message_id, attachment_id, content_id, mime, file_path) in atts {
-            let bytes = match file_path {
-                Some(path) => tokio::fs::read(path).await.ok(),
+            // Only image-ish parts are candidates; anything else keeps its
+            // cid: reference and is not even fetched for this.
+            if !crate::mime::inline_image_candidate(mime.as_deref()) {
+                continue;
+            }
+            // Unavailable means "on disk but unreadable/absent" and earns a
+            // refetch below; an on-disk part over the per-image cap instead
+            // leaves the cid: reference unresolved on purpose.
+            let mut unavailable = file_path.is_none();
+            let bytes = match &file_path {
+                Some(path) => match tokio::fs::metadata(path).await {
+                    // The size check runs on metadata BEFORE the part is
+                    // read into memory.
+                    Ok(meta) if meta.len() <= crate::mime::INLINE_IMAGE_MAX_BYTES => {
+                        let bytes = tokio::fs::read(path).await.ok();
+                        unavailable = bytes.is_none();
+                        bytes
+                    }
+                    Ok(_) => None,
+                    Err(_) => {
+                        unavailable = true;
+                        None
+                    }
+                },
                 None => None,
             };
             match bytes {
-                Some(bytes) => fetched.push((message_id, content_id, mime, bytes)),
-                None => missing.push(attachment_id),
+                // The emitted data: URI always uses the sniffed type - a part
+                // labelled image/png that is really SVG/HTML is refused.
+                Some(bytes) => {
+                    if let Some(mime) = crate::mime::sniff_image_mime(&bytes)
+                        && budget.try_reserve(bytes.len() as u64)
+                    {
+                        fetched.push((message_id, content_id, mime, bytes));
+                    }
+                }
+                None if unavailable => missing.push(attachment_id),
+                None => {}
             }
         }
         if !missing.is_empty() {
@@ -1328,7 +1384,6 @@ impl Core {
             use base64::Engine;
             let mut maps: HashMap<i64, HashMap<String, String>> = HashMap::new();
             for (message_id, content_id, mime, bytes) in fetched {
-                let mime = mime.unwrap_or_else(|| "application/octet-stream".to_string());
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 maps.entry(message_id).or_default().insert(
                     crate::mime::normalize_cid(&content_id),
