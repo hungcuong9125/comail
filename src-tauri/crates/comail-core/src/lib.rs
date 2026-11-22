@@ -1062,9 +1062,11 @@ impl Core {
             // lifecycle lock is still held - milliseconds of work - so the
             // slow recursive deletes below can run AFTER the lock is released
             // without a recycled account id ever seeing its fresh dirs
-            // deleted. Staged draft dirs get the same treatment because
-            // message ids (and with them `d{id}` staging dir names) recycle
-            // the same way. Leftover tombstones are swept at start-up.
+            // deleted. Staged draft dirs get the same treatment: they are
+            // random per-file sub-directories under the shared staging
+            // root, so they cannot collide by name - tombstoning guards
+            // the same id-recycling window anyway. Leftover tombstones
+            // are swept at start-up.
             let tombstones = self.tombstone_account_dirs(account_id, &staged).await;
             #[cfg(test)]
             if REMOVE_PAUSE_FOR_ADD.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -1162,8 +1164,9 @@ impl Core {
             }
         }
         // Staged draft attachments: confine to the staging root exactly like
-        // remove_staged_draft_files, then tombstone each per-draft directory
-        // (`d{id}`) - message ids recycle, so a later draft could own one.
+        // remove_staged_draft_files, then tombstone each per-file directory
+        // (random uuid sub-dirs) - ids recycle, so a later staged file
+        // could land in one.
         let root = self.paths.draft_attachments_dir();
         if let Ok(root) = tokio::fs::canonicalize(&root).await {
             let mut dirs = std::collections::HashSet::new();
@@ -2009,6 +2012,14 @@ impl Core {
             bytes: current_bytes,
         };
         self.approvals.claim_drops(paths, nonce, Some(&mut budget))
+    }
+
+    /// Release approval tokens the composer will not spend: a removed
+    /// chip, an unticked forward set, or a closed composer. Frees their
+    /// `pending_bytes` immediately; nonce-bound, and in-flight tokens are
+    /// untouched.
+    pub fn release_attachment_tokens(&self, tokens: &[String], nonce: Option<String>) {
+        self.approvals.release(tokens, &nonce);
     }
 
     /// Resolve a received attachment to an approval token so a forward can

@@ -308,6 +308,23 @@ pub async fn prepare_forward_attachment(
         .map_err(err)
 }
 
+/// Release approval tokens the composer will not spend - a removed chip,
+/// an unticked forward set, or a composer closing without sending. Frees
+/// the session's prepared-bytes accounting immediately; nonce-bound like
+/// the other approval calls, and tokens checked out by an in-flight save
+/// are untouched.
+#[tauri::command]
+pub async fn release_attachment_tokens(
+    state: State<'_, AppState>,
+    tokens: Vec<String>,
+    composer_nonce: Option<String>,
+) -> CmdResult<()> {
+    state
+        .core
+        .release_attachment_tokens(&tokens, webview_nonce(composer_nonce));
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn save_draft(
     state: State<'_, AppState>,

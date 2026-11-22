@@ -1286,6 +1286,14 @@ export interface Commands {
     currentCount?: number;
     currentBytes?: number;
   }): Promise<ApprovedAttachment>;
+  /** Release approval tokens this composer will never save with (removed
+   *  chip, unticked forward set, composer closed) - frees the session's
+   *  prepared-bytes accounting immediately. Nonce-bound; tokens checked
+   *  out by an in-flight save are untouched. */
+  release_attachment_tokens(args: {
+    tokens: string[];
+    composerNonce?: string | null;
+  }): Promise<void>;
   save_draft(args: { args: SaveDraftArgs }): Promise<SaveDraftResult>;
   get_draft(args: { draftId: number }): Promise<SaveDraftArgs>;
   delete_draft(args: { draftId: number }): Promise<void>;

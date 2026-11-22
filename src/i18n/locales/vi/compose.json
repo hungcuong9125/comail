@@ -18,6 +18,7 @@
   "forwardIncludeFiles_other": "Gửi kèm {{count}} tệp đính kèm",
   "forwardAttachingCount_other": "Đang đính kèm {{count}} tệp…",
   "forwardAttaching": "Đang đính kèm các tệp được chuyển tiếp…",
+  "attachmentFailed": "Không thể đính kèm {{names}}. Hãy xóa hoặc thử lại.",
   "forwardAttachFailed": "Không đính kèm được {{name}}: {{detail}}",
   "close": "Đóng",
   "ccBcc": "Cc / Bcc",

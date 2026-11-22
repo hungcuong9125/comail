@@ -40,6 +40,8 @@ interface Backend {
   saves: SaveDraftArgs[];
   queues: Array<{ draftId: number; sendAt?: number; expectedAttachments?: string[] }>;
   prepares: Map<number, ReturnType<typeof deferred<ApprovedAttachment>>>;
+  prepareCalls: number[];
+  releases: string[][];
   prepareFor: (attachmentId: number) => ReturnType<typeof deferred<ApprovedAttachment>>;
   failNextSave: (err: unknown) => void;
 }
@@ -51,6 +53,8 @@ function makeBackend(): Backend {
   const saves: SaveDraftArgs[] = [];
   const queues: Backend["queues"] = [];
   const prepares = new Map<number, ReturnType<typeof deferred<ApprovedAttachment>>>();
+  const prepareCalls: number[] = [];
+  const releases: string[][] = [];
   let nextDraftId = 100;
   let failSave: unknown = null;
 
@@ -84,10 +88,14 @@ function makeBackend(): Backend {
         return { actionId: 7, dispatchAt: Date.now() };
       case "prepare_forward_attachment": {
         const id = a.attachmentId as number;
+        prepareCalls.push(id);
         const d = deferred<ApprovedAttachment>();
         prepares.set(id, d);
         return d.promise;
       }
+      case "release_attachment_tokens":
+        releases.push(a.tokens as string[]);
+        return undefined;
       default:
         throw new Error(`unexpected call ${cmd}`);
     }
@@ -97,6 +105,8 @@ function makeBackend(): Backend {
     saves,
     queues,
     prepares,
+    prepareCalls,
+    releases,
     prepareFor: (id) => {
       const d = prepares.get(id);
       if (!d) throw new Error(`no pending prepare for ${id}`);
@@ -130,7 +140,7 @@ function makeDraft(
     },
     opts,
   );
-  d.saver.open();
+  d.start();
   return d;
 }
 
@@ -256,8 +266,13 @@ describe("ComposerDraft send orchestration", () => {
     await vi.waitFor(() =>
       expect(draft.chips.some((c) => c.status === "error")).toBe(true),
     );
-    // The failed chip keeps send blocked...
-    expect((await draft.send()).kind).toBe("attaching");
+    // The failed chip keeps send blocked with a distinct outcome naming
+    // it - "remove or retry", not "still attaching".
+    const blocked = await draft.send();
+    expect(blocked.kind).toBe("failed");
+    if (blocked.kind === "failed") {
+      expect(blocked.names).toEqual(["report.pdf"]);
+    }
     // ...but text still autosaves fine without it.
     draft.saver.markChanged(); // a body edit
     await draft.saver.saveIfDirty();
@@ -300,7 +315,7 @@ describe("ComposerDraft send orchestration", () => {
         ],
       },
     );
-    reopened.saver.open();
+    reopened.start();
     // A reopened draft is clean: flush issues no save, the gate passes on
     // the restored set, queue_send carries the expected staged path.
     const out = await reopened.send();
@@ -346,7 +361,7 @@ describe("ComposerDraft send orchestration", () => {
         ],
       },
     );
-    draft.saver.open();
+    draft.start();
     // The stored id is stale: first save hits not_found and recreates.
     backend.failNextSave({ code: "not_found", message: "draft gone" });
     draft.saver.markChanged();
@@ -378,5 +393,97 @@ describe("ComposerDraft send orchestration", () => {
     const out = await draft.send();
     expect(out.kind).toBe("sent");
     expect(backend.saves[backend.saves.length - 1]!.attachments).toHaveLength(2);
+  });
+});
+
+describe("ComposerDraft lifecycle + token release", () => {
+  it("StrictMode: construct twice, start one; start->dispose->start issues each prepare once", async () => {
+    const backend = makeBackend();
+    const deps = () => ({
+      call: (cmd: string, args?: unknown) => backend.call(cmd, args),
+      composerNonce: "nonce-1",
+      getFields: () => fields,
+      onChips: vi.fn(),
+    });
+    // StrictMode's double memo-init: two instances, only one is started.
+    const discarded = new ComposerDraft(deps(), {
+      forwardSources: SOURCES,
+      includeForwards: true,
+    });
+    const kept = new ComposerDraft(deps(), {
+      forwardSources: SOURCES,
+      includeForwards: true,
+    });
+    expect(discarded.chips).toHaveLength(2);
+    kept.start();
+    await tick();
+    expect(backend.prepareCalls.sort()).toEqual([60, 61]);
+    // mount -> cleanup -> mount on the same instance.
+    kept.dispose();
+    kept.start();
+    await tick();
+    // The prepares issued before dispose are still tracked - no re-issue.
+    expect(backend.prepareCalls.sort()).toEqual([60, 61]);
+    // Chips are removable on the live instance.
+    kept.removeAttachment(kept.chips[0].id);
+    expect(kept.chips).toHaveLength(1);
+  });
+
+  it("untick releases the chips' tokens so the session budget recovers; x10 toggles stay at one live token per attachment", async () => {
+    const backend = makeBackend();
+    const live = new Set<string>();
+    const orig = backend.call;
+    // Track live tokens: prepare mints, release returns.
+    backend.call = async (cmd, args) => {
+      if (cmd === "release_attachment_tokens") {
+        for (const t of ((args as { tokens: string[] }).tokens ?? [])) {
+          live.delete(t);
+        }
+        return orig(cmd, args);
+      }
+      const res = await orig(cmd, args);
+      if (cmd === "prepare_forward_attachment") {
+        // resolved later via deferreds; token lands in chipResolved
+      }
+      return res;
+    };
+    const draft = makeDraft(backend, {
+      forwardSources: [SOURCES[0]],
+      includeForwards: true,
+    });
+    for (let i = 0; i < 10; i += 1) {
+      const d = backend.prepareFor(60);
+      d.resolve(approved("big.bin", `tok-big-${i}`));
+      await tick();
+      live.add(`tok-big-${i}`);
+      backend.prepares.clear();
+      draft.toggleForward(false);
+      draft.toggleForward(true);
+    }
+    // Every untick released the chip's token before the next minted.
+    expect(backend.releases.flat().sort()).toEqual(
+      Array.from({ length: 10 }, (_, i) => `tok-big-${i}`).sort(),
+    );
+    // The pending re-tick prepare resolves into exactly one live token.
+    backend.prepareFor(60).resolve(approved("big.bin", "tok-big-10"));
+    await tick();
+    live.add("tok-big-10");
+    expect(live.size).toBe(1);
+    expect([...live][0]).toBe("tok-big-10");
+  });
+
+  it("dispose releases held tokens and a late prepare result is released, not applied", async () => {
+    const backend = makeBackend();
+    const draft = makeDraft(backend, {
+      forwardSources: [SOURCES[0]],
+      includeForwards: true,
+    });
+    // Prepare still in flight; dispose before it resolves.
+    draft.dispose();
+    backend.prepareFor(60).resolve(approved("f60.bin", "tok-late"));
+    await tick();
+    // The token was released rather than applied to a chip.
+    expect(backend.releases.flat()).toContain("tok-late");
+    expect(draft.chips[0].ref).toBeNull();
   });
 });

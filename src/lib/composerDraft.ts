@@ -73,6 +73,7 @@ export interface ComposerDraftDeps {
 export type SendOutcome =
   | { kind: "sent"; result: QueueSendResult; draftId: number }
   | { kind: "attaching" }
+  | { kind: "failed"; names: string[] }
   | { kind: "out_of_sync" };
 
 /** What `send` verifies: the staged paths the LAST committed save wrote. */
@@ -94,9 +95,19 @@ export class ComposerDraft {
   /** Staged paths the last successful save persisted - the send gate's
    *  ground truth for "what the draft holds". */
   private savedWire: string[] = [];
+  /** Chips whose prepare IPC is in flight - start() never double-issues. */
+  private readonly preparing = new Set<string>();
+  /** Set by dispose(); while true, emits and prepare applications are
+   *  no-ops and tokens that land late are released instead of applied. */
+  private disposed = false;
+  private started = false;
   readonly saver: DraftSaver;
   private readonly deps: ComposerDraftDeps;
 
+  /** PURE constructor: builds the chip list only. No IPC, no emits -
+   *  React StrictMode runs memo initialisers twice and discards one
+   *  instance, and the discarded one must leave no trace. start() (in an
+   *  effect) is where IPC begins. */
   constructor(
     deps: ComposerDraftDeps,
     opts: {
@@ -112,6 +123,14 @@ export class ComposerDraft {
       .map((a) => a.filePath)
       .sort();
     this.forwardSources = opts.forwardSources ?? [];
+    if (opts.includeForwards) {
+      this.chipsValue = addChips(
+        this.chipsValue,
+        this.forwardSources.map((s) =>
+          forwardChip(s.attachmentId, s.displayName, s.size),
+        ),
+      ).chips;
+    }
 
     this.saver = new DraftSaver(
       {
@@ -124,18 +143,51 @@ export class ComposerDraft {
       },
       deps.draftId ?? null,
     );
+  }
 
-    if (opts.includeForwards && this.forwardSources.length > 0) {
-      this.setChips((cur) =>
-        addChips(
-          cur,
-          this.forwardSources.map((s) =>
-            forwardChip(s.attachmentId, s.displayName, s.size),
-          ),
-        ).chips,
-      );
-      this.chipsValue.filter((c) => c.status === "attaching").forEach((c) => this.prepareChip(c));
+  /** Begin IPC work: open the saver, mirror chips to the owner, and kick a
+   *  prepare per attaching chip that isn't already in flight. Idempotent;
+   *  a start after dispose re-arms the same instance (StrictMode's
+   *  mount → cleanup → mount). */
+  start(): void {
+    if (this.started) return;
+    this.started = true;
+    this.disposed = false;
+    this.saver.open();
+    this.deps.onChips?.(this.chipsValue);
+    for (const c of this.chipsValue) {
+      if (c.status === "attaching" && !this.preparing.has(c.id)) {
+        this.prepareChip(c);
+      }
     }
+  }
+
+  /** Stop IPC work: close the saver and release every token this composer
+   *  holds but never saved (chip refs + nothing else can mint them).
+   *  Prepares that land after this point release their token instead of
+   *  applying it. */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.started = false;
+    this.saver.close();
+    const released = this.chipsValue.flatMap((c) =>
+      c.ref !== null && c.ref.kind === "token" ? [c.ref.token] : [],
+    );
+    if (released.length === 0) return;
+    // The released tokens are dead: a restart (StrictMode remount) must
+    // never save one. Forward chips re-mint on start(); a picked/dropped
+    // token is the only handle to its file, so that chip must be
+    // re-attached by hand.
+    this.setChips((cur) =>
+      cur.map((c) => {
+        if (c.ref === null || c.ref.kind !== "token") return c;
+        return c.origin.kind === "forward"
+          ? { ...c, ref: null, status: "attaching" as const, error: undefined }
+          : chipFailed(c, "the file must be re-attached");
+      }),
+    );
+    this.releaseTokens(released);
   }
 
   get chips(): ComposerAttachment[] {
@@ -155,7 +207,9 @@ export class ComposerDraft {
     const next = fn(this.chipsValue);
     if (next === this.chipsValue) return;
     this.chipsValue = next;
-    this.deps.onChips?.(next);
+    // A disposed controller still updates its model (restart correctness)
+    // but never touches the component.
+    if (!this.disposed) this.deps.onChips?.(next);
     if (JSON.stringify(wireEntries(next)) !== before) this.saver.markChanged();
   }
 
@@ -208,12 +262,13 @@ export class ComposerDraft {
     return { id: result.draftId, payload };
   }
 
-  /** Resolve one forward chip to a token OUTSIDE save_draft. A late
-   *  resolve lands only if the chip is still present (same id). */
+  /** Resolve one forward chip to a token OUTSIDE save_draft. A token that
+   *  lands for a chip that is gone, already resolved, or behind a dispose
+   *  is released instead of applied - it can never hold session bytes for
+   *  a file nobody will save. */
   private prepareChip(chip: ComposerAttachment): void {
-    if (chip.origin.kind !== "forward") return;
-    const apply = (fn: (c: ComposerAttachment) => ComposerAttachment) =>
-      this.setChips((cur) => cur.map((c) => (c.id === chip.id ? fn(c) : c)));
+    if (chip.origin.kind !== "forward" || this.disposed) return;
+    this.preparing.add(chip.id);
     const { count, bytes } = this.totals();
     void this.deps
       .call("prepare_forward_attachment", {
@@ -222,11 +277,40 @@ export class ComposerDraft {
         currentCount: count,
         currentBytes: bytes,
       })
-      .then((a) => apply((c) => chipResolved(c, a as ApprovedAttachment)))
+      .then((a) => {
+        this.preparing.delete(chip.id);
+        const approved = a as ApprovedAttachment;
+        const live = this.chipsValue.find((c) => c.id === chip.id);
+        if (this.disposed || live === undefined || live.ref !== null) {
+          this.releaseTokens([approved.token]);
+          return;
+        }
+        this.setChips((cur) =>
+          cur.map((c) => (c.id === chip.id ? chipResolved(c, approved) : c)),
+        );
+      })
       .catch((err: unknown) => {
+        this.preparing.delete(chip.id);
+        if (this.disposed) return;
         const detail = err instanceof Error ? err.message : String(err);
-        apply((c) => chipFailed(c, detail));
+        this.setChips((cur) =>
+          cur.map((c) => (c.id === chip.id ? chipFailed(c, detail) : c)),
+        );
         this.deps.onChipFailed?.(chip, detail);
+      });
+  }
+
+  /** Give back tokens this composer minted but will never spend. */
+  private releaseTokens(tokens: string[]): void {
+    if (tokens.length === 0) return;
+    void this.deps
+      .call("release_attachment_tokens", {
+        tokens,
+        composerNonce: this.deps.composerNonce,
+      })
+      .catch(() => {
+        // Best effort: a failed release only delays budget recovery to
+        // the 30-minute approval expiry.
       });
   }
 
@@ -267,15 +351,33 @@ export class ComposerDraft {
 
   /** The include-original-attachments toggle. Identity-only stash: re-tick
    *  builds fresh attaching chips and re-runs prepare, never replays a
-   *  spent token or a stale staged ref. */
+   *  spent token or a stale staged ref. Unticking releases every token the
+   *  removed chips held so the session's prepared-bytes cap recovers now,
+   *  not at token expiry. */
   toggleForward(include: boolean): void {
-    const r = toggleForwardChips(this.chipsValue, this.forwardSources, include);
-    this.setChips(() => r.chips);
-    if (include) r.toPrepare.forEach((c) => this.prepareChip(c));
+    if (include) {
+      const r = toggleForwardChips(this.chipsValue, this.forwardSources, true);
+      this.setChips(() => r.chips);
+      if (!this.disposed) {
+        r.toPrepare.forEach((c) => this.prepareChip(c));
+      }
+      return;
+    }
+    const tokens = this.chipsValue.flatMap((c) =>
+      c.origin.kind === "forward" && c.ref !== null && c.ref.kind === "token"
+        ? [c.ref.token]
+        : [],
+    );
+    this.setChips((cur) => toggleForwardChips(cur, this.forwardSources, false).chips);
+    this.releaseTokens(tokens);
   }
 
   removeAttachment(id: string): void {
+    const chip = this.chipsValue.find((c) => c.id === id);
     this.setChips((cur) => removeChipFrom(cur, id));
+    if (chip?.ref !== null && chip?.ref.kind === "token") {
+      this.releaseTokens([chip.ref.token]);
+    }
   }
 
   /** Current wire entries - for the undo reopen payload. */
@@ -288,9 +390,18 @@ export class ComposerDraft {
    *  resave is allowed if they differ. Only then queue_send, carrying
    *  the expected staged paths as the Rust backstop. */
   async send(opts: { sendAt?: number } = {}): Promise<SendOutcome> {
-    if (!allReady(this.chipsValue)) return { kind: "attaching" };
+    const blocked = (): SendOutcome | null => {
+      const failed = this.chipsValue.filter((c) => c.status === "error");
+      if (failed.length > 0) {
+        return { kind: "failed", names: failed.map((c) => c.displayName) };
+      }
+      return allReady(this.chipsValue) ? null : { kind: "attaching" };
+    };
+    const early = blocked();
+    if (early) return early;
     const gate = async (id: number): Promise<SendOutcome | null> => {
-      if (!allReady(this.chipsValue)) return { kind: "attaching" };
+      const b = blocked();
+      if (b) return b;
       const wire = stagedWirePaths(this.chipsValue);
       if (wire.length !== this.savedWire.length || wire.some((p, i) => p !== this.savedWire[i])) {
         return null; // out of sync - caller may resave once

@@ -389,15 +389,15 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   }, []);
   const saver = draft.saver;
 
-  // "Closed" means this composer instance is gone - and it is reversible,
-  // because StrictMode unmounts and remounts effects in dev while useMemo
-  // keeps the same saver: opening in the effect body keeps the saver alive
-  // through the fake unmount/remount cycle. A drain already in flight
-  // settles silently so Discard can still learn the created draft id.
+  // Construction is pure; IPC begins in this effect. StrictMode's
+  // mount → cleanup → mount reuses the same memoised controller:
+  // dispose() pauses its work and releases unused tokens, the second
+  // start() re-arms it. A drain already in flight settles silently so
+  // Discard can still learn the created draft id.
   useEffect(() => {
-    saver.open();
-    return () => saver.close();
-  }, [saver]);
+    draft.start();
+    return () => draft.dispose();
+  }, [draft]);
 
   useEffect(() => {
     if (accounts && !accounts.some((a) => a.id === accountId) && accounts[0]) {
@@ -504,6 +504,14 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         const outcome = await draft.send({ sendAt });
         if (outcome.kind === "attaching") {
           pushToast({ kind: "info", message: t("compose:forwardAttaching"), durationMs: 3000 });
+          return;
+        }
+        if (outcome.kind === "failed") {
+          pushToast({
+            kind: "error",
+            message: t("compose:attachmentFailed", { names: outcome.names.join(", ") }),
+            durationMs: 4000,
+          });
           return;
         }
         if (outcome.kind === "out_of_sync") {
