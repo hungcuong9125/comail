@@ -136,3 +136,109 @@ describe("DraftSaver", () => {
     expect(save).not.toHaveBeenCalled();
   });
 });
+
+describe("DraftSaver lifecycle", () => {
+  const notFound = () => ({ code: "not_found", message: "gone" });
+  const gone = (e: unknown) => (e as { code?: string }).code === "not_found";
+
+  it("close then open restores saving (StrictMode effect re-run)", async () => {
+    const save = vi.fn().mockResolvedValue(7);
+    const saver = new DraftSaver({ save });
+    saver.close(); // cleanup of the fake unmount
+    saver.open(); // setup of the remount
+    saver.markChanged();
+    await saver.saveIfDirty();
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(saver.id).toBe(7);
+    expect(saver.dirty).toBe(false);
+  });
+
+  it("flush creates a draft for a composer that has never saved", async () => {
+    const saver = new DraftSaver({ save: async () => 11 });
+    expect(saver.dirty).toBe(false);
+    expect(await saver.flush()).toBe(11);
+  });
+
+  it("autosave still refuses to create a draft for untouched fields", async () => {
+    const save = vi.fn().mockResolvedValue(1);
+    const saver = new DraftSaver({ save });
+    await saver.saveIfDirty();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it("a save hitting 'draft gone' drops the stale id and recreates", async () => {
+    const calls: Array<number | null> = [];
+    let nextId = 0;
+    const saver = new DraftSaver({
+      save: (draftId) => {
+        calls.push(draftId);
+        if (draftId === 5) return Promise.reject(notFound());
+        nextId = draftId === null ? (nextId === 0 ? 5 : 9) : draftId;
+        return Promise.resolve(nextId);
+      },
+      isDraftGone: gone,
+    });
+    saver.markChanged();
+    await saver.saveIfDirty();
+    expect(saver.id).toBe(5);
+
+    saver.markChanged();
+    await saver.saveIfDirty();
+    // save(5) rejected NotFound -> the saver recreated with a null id.
+    expect(calls).toEqual([null, 5, null]);
+    expect(saver.id).toBe(9);
+    expect(saver.dirty).toBe(false);
+  });
+
+  it("a 'gone' verdict on create is not retried forever", async () => {
+    const save = vi.fn().mockRejectedValue(notFound());
+    const saver = new DraftSaver({ save, isDraftGone: gone });
+    saver.markChanged();
+    await expect(saver.saveIfDirty()).rejects.toEqual(notFound());
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  it("discard deletes the draft an in-flight create produced", async () => {
+    const gate = deferred<number>();
+    const deleted: number[] = [];
+    const saver = new DraftSaver({ save: () => gate.promise });
+    saver.markChanged();
+    void saver.saveIfDirty();
+    const pending = saver.discard(async (id) => {
+      deleted.push(id);
+    });
+    gate.resolve(13);
+    const res = await pending;
+    expect(res.done).toBe(true);
+    expect(deleted).toEqual([13]);
+  });
+
+  it("a discard whose delete fails re-opens the saver for later edits", async () => {
+    const calls: Array<number | null> = [];
+    const saver = new DraftSaver({
+      save: (draftId) => {
+        calls.push(draftId);
+        return Promise.resolve(5);
+      },
+    });
+    saver.markChanged();
+    await saver.saveIfDirty();
+    const res = await saver.discard(() => Promise.reject(new Error("db locked")));
+    expect(res.done).toBe(false);
+    expect(saver.isClosed).toBe(false);
+    // A later edit saves against the same draft id.
+    saver.markChanged();
+    await saver.saveIfDirty();
+    expect(calls).toEqual([null, 5]);
+    expect(saver.dirty).toBe(false);
+  });
+
+  it("a discard hitting 'draft gone' closes as already deleted", async () => {
+    const saver = new DraftSaver({ save: async () => 5, isDraftGone: gone });
+    saver.markChanged();
+    await saver.saveIfDirty();
+    const res = await saver.discard(() => Promise.reject(notFound()));
+    expect(res.done).toBe(true);
+    expect(saver.isClosed).toBe(true);
+  });
+});

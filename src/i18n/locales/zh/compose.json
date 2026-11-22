@@ -73,6 +73,7 @@
   "undo": "撤销",
   "sendNow": "立即发送",
   "couldntSend": "无法发送：{{error}}",
+  "sendNoDraft": "没有可发送的草稿",
   "couldntPickFiles": "无法选择文件：{{error}}",
   "showQuoted": "显示引用内容",
   "hideQuoted": "隐藏",

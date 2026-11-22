@@ -73,6 +73,7 @@
   "undo": "Hoàn tác",
   "sendNow": "Gửi ngay",
   "couldntSend": "Không thể gửi: {{error}}",
+  "sendNoDraft": "Không có bản nháp để gửi",
   "couldntPickFiles": "Không thể chọn tệp: {{error}}",
   "showQuoted": "Hiện văn bản trích dẫn",
   "hideQuoted": "Ẩn",

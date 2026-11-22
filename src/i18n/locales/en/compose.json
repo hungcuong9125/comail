@@ -75,6 +75,7 @@
   "undo": "Undo",
   "sendNow": "Send now",
   "couldntSend": "Couldn't send: {{error}}",
+  "sendNoDraft": "There’s no draft to send",
   "couldntPickFiles": "Couldn't pick files: {{error}}",
   "showQuoted": "Show quoted text",
   "hideQuoted": "Hide",

@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import i18n from "../../i18n";
-import { errorMessage } from "../../ipc/errors";
+import { errorMessage, parseError } from "../../ipc/errors";
 import { call } from "../../ipc/commands";
 import { MOCK_MODE } from "../../ipc/mock";
 import { subscribeEvent } from "../../ipc/events";
@@ -354,6 +354,9 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
             );
             if (clean) dirtyRef.current = false;
           },
+          // The draft vanished under us (deleted on another surface, or
+          // already sent): the saver drops the stale id and recreates.
+          isDraftGone: (err) => parseError(err).code === "not_found",
         },
         state.draftId ?? null,
       ),
@@ -361,9 +364,15 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
     [],
   );
 
-  // No new saves once this instance is gone; a drain already in flight
+  // "Closed" means this composer instance is gone - and it is reversible,
+  // because StrictMode unmounts and remounts effects in dev while useMemo
+  // keeps the same saver: opening in the effect body keeps the saver alive
+  // through the fake unmount/remount cycle. A drain already in flight
   // settles silently so Discard can still learn the created draft id.
-  useEffect(() => () => saver.close(), [saver]);
+  useEffect(() => {
+    saver.open();
+    return () => saver.close();
+  }, [saver]);
 
   useEffect(() => {
     if (accounts && !accounts.some((a) => a.id === accountId) && accounts[0]) {
@@ -513,9 +522,19 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
         // draft id the last save produced is the one that gets queued, so a
         // pending first save can't leave a duplicate draft behind.
         const id = await saver.flush();
-        if (id == null) return; // unreachable: any edit makes the draft dirty
+        if (id == null) {
+          // Only possible if the saver was closed under us; never swallow it.
+          pushToast({
+            kind: "error",
+            message: t("compose:couldntSend", { error: t("compose:sendNoDraft") }),
+          });
+          return;
+        }
         const sendAt = opts.instant ? Date.now() : opts.sendAt;
         const res = await call("queue_send", { args: { draftId: id, sendAt } });
+        // The draft is now the send queue's: stop autosaving against it so a
+        // late tick can't resurrect a copy once it dispatches.
+        saver.close();
         // The whoosh plays only once the send is actually queued - never on
         // a save or queue failure.
         playSound("send");
@@ -925,22 +944,19 @@ export function Composer({ state, inline }: { state: ComposerState; inline?: boo
   };
 
   const discard = async () => {
-    // Close the saver first: no new saves can start, and an in-flight create
-    // completes silently so its draft id can be deleted instead of surviving
-    // as an orphan.
-    saver.close();
-    await saver.idle();
-    const id = saver.id;
-    if (id != null) {
-      try {
-        await deleteDrafts([id]);
-      } catch (err) {
-        pushToast({
-          kind: "error",
-          message: t("compose:discardFailed", { detail: errorMessage(err) }),
-        });
-        return;
-      }
+    // Quiesce saves and wait out an in-flight create so its draft id can be
+    // deleted instead of surviving as an orphan. If the delete fails for
+    // anything but "already gone" the saver re-opens - this composer stays
+    // on screen and must keep a working saver.
+    const result = await saver.discard(async (id) => {
+      await deleteDrafts([id]);
+    });
+    if (!result.done) {
+      pushToast({
+        kind: "error",
+        message: t("compose:discardFailed", { detail: errorMessage(result.error) }),
+      });
+      return;
     }
     closeComposer();
   };
