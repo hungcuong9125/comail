@@ -85,4 +85,52 @@ describe("observeThread", () => {
     expect(s.suppressed).toBe(false);
     expect(s.pending).toBe(true);
   });
+
+  it("re-arms once when a stale refetch lands after dispatch instead of suppressing", () => {
+    let s: AutoMarkRead = observeThread(emptyAutoMarkRead, snap(1, 1, [10]));
+    s = markReadDispatched(s);
+    // A refetch that was already in flight returns the pre-mark payload: still
+    // unread, no new messages. That is our own mark not having landed yet, not
+    // the user - re-arm instead of suppressing permanently.
+    s = observeThread(s, snap(1, 1, [10]));
+    expect(s.suppressed).toBe(false);
+    expect(s.pending).toBe(true);
+    // The retry dispatches and this time the payload shows it landed.
+    s = markReadDispatched(s);
+    s = observeThread(s, snap(1, 0, [10]));
+    expect(s.pending).toBe(false);
+    expect(s.dispatched).toBe(false);
+    expect(s.retried).toBe(false);
+  });
+
+  it("stops retrying when a mark keeps failing to land, without suppressing", () => {
+    let s: AutoMarkRead = observeThread(emptyAutoMarkRead, snap(1, 1, [10]));
+    s = markReadDispatched(s);
+    // First unread payload after dispatch: stale or failed - retry once.
+    s = observeThread(s, snap(1, 1, [10]));
+    expect(s.pending).toBe(true);
+    s = markReadDispatched(s);
+    // Still unread on the next payload: stop re-arming, but do not confuse
+    // this with the user marking unread either.
+    s = observeThread(s, snap(1, 1, [10]));
+    expect(s.pending).toBe(false);
+    expect(s.dispatched).toBe(false);
+    expect(s.suppressed).toBe(false);
+    // Only a further identical payload now reads as a user action.
+    s = observeThread(s, snap(1, 1, [10]));
+    expect(s.suppressed).toBe(true);
+  });
+
+  it("holds new arrivals while a mark is in flight, then re-arms if unread stays", () => {
+    let s: AutoMarkRead = observeThread(emptyAutoMarkRead, snap(1, 1, [10]));
+    s = markReadDispatched(s);
+    // New unread mail lands while our mark is in flight: don't stack a second
+    // dispatch; the in-flight one is presumed to cover it.
+    s = observeThread(s, snap(1, 2, [10, 11]));
+    expect(s.pending).toBe(false);
+    expect(s.dispatched).toBe(true);
+    // The next payload shows it didn't: re-arm for the uncovered message.
+    s = observeThread(s, snap(1, 1, [10, 11]));
+    expect(s.pending).toBe(true);
+  });
 });
