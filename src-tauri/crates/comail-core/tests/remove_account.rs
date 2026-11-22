@@ -386,3 +386,90 @@ async fn run_dead_server_removal(creds: std::path::PathBuf) {
 
     let _ = std::fs::remove_file(&creds);
 }
+
+/// Writer-hold measurement: 100k indexed messages under one account, then the
+/// real `repo::accounts::delete` inside its single writer transaction. This is
+/// the number that decides whether the delete freezes the UI writer thread.
+#[tokio::test]
+async fn writer_hold_for_delete_measured_on_100k_messages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::for_tests(tmp.path());
+    paths.ensure().unwrap();
+    let db = Db::open(&paths.db_file()).unwrap();
+
+    const N: i64 = 100_000;
+    let seeded = Instant::now();
+    db.write(move |conn| {
+        insert_account(conn, "big@test.dev");
+        conn.execute(
+            "INSERT INTO threads (account_id, subject_norm) VALUES (1, 't')",
+            [],
+        )?;
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "WITH RECURSIVE seq(n) AS (
+               SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?1
+             )
+             INSERT INTO messages (thread_id, account_id, uid, message_id,
+                                   subject, from_addr, date)
+             SELECT ?2, 1, n, 'mid-' || n, 'subject ' || n, 'a@b.c', 1000
+             FROM seq",
+            rusqlite::params![N, tid],
+        )?;
+        // Realistic FTS rows: ~200 chars of body text per message, inserted
+        // the same way index_message does (contentless table, plain INSERT).
+        conn.execute(
+            "INSERT INTO messages_fts (rowid, subject, from_text, to_text, body)
+             SELECT id, subject, 'a@b.c', 'x@y.z',
+                    'lorem ipsum dolor sit amet consectetur adipiscing elit \
+                     sed do eiusmod tempor incididunt ut labore et dolore \
+                     magna aliqua enim ad minim veniam quis nostrud exercitation'
+             FROM messages WHERE account_id = 1",
+            [],
+        )?;
+        let fts: i64 = conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))?;
+        assert_eq!(fts, N);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    eprintln!("seeded {N} messages + FTS rows in {:?}", seeded.elapsed());
+
+    // The real remove_account shape: the FTS sweep runs as one writer
+    // transaction per batch (other jobs interleave between them), then the
+    // final transaction only carries the small re-sweep + the cascade.
+    let mut worst_batch = Duration::ZERO;
+    let sweep_started = Instant::now();
+    loop {
+        let t = Instant::now();
+        let n = db
+            .write(move |conn| repo::accounts::sweep_fts_batch(conn, 1))
+            .await
+            .unwrap();
+        worst_batch = worst_batch.max(t.elapsed());
+        if n < repo::accounts::FTS_DELETE_BATCH as usize {
+            break;
+        }
+    }
+    eprintln!(
+        "FTS sweep: {:?} total, worst single-batch writer hold {worst_batch:?}",
+        sweep_started.elapsed()
+    );
+    let started = Instant::now();
+    db.write(move |conn| repo::accounts::delete(conn, 1))
+        .await
+        .unwrap();
+    eprintln!(
+        "FINAL TX HOLD (cascade of {N} messages): {:?}",
+        started.elapsed()
+    );
+
+    let remaining: i64 = db
+        .read(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+                .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0, "batched FTS delete must not leak rows");
+}
